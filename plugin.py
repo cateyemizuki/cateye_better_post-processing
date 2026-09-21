@@ -164,7 +164,11 @@ from .modules.post_process_takeover import (
 from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
 
-SUPPORTED_CONFIG_VERSION = "0.11.2"
+SUPPORTED_CONFIG_VERSION = "0.11.3"
+
+# 表情包跟风触发条数的**旧默认值**：0.11.3 起默认值改成 2。
+# 老配置里写着这个值时视为"没改过"，迁移时丢弃它让新默认值生效（见 ``_legacy_config_values``）。
+OLD_FOLLOW_THRESHOLD = 3
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -1276,15 +1280,25 @@ class EmojiFollowSectionConfig(PluginConfigBase):
         },
     )
     threshold: int = Field(
-        default=3,
+        default=2,
         ge=1,
-        description="群友连续发送多少条表情包后触发跟发（中间出现任何非表情包消息即重新计数）",
+        description=(
+            "群友在群聊里**连续**发送多少条表情包后触发跟发（默认 2）。"
+            "**中间插入任何非表情包内容都会重新计数**：文本/图片/语音、系统通知（戳一戳、撤回等）、"
+            "bot 自己的发言、其它插件的注入记录都算打断；只有 bot 自己回环的**表情包**不算"
+            "（它本来也是表情包，且让它打断会导致本插件跟发的那张把自己的连击清掉）"
+        ),
         json_schema_extra={
             "label": "触发条数",
-            "x-toml-comment": "连续多少条表情包后触发。",
+            "x-toml-comment": (
+                "群友连续发多少条表情包后触发跟发（默认 2）。中间插入任何非表情包内容"
+                "（含系统通知与 bot 自己的发言）都会重新计数。"
+            ),
             **_ui_i18n(
                 "Threshold",
-                "Follow once group members send this many stickers in a row; any non-sticker message resets the count.",
+                "Follow once group members send this many stickers in a row (default 2). "
+                "Any non-sticker content in between resets the count: text, images, voice, system "
+                "notices (pokes, recalls), the bot's own messages, and other plugins' injected records.",
             ),
         },
     )
@@ -1746,6 +1760,16 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             plugin_section.pop("config_version", None)
             if not plugin_section:
                 migrated.pop("plugin", None)
+        # 0.11.3：`[emoji_follow] threshold` 的默认值由 3 调成 2（用户要求"连续 2 条即跟发"）。
+        # 老配置里这一项一定被宿主写成了旧默认值 3，如果原样带进新默认值，升上来还是 3、
+        # 用户会以为"改了没生效"。因此：**值恰好等于旧默认 3 时丢弃它**，让新默认 2 生效；
+        # 真想要 3 的话手改一下即可（那时值是 3 但语义上仍是"用户显式设置"，无法区分——
+        # 这里选择让新默认生效，因为"没改过"是绝大多数情况）。
+        follow_section = migrated.get("emoji_follow")
+        if isinstance(follow_section, dict) and follow_section.get("threshold") == OLD_FOLLOW_THRESHOLD:
+            follow_section.pop("threshold", None)
+            if not follow_section:
+                migrated.pop("emoji_follow", None)
         return migrated
 
     def get_default_config(self) -> Dict[str, Any]:
@@ -2652,33 +2676,55 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_inbound_emoji_observer(self, **kwargs: Any) -> None:
+        """统计群聊里**连续**入站的表情包条数，攒够 ``threshold`` 后按配置模式跟发一张。
+
+        "连续"的定义（0.11.3 收紧，见下面 ②）：**中间没有插入任何非表情包信息**。
+        任何一条非表情包入站内容——群友的文本/图片/语音、**系统通知**（戳一戳、撤回、
+        入群提示等 ``is_notify`` 记录）、**bot 自己发出的文本**、**其它插件注入的合成记录**
+        ——都会把连击清零，下一张表情包从 1 重新数起。
+
+        只有两类东西**不打断**（都写在下面 ①）：
+
+        1. **bot 自己 / 插件注入的"表情包"**：适配器把出站表情回环成入站时的产物
+           （NapCat/SnowLuma 出站表情按 ``image/sub_type=1`` 下发、入站判为 emoji）。
+           它本身**就是表情包**，不构成"插入的非表情包信息"；而且如果让它打断，
+           本插件跟发的那一张会自己把自己的连击清掉。所以它既不计数也不打断。
+           关掉 ``ignore_self_messages`` 时按普通群消息处理（会计数）——那是给
+           "适配器已经做了 self 过滤"的部署用的。
+        2. **无法归属会话的载荷**（``message`` 不是 dict，或没有 ``session_id``）：
+           既不能计数也不知道该清谁的连击，只能跳过。
+
+        含表情包组件的**混合消息**（如「哈哈哈 + 表情包」）按"发了表情包"处理：
+        它会**继续**连击而不是打断——用户确实发了表情包，而且这不属于"两条消息之间
+        插入了别的东西"。
+        """
         if not self._plugin_enabled():
             return
         message = kwargs.get("message")
         if not isinstance(message, dict):
             return
-        if bool(message.get("is_notify", False)):
-            return
         session_id = str(message.get("session_id") or "").strip()
-        if not session_id:
-            return
-
-        # bot 自己的消息（以及插件自注入的合成记录）不是"群友表情包"：宿主没有 self 过滤，
-        # 适配器关闭"忽略自身消息"时，bot 刚发的表情包会回环成入站表情组件（NapCat/SnowLuma
-        # 出站表情按 image/sub_type=1 下发，入站会判为 emoji）。这类消息既不计入连击、
-        # 也不打断连击，直接忽略（含义缓存同样不记录）。
-        if self.config.emoji_follow.ignore_self_messages and self._is_self_message(message):
-            self.ctx.logger.debug("忽略自身/注入消息，不参与表情包跟风统计（会话 %s）", session_id)
-            return
 
         components = message.get("raw_message")
         has_emoji = isinstance(components, list) and any(
             isinstance(component, dict) and str(component.get("type") or "") == "emoji"
             for component in components
         )
-        if not has_emoji:
-            # 连续计数被非表情包消息打断，归零。
-            self._emoji_streaks.pop(session_id, None)
+        is_notify = bool(message.get("is_notify", False))
+        cfg = self.config.emoji_follow
+        # ① bot 自己（或插件注入）的**表情包**回环：不计入、也不打断连击。
+        #    含义缓存同样不记录（那不是"群友发的图"）。
+        if has_emoji and cfg.ignore_self_messages and self._is_self_message(message):
+            self.ctx.logger.debug("忽略自身/注入消息，不参与表情包跟风统计（会话 %s）", session_id)
+            return
+        if not session_id:
+            return
+        # ② 任何"非表情包内容"一律打断连击（含系统通知、bot 自己的文本、其它插件的注入记录）。
+        if not has_emoji or is_notify:
+            if self._emoji_streaks.pop(session_id, None) is not None:
+                self.ctx.logger.debug(
+                    "表情包连击被打断：收到了非表情包内容（会话 %s，is_notify=%s）", session_id, is_notify
+                )
             return
 
         now = time.monotonic()
@@ -2688,7 +2734,6 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             self._remember_session_emoji_descs(session_id, now, descs)
 
         # —— 表情包跟风（仅群聊）——
-        cfg = self.config.emoji_follow
         if not cfg.enabled or not self._is_group_message(message):
             return
 
