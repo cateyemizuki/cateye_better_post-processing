@@ -13,7 +13,7 @@ SQLite 库（``ctx.paths.data_dir/emoji_meanings.db``），以宿主 description
 
 约束
 ----
-* 生成与注入都只依赖公开能力（``database.query``/``emoji.get_all``/
+* 生成与注入都只依赖公开能力（``database.query``/``emoji.get_random``/
   ``llm.generate``），不直接读宿主文件与数据库文件。
 * 含义文本来自视觉模型对用户图片的描述，属于不可信输入：本模块负责把长度
   压到配置上限、压平空白；调用方负责把它包裹为"参考数据"而非指令。
