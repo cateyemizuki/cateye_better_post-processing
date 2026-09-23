@@ -31,12 +31,17 @@
 
 1. 后处理接管（``[response_splitter]``）：框架
    ``response_post_process.enable_response_post_process`` 关闭时，在
-   ``maisaka.reply.before_post_process``（blocking）里以**与 MaiBot 完全一致的原逻辑**
+   ``maisaka.reply.before_post_process``（blocking）里以**与 MaiBot 一致的原逻辑**
    接管错别字注入 + 分段 + 颜文字保护 + 长度/句数守卫（``post_processing.py`` 逐行复刻
    ``process_llm_response_segments`` 与 ``ChineseTypoGenerator``）。
    分段**照宿主那样每段一条消息**依次发出：第 1 段走宿主原生发送链
-   （引用/写库/历史同步原生），第 2..N 段由插件补发并按宿主的打字速度模拟打字，
-   更正段引用上一段。
+   （引用/写库/历史同步原生），第 2..N 段由插件补发并按宿主的打字速度模拟打字。
+   **错字纠正（0.12.0 起恒由权重池决定）**：每处错字抽一次纠正方式——直接发送 /
+   引用那条错字消息 / 撤回后重发修正句 / 不纠正；``last_correction_enabled`` 打开时按
+   ``last_correction_probability`` 决定是否推迟到本轮分段全发完再执行（"最后纠正"只改时机）；
+   撤回前按 ``recall_delay_seconds`` 先等一会儿（留空 = 按被撤回那条的打字时长自动）。
+   与宿主**有意不同**的两处：整词同音替换的组合数上限、``@昵称`` 不参与错字生成
+   （宿主会把它一起改错，配合真实 at 组件就成了"一条消息两个 @"）。
    分段/错别字/打字速度参数默认读宿主自身配置（``response_splitter.*``、``chinese_typo.*``、
    ``response_post_process.typing_speed``、``bot.nickname``）；插件里也有**同名镜像节**，
    留空 = 跟随宿主，填了值 = 以插件为准（见 ``[response_splitter]`` 等节）。
@@ -49,22 +54,31 @@
    （经 ``message.get_by_id`` 查询并缓存）。**群聊与私聊的权重、过旧规则与
    "同一消息只引用一次"记录完全独立**（``_reply_style_weights`` /
    ``_reply_style_weights_private``，按会话类型取用）。
-   目标消息过旧有两条规则（超时优先）：目标发出超过 ``stale_age_seconds`` 秒后
+   目标消息过旧有三条规则（超时优先，其次条数）：目标发出超过 ``stale_age_seconds`` 秒后
    **强制直接回复**——既**不引用**也**不 @**（就是权重池里的"直接回复"，
-   不是"以引用的方式发出去"）；目标之后已出现 ≥ ``stale_threshold_messages`` 条消息时
+   不是"以引用的方式发出去"）；目标之后已出现的消息数**未达到**
+   ``force_direct_threshold_messages``（强制直发阈值，默认关闭）时也强制直接回复；
+   目标之后已出现 ≥ ``stale_threshold_messages`` 条消息时
    视为"对话已推进"——抽取池剔除"直接回复"，并把 @回复 权重调为
    ``stale_at_weight``（留空则取原 @权重 的一半），避免裸回复指代不明。
+   强制直发阈值必须小于"对话已推进阈值"：配置值 ≥ 旧阈值时自动让步，压到旧阈值 − 1。
 
    **同一消息只引用一次**（``quote_once_per_target``，群聊/私聊各自独立开关与记录）：
    一条目标消息一旦被引用过（本插件抽到引用/引用＋@，或在
    ``send_service.after_send`` 观测到它以 ``set_reply=True`` 发出——宿主自带的、
    其它插件注入的都算），之后**任何**对该消息的回复都不再引用，只可能直接回复或
    （群聊）@；抽到"直接回复"不消耗这次机会，下一轮 planner 再次回复同一条消息时
-   仍有机会抽到引用。该规则优先于两条过旧规则（含 ``stale_age_seconds`` 的
+   仍有机会抽到引用。该规则优先于全部过旧规则（含 ``stale_age_seconds`` 的
    "目标超时后强制直接回复"），因此对"bot 回复自己刚发过的消息"这类超出时间窗的目标
    同样生效。记录按 session 存放（群聊/私聊天然分开），单会话上限
    ``_QUOTED_TARGET_MAX_ENTRIES`` 条（超出按登记顺序淘汰最旧），整会话记录
    保留 ``_QUOTED_TARGET_SESSION_TTL_SECONDS``。
+
+   **过滤假 @**（``[plugin] filter_fake_at``，默认开）：LLM 会在正文里手写 ``@某人``——
+   那只是普通文本（宿主与适配器都**不会**把它转成真实 at 段，QQ 里不提醒任何人；模型是照抄
+   宿主渲染进上下文的「@昵称」文本）。出站前把**消息开头**的 ``@某人 + 空格`` 整段删掉，
+   这样抽到 @ 回复时注入的**真实 at** 才是消息里唯一的一个 @。
+   只受「丰富回复门控」约束，作用范围与文本规则一致（只动 bot 本轮回复自己的消息）。
 
    生效范围（0.7.1 收紧）：只处理**本插件已登记的回复轮**（由
    ``maisaka.reply.before_post_process`` 标记）中**指向轮目标消息**的**首条含文本
@@ -113,16 +127,20 @@
    字段，判别依据是本插件的回复轮记录（会话 + 轮目标消息 id，或"引用了本轮已发出
    的某条消息"）。其它插件用 ``ctx.send.*`` 直接发出的文本、宿主命令提示等一律
    不改写；需要覆盖 bot 全部出站文本时可改为 ``all_outbound``。
-6. 表情包含义库（``[emoji_meaning]``）：维护一份插件自有 SQLite 库，为表情包的
-   宿主描述标签（replyer 上下文里 ``[表情包: 描述]`` 的"描述"）补录由视觉模型
-   生成的"准确内容"，并在 replyer 请求前（``maisaka.replyer.before_request``）
-   把上下文中出现的表情包含义注入 ``extra_prompt``。``inject_request_types``
-   （默认 ``["maisaka.replyer"]``）限定只注入 **planner 拉起的正常回复流程**：
-   插件自己拉起回复生成（``generator_api`` / ``plugin.<id>`` 等）时不管；插件
-   激活 planner（主动触发、注入上下文）后由 planner 拉起的 reply 照常注入。
-   两条补录通道：周期扫描宿主表情库补录已有表情包（``database.query`` +
-   ``emoji.get_random`` 抽样 + ``llm.generate``），以及
-   ``emoji.register.after_build_description`` 钩子即时补录插件安装后新入库的表情包。
+6. 表情包含义库（``[emoji_meaning]``）：维护一份插件自有 SQLite 库，为表情包补录
+   由视觉模型生成的"准确内容"，并在**发给模型的请求**里把上下文中的
+   ``[表情包: 标签]`` **就地替换**为库里的描述（``maisaka.replyer.before_model_request``
+   与 ``maisaka.planner.before_request`` 改写 Context Items；范围由 ``rewrite_scope``
+   控制，**默认只改 replyer**）。改的只是"即将发给模型的请求"，不动宿主数据、随时可回退。
+   **关联键是宿主 image_hash（sha256）**——组件 ``EmojiComponent.binary_hash`` 就是
+   ``Images.image_hash``，描述只是展示字段（表情库维护会按描述"取消注册旧的、注册新的"，
+   按描述存会把含义错挂给新图）。标签定位优先用 item 前缀的 ``msg_id`` 查本地映射、
+   按组件顺序对应；取不到再按描述回退匹配；**都失败就保持标签原样**。
+   两条补录通道：**planner 按需补录**（``maisaka.planner.before_request`` 扫本轮上下文
+   出现的表情包，token 随使用量走）与 ``emoji.register.after_build_description`` 钩子
+   即时补录新表情包。含义按 ``meaning_ttl_days``（默认 30 天）淘汰长期没用过的记录。
+   取图按 hash：入站载荷内联字节 → 宿主图片文件（根目录包含校验）→
+   ``emoji.get_random`` 抽样（本地算 sha256 比对）。
 
 聊天流表情冷却（``[emoji_cooldown]``）：``send_service.after_send``（observe）观察到
 任何来源（planner 的 send_emoji 工具、其它插件、本插件自身）的表情包消息发出后，
@@ -135,9 +153,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import random
+import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Deque, Dict, List, Literal, Optional, Tuple, Union
 
@@ -148,10 +169,15 @@ from .emoji_meanings import (
     DEFAULT_GENERATION_PROMPT,
     MAX_DESCRIPTION_LENGTH,
     EmojiMeaningStore,
+    build_emoji_content_suffix,
     build_generation_messages,
-    build_injection_block,
-    extract_emoji_descriptions_from_message,
-    sniff_image_format,
+    build_tagged_emoji_label,
+    detect_image_format,
+    EMOJI_CONTENT_SUFFIX_PREFIX,
+    EMOJI_LABEL_PATTERN,
+    extract_emoji_refs_from_message,
+    normalize_image_for_vlm,
+    sha256_of_base64,
 )
 from .text_rules import ParsedRules, apply_rules, apply_replaces, find_cover, parse_rules
 from .modules.post_process_takeover import (
@@ -163,12 +189,9 @@ from .modules.post_process_takeover import (
 )
 from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
+from .trace_log import current_log_path, install as install_trace_log, uninstall as uninstall_trace_log
 
-SUPPORTED_CONFIG_VERSION = "0.11.3"
-
-# 表情包跟风触发条数的**旧默认值**：0.11.3 起默认值改成 2。
-# 老配置里写着这个值时视为"没改过"，迁移时丢弃它让新默认值生效（见 ``_legacy_config_values``）。
-OLD_FOLLOW_THRESHOLD = 3
+SUPPORTED_CONFIG_VERSION = "0.13.18"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -197,14 +220,66 @@ _MEANING_SAMPLE_K_START = 10
 _MEANING_SAMPLE_K_MAX = 60
 _MEANING_SAMPLE_MISS_CAP = 100
 
+# 「planner 按需补录」一次扫描的取消息上限、同会话最小间隔（秒）与时间窗前后余量（秒）。
+# 只拉本轮上下文时间窗内的消息、且不带二进制（include_binary_data=False），单次开销很小。
+_MEANING_SCAN_MSG_LIMIT = 120
+_MEANING_SCAN_MIN_INTERVAL_SECONDS = 15.0
+_MEANING_SCAN_WINDOW_PAD_SECONDS = 2.0
+
+# 入站载荷自带 base64 的缓存条数（够生成循环一两轮用；用不上就按 hash 读宿主图片文件）。
+_MEANING_INLINE_BYTES_MAX = 8
+
+# 过期含义淘汰的最小间隔（秒）：淘汰是整表 DELETE，没必要每轮都跑。
+_MEANING_PURGE_MIN_INTERVAL_SECONDS = 3600.0
+
+# 入站消息 → 表情包引用 的本地映射：reply 路径按 ``message_id`` 直接定位（0 RPC）。
+# **纯缓存**：宿主消息库里本来就有 ``message_id`` + 组件 ``hash``，丢了由 ``message.get_by_id``
+# 兜底，所以容量与时效都可以给得比较紧。
+_MESSAGE_EMOJI_REFS_MAX_ENTRIES = 512
+_MESSAGE_EMOJI_REFS_TTL_SECONDS = 3600.0
+
+# item 文本前缀里的消息 id（`<message msg_id="…" …>`，宿主 planner_messages 生成）。
+_MSG_ID_IN_PREFIX = re.compile(r'msg_id="([^"]*)"')
+
+# 适配器把"取不到二进制的媒体"降级成的**纯文本占位**（napcat 适配器
+# ``codecs/inbound/message_codec.py``：表情/图片下载不到就发 ``[emoji]``/``[image]``，
+# 语音/视频/文件同理）。这类消息在宿主侧**没有 emoji 组件、没有 hash、没有字节**，
+# 含义库无从下手——命中时日志里会明确写出来，省得再去猜"为什么没补录"。
+_MEDIA_PLACEHOLDER_HINTS = (
+    "[emoji]",
+    "[image]",
+    "[voice]",
+    "[视频]",
+    "[文件]",
+    "[json]",
+    "[forward]",
+)
+
+# 按 hash 读宿主图片文件时的候选后缀与体积上限（超过就当读不到，避免把大图塞给视觉模型）。
+_IMAGE_FILE_EXTS = ("png", "jpeg", "jpg", "webp", "gif", "bmp")
+_MAX_IMAGE_FILE_BYTES = 8 * 1024 * 1024
+
+
+def _parse_iso_timestamp(value: Any) -> float:
+    """把上下文项 meta 里的 ISO 时间戳转成 Unix 秒（解析失败返回 0.0）。
+
+    宿主快照用 ``meta.timestamp.isoformat()``（本地无时区），``.timestamp()`` 按本地时区还原，
+    与 ``message.get_by_time_in_chat`` 用的 ``session_message.timestamp.timestamp()`` 同口径。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(datetime.fromisoformat(text).timestamp())
+    except (TypeError, ValueError):
+        return 0.0
+
 # 判定"本轮开始前 bot 刚发过表情包"（planner 先 send_emoji 再 reply 的情况）的时间窗。
 _RECENT_BOT_EMOJI_WINDOW_SECONDS = 15.0
 
 # 会话近期表情包描述缓存与 @ 目标表情包描述缓存的时效/容量。
 _SESSION_EMOJI_TTL_SECONDS = 1800.0
 _SESSION_EMOJI_MAX_ENTRIES = 20
-_TARGET_EMOJI_TTL_SECONDS = 600.0
-_TARGET_EMOJI_MAX_ENTRIES = 256
 
 
 # 回复轮已发出消息 id 的保留条数（错别字更正段的归属判定用）。
@@ -213,15 +288,24 @@ _ROUND_SENT_ID_MAX_ENTRIES = 20
 # 文本规则归属判定里"首条分段等待窗"的兜底秒数（宿主配置为 0 时使用）。
 _REPLY_FLOW_ARM_FALLBACK_SECONDS = 20.0
 
+# 「假 @」：LLM 手写在正文里的 "@某人"——`@` + 昵称字符 + **至少一个水平空白**。
+# 昵称字符集与 post_processing._AT_MENTION_PATTERN 保持一致（汉字/字母数字/下划线/连字符/间隔号）；
+# 空白只认水平空白（半角、全角、Tab、NBSP），**不含换行**——换行后面跟着的通常已经是下一句了。
+_FAKE_AT_PATTERN = re.compile(
+    r"@[0-9A-Za-z_\-\u00b7\u3400-\u4dbf\u4e00-\u9fff\uff10-\uff19\uff21-\uff3a\uff41-\uff5a]{1,32}[ \t\u3000\u00a0]+"
+)
 
+
+# 为什么 filter_fake_at 放这里而不是某个功能板块：它跨板块（群聊/私聊、两个接管都算），
+# 且与 rich_reply_gate 是同一套门控口径（宿主开着「丰富回复」时插件整体不介入）。
 class PluginSectionConfig(PluginConfigBase):
-    """插件基础配置。"""
+    """插件总开关、跨板块门控与出站清洗开关。"""
 
     __ui_label__ = "插件"
     __ui_icon__ = "package"
     __ui_order__ = 0
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
-        "en": {"title": "Plugin", "description": "Plugin master switch and config version."},
+        "en": {"title": "Plugin", "description": "Plugin master switch, cross-section gates and outbound cleanup."},
     }
 
     enabled: bool = Field(
@@ -249,6 +333,51 @@ class PluginSectionConfig(PluginConfigBase):
                 "Rich reply gate",
                 "On (default): the two takeover modules stay silent while the host "
                 "experimental.enable_rich_reply is on.",
+            ),
+        },
+    )
+    filter_fake_at: bool = Field(
+        default=True,
+        description=(
+            "过滤假 @：LLM 会在正文里手写「@某人」，那只是普通文本——宿主与适配器都**不会**"
+            "把它转成真实 at 段，QQ 里不会提醒任何人。开启后插件在出站前把**消息开头**的"
+            "「@某人 + 空格」整段删掉，这样「引用回复接管」抽到 @ 时注入的**真实 @** 才是消息里"
+            "唯一的一个。只认「开头」且「名字后面跟空格」两条；删完只剩空白时不动（免得发出空消息）。"
+            "与两个接管同口径受「丰富回复门控」约束"
+        ),
+        json_schema_extra={
+            "label": "过滤假 @",
+            "x-toml-comment": "删掉正文开头的「@某人 + 空格」（LLM 手写的纯文本 @，不提醒人）。",
+            **_ui_i18n(
+                "Filter fake @",
+                "Strip a leading text-only \"@name \" written by the LLM (not a real mention).",
+            ),
+        },
+    )
+    at_trailing_space: bool = Field(
+        default=False,
+        description=(
+            "注入真实 @ 时是否**额外补一个空格组件**。"
+            "**按宿主版本选**（官方文档 v1.2.5 附录 B-5「富回复每个 @ 组件后增加空格」）："
+            "**MaiBot 1.2.5 起应关闭**（宿主富回复自己会在每个 @ 组件后插一个空格组件，"
+            "`builtin_tool/context.py` 的 `at_prefix_components.extend([at_component, TextComponent(\" \")])`，"
+            "插件再补就是两个）；**1.2.5 以前（不含 1.2.5）应开启**"
+            "（那时宿主是 `at_components + …`、**不插空格**，插件不补的话 @ 与正文会贴在一起）。"
+            "注意：宿主渲染出站纯文本时用 `\" \".join` 拼接组件，所以开启后纯文本里会出现三个空格"
+            "（并跟着 `processed_plain_text` 进消息库、上下文与记忆抽取）——"
+            "这是「平台侧不粘连」与「纯文本好看」之间的取舍，1.2.5+ 的宿主两者都不需要插件操心"
+        ),
+        json_schema_extra={
+            "label": "@ 后补空格组件（1.2.5 起关闭 / 1.2.5 以前开启）",
+            "x-toml-comment": (
+                "注入 @ 时是否额外补一个空格组件。MaiBot 1.2.5 起应关闭（宿主自己会补）；"
+                "1.2.5 以前（不含 1.2.5）应开启（宿主不补，会与正文粘连）。"
+            ),
+            **_ui_i18n(
+                "Trailing space after @ (off since MaiBot 1.2.5)",
+                "Whether to inject an extra space component after the mention. Turn OFF on MaiBot 1.2.5+ "
+                "(the host already inserts one after every @ component); turn ON for older hosts "
+                "(before 1.2.5) which insert none and would otherwise glue the mention to the text.",
             ),
         },
     )
@@ -284,8 +413,14 @@ class PluginSectionConfig(PluginConfigBase):
 #    开关项三选一「跟随宿主 / 开启 / 关闭」；文本项空字符串。**不要用负数当哨兵**。
 # 5. 首次生成 config.toml 时插件会读宿主现值填进去（见 ``get_default_config``），
 #    所以默认看到的就是宿主当前值；想重新跟随宿主就把该项清空。
+#    **镜像项的完整取值链路是四级的**：插件填了值就用它 → 留空则跟随宿主（读宿主运行时配置）
+#    → 宿主快照读不到则退到 `modules/post_process_takeover.py` 的 ``_POST_PROCESS_CONFIG_KEYS``
+#    第 3 列（**最终代码层兜底**，取自发布者实机在用的 config.toml）。
 # 6. 唯一**故意不搬**的是宿主 ``[response_post_process] enable_response_post_process``：
 #    它是本插件的生效条件（宿主开着它时宿主自己做后处理，插件必须让位），不是可改参数。
+# 7. **板块说明（配置类的 docstring）只写一句话**（0.12.2 起）：WebUI 直接显示
+#    ``config_class.__doc__.strip()``，而 ``maibot_sdk`` **不做 dedent**——多行 docstring 会
+#    带着源码缩进显示成一坨。设计说明、历史沿革一律写成类上方的 ``#`` 注释，不要进 docstring。
 
 # 「跟随宿主」的取值：TOML 没有 null，空字符串即"未填写"。
 FOLLOW_HOST = ""
@@ -294,6 +429,9 @@ _HostSwitch = Literal["跟随宿主", "开启", "关闭"]
 # 数值型宿主项：空字符串 = 跟随宿主；否则是真值（int / float 分开，避免 512.5 被悄悄取整）。
 _HostInt = Union[int, Literal[""]]
 _HostFloat = Union[float, Literal[""]]
+# 插件**自有**的可留空数值（不镜像宿主）：空字符串 = 用该字段自己的"自动"规则
+# （目前只有「撤回反应时间」：留空 = 按打字速度自动）。与 _HostFloat 类型相同，分开命名只为可读。
+_OptionalFloat = Union[float, Literal[""]]
 
 # ---------------------------------------------------------------------------
 # 旧配置迁移（0.10.x / 0.11.0 → 0.11.1 的功能板块排版）
@@ -313,17 +451,13 @@ _MIGRATABLE_LEGACY_PATHS: Dict[str, Tuple[str, str]] = {
     "post_process.yield_to_other_plugins": ("response_splitter", "yield_to_other_plugins"),
     "post_process.max_segments": ("response_splitter", "max_segments"),
     "post_process.wait_timeout_seconds": ("response_splitter", "wait_timeout_seconds"),
-    "post_process.correction_mode_enabled": ("chinese_typo", "correction_mode_enabled"),
     "post_process.correction_max_cjk": ("chinese_typo", "correction_max_cjk"),
     "post_process.recall_fallback": ("chinese_typo", "recall_fallback"),
-    "post_process.recall_purge": ("chinese_typo", "recall_purge"),
-    "post_process.quote_correction": ("chinese_typo", "enable_correction_quote"),
     "post_process.weight_correction_direct": ("chinese_typo_weights", "weight_correction_direct"),
     "post_process.weight_correction_quote": ("chinese_typo_weights", "weight_correction_quote"),
     "post_process.weight_correction_recall": ("chinese_typo_weights", "weight_correction_recall"),
     "post_process.weight_correction_none": ("chinese_typo_weights", "weight_correction_none"),
     "post_process.last_correction_enabled": ("chinese_typo_weights", "last_correction_enabled"),
-    "post_process.weight_correction_last": ("chinese_typo_weights", "weight_correction_last"),
     # 引用回复权重拆到权重板块（stale_at_weight 的旧 -1 哨兵 → 留空）
     "quote_reply.weight_direct": ("quote_reply_weights", "weight_direct"),
     "quote_reply.weight_quote": ("quote_reply_weights", "weight_quote"),
@@ -347,7 +481,6 @@ _MIGRATABLE_LEGACY_PATHS: Dict[str, Tuple[str, str]] = {
     "host_override.typo_min_freq": ("chinese_typo", "min_freq"),
     "host_override.typo_tone_error_rate": ("chinese_typo", "tone_error_rate"),
     "host_override.typo_word_replace_rate": ("chinese_typo", "word_replace_rate"),
-    "host_override.typo_correction_quote_probability": ("chinese_typo", "correction_quote_probability"),
     "host_override.bot_nickname": ("response_splitter", "fallback_nickname"),
     # 0.11.0 已经叫这些名字、节也同名：留着这条便于跨版本比对（值本身照搬）
     "response_splitter.enable": ("response_splitter", "enable"),
@@ -357,6 +490,18 @@ _LEGACY_REMOVED_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("post_process", "multi_message"),
     ("post_process", "typing"),
     ("post_process", "correction_gate_probability"),
+    # 0.12.0 移除：纠正方式与"是否引用"改由权重池恒决定（开关与两个宿主镜像项一起删），
+    # "撤回后清理原消息"实测无效（宿主的第 1 段历史由宿主自己写，插件拦不住）。
+    ("post_process", "correction_mode_enabled"),
+    ("post_process", "quote_correction"),
+    ("post_process", "recall_purge"),
+    ("post_process", "weight_correction_last"),
+    ("chinese_typo", "correction_mode_enabled"),
+    ("chinese_typo", "enable_correction_quote"),
+    ("chinese_typo", "correction_quote_probability"),
+    ("chinese_typo", "recall_purge"),
+    ("chinese_typo_weights", "weight_correction_last"),
+    ("host_override", "typo_correction_quote_probability"),
 )
 
 _LEGACY_SWITCH_TEXT = {"host": "跟随宿主", "跟随宿主": "跟随宿主", "on": "开启", "off": "关闭"}
@@ -426,11 +571,9 @@ def migrate_legacy_config(config_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+# 权重在紧随其后的 [quote_reply_weights]。
 class QuoteReplySectionConfig(PluginConfigBase):
-    """引用回复（群聊）：什么时候接管、目标过旧怎么处理、引用去重规则。
-
-    权重在紧随其后的 ``[quote_reply_weights]``。
-    """
+    """群聊：何时接管、目标过旧怎么处理、引用去重。"""
 
     __ui_label__ = "引用回复"
     __ui_icon__ = "format_quote"
@@ -457,19 +600,41 @@ class QuoteReplySectionConfig(PluginConfigBase):
             ),
         },
     )
+    force_direct_threshold_messages: int = Field(
+        default=2,
+        ge=0,
+        description=(
+            "强制直发阈值（条）：回复目标之后已出现的消息数**未达到**该值（对话还很新）时，"
+            "本次回复强制直接回复（不引用也不 @，就是权重池里的「直接回复」）；"
+            "达到该值后回到正常权重抽取。0 = 关闭。"
+            "本项必须**小于**「对话已推进阈值（条）」——配置值 ≥ 该阈值时自动为旧阈值让步，"
+            "压到「对话已推进阈值 − 1」（例如推进阈值 3、本项填 4 时按 2 生效）"
+        ),
+        json_schema_extra={
+            "label": "强制直发阈值（条）",
+            "x-toml-comment": "目标后消息数不足该值时强制直发（不引用也不 @）。0 = 关闭；须小于「对话已推进阈值」，超出时自动压到其 −1。",
+            **_ui_i18n(
+                "Force direct reply below (messages)",
+                "While fewer than this many messages follow the target, replies are forced direct: no quote and no @. "
+                "0 disables. Must stay below the stale threshold; larger values are clamped to stale threshold − 1.",
+            ),
+        },
+    )
     stale_threshold_messages: int = Field(
         default=3,
         ge=0,
         description=(
-            "回复目标之后出现 ≥N 条消息即视为「对话已推进」：抽取回复方式时剔除直接回复，"
-            "并把 @ 权重按权重板块里的「推进时 @ 权重」调整（0 = 关闭）"
+            "对话已推进阈值（条）：回复目标之后出现 ≥N 条消息即视为「对话已推进」，"
+            "抽取回复方式时剔除直接回复，并把 @ 权重按权重板块里的「推进时 @ 权重」调整"
+            "（0 = 关闭）。与上面的「强制直发阈值」互补：消息数不足直发阈值时强制直发，"
+            "达到推进阈值后剔除直发"
         ),
         json_schema_extra={
             "label": "对话已推进阈值（条）",
-            "x-toml-comment": "被回复消息之后又来了这么多条消息，就算「对话已推进」。0 = 不判定。",
+            "x-toml-comment": "被回复消息之后又来了这么多条消息（≥N），就算「对话已推进」：不再直发、@ 权重按权重板块调整。0 = 不判定。",
             **_ui_i18n(
                 "Stale threshold (messages)",
-                "When this many messages appear after the target, direct replies are excluded and the @ weight is adjusted. 0 disables.",
+                "When this many messages appear after the target, the conversation counts as moved on: direct replies are excluded and the @ weight is adjusted. 0 disables.",
             ),
         },
     )
@@ -478,10 +643,10 @@ class QuoteReplySectionConfig(PluginConfigBase):
         description="统计目标后消息数时排除 bot 自己的消息（默认计入所有消息）",
         json_schema_extra={
             "label": "统计时排除 bot 消息",
-            "x-toml-comment": "统计「对话已推进」时是否不数 bot 自己发的消息。",
+            "x-toml-comment": "统计「强制直发」与「对话已推进」两条阈值时是否不数 bot 自己发的消息。",
             **_ui_i18n(
                 "Exclude bot messages",
-                "Exclude the bot's own messages when counting messages after the target.",
+                "Exclude the bot's own messages when counting messages after the target (used by both the force-direct and stale thresholds).",
             ),
         },
     )
@@ -490,7 +655,8 @@ class QuoteReplySectionConfig(PluginConfigBase):
         ge=0.0,
         description=(
             "回复目标发出超过 N 秒后，本次回复**直接回复**（不引用也不 @，纯文本发出）"
-            "（0 = 关闭；优先级高于上面的「对话已推进」调整）"
+            "（0 = 关闭）。按时间判定的过旧规则，优先级高于按条数判定的"
+            "「强制直发阈值」与「对话已推进」调整"
         ),
         json_schema_extra={
             "label": "目标超时后强制直接回复（秒）",
@@ -538,7 +704,7 @@ class QuoteReplySectionConfig(PluginConfigBase):
 
 
 class QuoteReplyWeightsSectionConfig(PluginConfigBase):
-    """引用回复 · 权重（群聊）：按权重抽取这条回复怎么引用 / @。"""
+    """群聊按权重抽取这条回复怎么引用 / @。"""
 
     __ui_label__ = "引用回复 · 权重"
     __ui_icon__ = "balance"
@@ -551,7 +717,7 @@ class QuoteReplyWeightsSectionConfig(PluginConfigBase):
     }
 
     weight_direct: int = Field(
-        default=2,
+        default=5,
         ge=0,
         description="权重：直接回复（不引用也不 @）",
         json_schema_extra={
@@ -561,7 +727,7 @@ class QuoteReplyWeightsSectionConfig(PluginConfigBase):
         },
     )
     weight_quote: int = Field(
-        default=6,
+        default=1,
         ge=0,
         description="权重：引用回复",
         json_schema_extra={
@@ -571,7 +737,7 @@ class QuoteReplyWeightsSectionConfig(PluginConfigBase):
         },
     )
     weight_at: int = Field(
-        default=1,
+        default=2,
         ge=0,
         description="权重：@回复（@ 被回复消息的发送者，仅群聊生效）",
         json_schema_extra={
@@ -581,7 +747,7 @@ class QuoteReplyWeightsSectionConfig(PluginConfigBase):
         },
     )
     weight_quote_at: int = Field(
-        default=1,
+        default=4,
         ge=0,
         description="权重：引用＋@回复（仅群聊生效）",
         json_schema_extra={
@@ -614,11 +780,9 @@ class QuoteReplyWeightsSectionConfig(PluginConfigBase):
     )
 
 
+# 与群聊各自独立记录去重与过旧判定；权重在紧随其后的 [quote_reply_private_weights]。
 class QuoteReplyPrivateSectionConfig(PluginConfigBase):
-    """引用回复（私聊）：与群聊各自独立记录去重与过旧判定；私聊恒不 @。
-
-    权重在紧随其后的 ``[quote_reply_private_weights]``。
-    """
+    """私聊的接管与去重规则（私聊恒不 @）。"""
 
     __ui_label__ = "引用回复（私聊）"
     __ui_icon__ = "person"
@@ -639,28 +803,51 @@ class QuoteReplyPrivateSectionConfig(PluginConfigBase):
             **_ui_i18n("Take over private replies", "Whether the plugin picks the reply style in private chats."),
         },
     )
-    stale_threshold_messages: int = Field(
+    force_direct_threshold_messages: int = Field(
         default=3,
         ge=0,
-        description="回复目标之后出现 ≥N 条消息即剔除直接回复（0 = 关闭）",
+        description=(
+            "强制直发阈值（条）：回复目标之后已出现的消息数**未达到**该值（对话还很新）时，"
+            "本次回复强制直接回复（不引用；私聊恒不 @）。0 = 关闭。"
+            "本项必须**小于**「对话已推进阈值（条）」——配置值 ≥ 该阈值时自动为旧阈值让步，"
+            "压到「对话已推进阈值 − 1」（例如推进阈值 3、本项填 4 时按 2 生效）"
+        ),
+        json_schema_extra={
+            "label": "强制直发阈值（条）",
+            "x-toml-comment": "目标后消息数不足该值时强制直发（不引用）。0 = 关闭；须小于「对话已推进阈值」，超出时自动压到其 −1。",
+            **_ui_i18n(
+                "Force direct reply below (messages)",
+                "While fewer than this many messages follow the target, replies are forced direct (no quote; private chats never @). "
+                "0 disables. Must stay below the stale threshold; larger values are clamped to stale threshold − 1.",
+            ),
+        },
+    )
+    stale_threshold_messages: int = Field(
+        default=5,
+        ge=0,
+        description=(
+            "对话已推进阈值（条）：回复目标之后出现 ≥N 条消息即视为「对话已推进」，"
+            "抽取回复方式时剔除直接回复（0 = 关闭）。与上面的「强制直发阈值」互补："
+            "消息数不足直发阈值时强制直发，达到推进阈值后剔除直发"
+        ),
         json_schema_extra={
             "label": "对话已推进阈值（条）",
-            "x-toml-comment": "被回复消息之后又来了这么多条消息，就算「对话已推进」。0 = 不判定。",
+            "x-toml-comment": "被回复消息之后又来了这么多条消息（≥N），就算「对话已推进」：不再直发。0 = 不判定。",
             **_ui_i18n(
                 "Stale threshold (messages)",
-                "When this many messages appear after the target, direct replies are excluded. 0 disables.",
+                "When this many messages appear after the target, the conversation counts as moved on: direct replies are excluded. 0 disables.",
             ),
         },
     )
     stale_exclude_bot_messages: bool = Field(
-        default=False,
+        default=True,
         description="统计目标后消息数时排除 bot 自己的消息（默认计入所有消息）",
         json_schema_extra={
             "label": "统计时排除 bot 消息",
-            "x-toml-comment": "统计「对话已推进」时是否不数 bot 自己发的消息。",
+            "x-toml-comment": "统计「强制直发」与「对话已推进」两条阈值时是否不数 bot 自己发的消息。",
             **_ui_i18n(
                 "Exclude bot messages",
-                "Exclude the bot's own messages when counting messages after the target.",
+                "Exclude the bot's own messages when counting messages after the target (used by both the force-direct and stale thresholds).",
             ),
         },
     )
@@ -696,7 +883,7 @@ class QuoteReplyPrivateSectionConfig(PluginConfigBase):
 
 
 class QuoteReplyPrivateWeightsSectionConfig(PluginConfigBase):
-    """引用回复 · 权重（私聊）：私聊只有「直接回复 / 引用回复」两种，没有 @ 权重。"""
+    """私聊只有直接回复与引用回复两种。"""
 
     __ui_label__ = "引用回复 · 权重（私聊）"
     __ui_icon__ = "balance"
@@ -709,7 +896,7 @@ class QuoteReplyPrivateWeightsSectionConfig(PluginConfigBase):
     }
 
     weight_direct: int = Field(
-        default=2,
+        default=4,
         ge=0,
         description="权重：直接回复（不引用）",
         json_schema_extra={
@@ -719,7 +906,7 @@ class QuoteReplyPrivateWeightsSectionConfig(PluginConfigBase):
         },
     )
     weight_quote: int = Field(
-        default=6,
+        default=2,
         ge=0,
         description="权重：引用回复（私聊不提供 @ 权重：QQ 私聊不会出现 @）",
         json_schema_extra={
@@ -733,15 +920,18 @@ class QuoteReplyPrivateWeightsSectionConfig(PluginConfigBase):
     )
 
 
+# 权重在紧随其后的 [chinese_typo_weights]。
+#
+# 错字概率只有一个：error_rate（宿主【单字错字概率】）决定错字出现的总频率。宿主那半句
+# 「抽到纠正建议后 50% 发错字、50% 整句替换成正确句」的门控照抄硬编码 0.5、不对外暴露
+# （见 post_processing.plan 的 visible_probability）；另一半「50% 才给纠正建议」在接管
+# 分支里已绕过——否则会出现"打了错字却既不纠正也不撤回"。
+#
+# 0.12.0 按需求移除四项：宿主镜像 enable_correction_quote / correction_quote_probability
+# 与「错字纠正方式」开关 correction_mode_enabled（纠正方式与是否引用一律由权重池决定），
+# 以及实测无效的 recall_purge（撤回后清理原消息）。
 class ChineseTypoSectionConfig(PluginConfigBase):
-    """错别字：宿主 ``[chinese_typo]`` 的全部参数 + 插件的纠正行为。
-
-    权重在紧随其后的 ``[chinese_typo_weights]``。
-
-    **错字概率只有一个**：``error_rate``（宿主【单字错字概率】），它决定错字出现的总频率。
-    宿主代码里那半句「抽到纠正建议后 50% 发错字、50% 整句替换成正确句」的门控**照抄硬编码 0.5**，
-    不对外暴露（见 ``post_processing.plan`` 的 ``visible_probability``）。
-    """
+    """错字注入参数与纠正行为。"""
 
     __ui_label__ = "错别字"
     __ui_icon__ = "spellcheck"
@@ -804,47 +994,6 @@ class ChineseTypoSectionConfig(PluginConfigBase):
             **_ui_i18n("Word replace rate", "Empty = follow host."),
         },
     )
-    enable_correction_quote: _HostSwitch = Field(
-        default="跟随宿主",
-        description=(
-            "宿主【错别字纠正时引用原消息】：纠正错别字时，是否引用上一条包含错别字的消息。"
-            "跟随宿主 / 开启 / 关闭。仅**未开启**下面的「错字纠正方式」时有意义"
-        ),
-        json_schema_extra={
-            "label": "错别字纠正时引用原消息",
-            "x-toml-comment": "纠正错别字时，是否引用上一条含错别字的消息。「跟随宿主」= 用宿主的值。",
-            **_ui_i18n("Correction quote", "Follow host / on / off."),
-        },
-    )
-    correction_quote_probability: _HostFloat = Field(
-        default=FOLLOW_HOST,
-        description=(
-            "宿主【错别字纠正引用概率】：生成纠正消息时，引用上一条错别字消息的概率。"
-            "留空 = 跟随宿主。仅**未开启**下面的「错字纠正方式」时有意义（那之后引用由权重决定）"
-        ),
-        json_schema_extra={
-            "label": "错别字纠正引用概率",
-            "x-toml-comment": "生成纠正消息时引用上一条错别字消息的概率。留空 = 跟随宿主。",
-            **_ui_i18n("Correction quote probability", "Empty = follow host."),
-        },
-    )
-    correction_mode_enabled: bool = Field(
-        default=False,
-        description=(
-            "错字纠正方式：宿主原生只会「抽到纠正建议就 50% 追加一条更正消息、50% 整句换成正确句」；"
-            "开启本项后改为对每处错字按权重板块里的权重抽取纠正方式"
-            "（直接发送 / 引用 / 撤回重发 / 不纠正，可另加最后纠正）。"
-            "开启后宿主那半句 50% 门控仍照旧生效"
-        ),
-        json_schema_extra={
-            "label": "错字纠正方式",
-            "x-toml-comment": "开启后用权重板块自己决定怎么纠正错字（宿主原生只有追加更正消息）。",
-            **_ui_i18n(
-                "Correction modes",
-                "Off (default): host behaviour. On: pick a correction mode per typo by weight.",
-            ),
-        },
-    )
     correction_max_cjk: int = Field(
         default=20,
         ge=0,
@@ -870,27 +1019,29 @@ class ChineseTypoSectionConfig(PluginConfigBase):
             **_ui_i18n("Recall fallback", "quote (default) / direct / none."),
         },
     )
-    recall_purge: bool = Field(
-        default=True,
+    recall_delay_seconds: _OptionalFloat = Field(
+        default="",
         description=(
-            "撤回后清理原消息：删掉宿主消息库里那条记录，并且不把「即将被撤回」的自发分段写进"
-            "bot 自己的对话历史（撤回后重发只留修正句）。"
-            "注意：**宿主发出的第 1 段**由宿主自己写历史，插件拦不住——它的库记录会被删掉，"
-            "但内存上下文里那条要等重启/上下文重建后才消失"
+            "撤回反应时间：bot 发出消息后，若这处错字要按「撤回重发」纠正，先等这么久再撤回，"
+            "单位秒，支持小数点。留空 = 按打字速度自动（拿被撤回那条的正文按宿主打字公式算："
+            "中文 0.3s/字、其它 0.15s/字符，乘【打字速度】——刚打完才发现打错的时间量级）。"
+            "0 = 立刻撤回"
         ),
         json_schema_extra={
-            "label": "撤回后清理原消息",
-            "x-toml-comment": "撤回后把原消息从消息库删掉，并让被撤回的自发分段不进 bot 自己的历史。",
+            "label": "撤回反应时间",
+            "x-toml-comment": "撤回前先等多少秒（支持小数点）。留空 = 按打字速度自动；0 = 立刻撤回。",
             **_ui_i18n(
-                "Purge recalled message",
-                "Delete the recalled message from the store and keep it out of the bot's own history.",
+                "Recall delay (s)",
+                "Empty = derived from typing speed; 0 = recall immediately.",
             ),
         },
     )
 
 
+# 「最后纠正」不在这个权重池里：它由 last_correction_enabled + last_correction_probability
+# 决定"抽到的纠正是否推迟到本轮分段发完之后"，只改时机、不改纠正方式。
 class ChineseTypoWeightsSectionConfig(PluginConfigBase):
-    """错别字 · 纠正方式权重：开启「错字纠正方式」后，每处错字按这里的权重抽取怎么纠正。"""
+    """每处错字按这里的权重抽取怎么纠正。"""
 
     __ui_label__ = "错别字 · 纠正方式权重"
     __ui_icon__ = "balance"
@@ -898,12 +1049,12 @@ class ChineseTypoWeightsSectionConfig(PluginConfigBase):
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Correction mode weights",
-            "description": "Chance weights for each typo correction mode (only used when correction modes are on).",
+            "description": "Chance weights for each typo correction mode.",
         },
     }
 
     weight_correction_direct: int = Field(
-        default=1,
+        default=2,
         ge=0,
         description="权重：直接发送纠正内容（不引用带错字的那条消息）",
         json_schema_extra={
@@ -923,7 +1074,7 @@ class ChineseTypoWeightsSectionConfig(PluginConfigBase):
         },
     )
     weight_correction_recall: int = Field(
-        default=1,
+        default=5,
         ge=0,
         description="权重：撤回带错字的那条消息，然后重发修正后的整句",
         json_schema_extra={
@@ -943,38 +1094,45 @@ class ChineseTypoWeightsSectionConfig(PluginConfigBase):
         },
     )
     last_correction_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "允许最后纠正：**只决定「最后纠正」是否加入权重池**（加入后由下面那个权重决定占比）。"
-            "抽到它时，纠正会等本轮所有分段都发完才发出，并且强制引用对应那条错字消息"
+            "允许最后纠正：开启后，抽到的纠正按下面的「最后纠正概率」决定是否推迟到"
+            "**本轮所有分段都发完**再执行。推迟**只改时机**——纠正方式仍是权重池抽到的那个"
+            "（直接补发 / 引用纠正 / 撤回重发），不再强制引用；抽到「不纠正」时什么都不会发生"
         ),
         json_schema_extra={
             "label": "允许最后纠正",
-            "x-toml-comment": "只决定「最后纠正」是否加入权重池（它等分段发完才纠正，且强制引用）。",
+            "x-toml-comment": "开启后抽到的纠正按「最后纠正概率」决定是否推迟到分段全发完再执行（只改时机）。",
             **_ui_i18n(
                 "Allow deferred correction",
-                "Only decides whether the deferred ('last') correction joins the weight pool.",
+                "Whether a correction may be deferred to the end of the round.",
             ),
         },
     )
-    weight_correction_last: int = Field(
-        default=1,
-        ge=0,
-        description="权重：最后纠正（仅「允许最后纠正」开启时参与抽取）",
+    last_correction_probability: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "最后纠正概率：抽到纠正后，把它推迟到本轮全部分段发完之后执行的概率（0~1）。"
+            "1 = 每次都推迟（默认）；0 = 从不推迟（等同关闭「允许最后纠正」）。"
+            "仅「允许最后纠正」开启时参与"
+        ),
         json_schema_extra={
-            "label": "权重 · 最后纠正",
-            "x-toml-comment": "「最后纠正」在权重池里的占比（仅上面那项开启时参与）。",
-            **_ui_i18n("Weight: last", "Only counted when deferred correction is allowed."),
+            "label": "最后纠正概率",
+            "x-toml-comment": "抽到纠正后推迟到最后再执行的概率（0~1）。1 = 每次推迟；0 = 从不。",
+            **_ui_i18n(
+                "Deferred correction chance",
+                "Chance (0~1) of deferring a correction to the end of the round.",
+            ),
         },
     )
 
 
+# 宿主的分段本来就是"每段一条消息 + 按打字速度模拟打字"，插件接管后照此复刻，所以这里
+# 没有"是否多条发送"这类开关——要关分段就关 enable，要关打字就把 typing_speed 设 0。
 class ResponseSplitterSectionConfig(PluginConfigBase):
-    """分段：宿主 ``[response_splitter]`` 的全部参数 + 分段打字速度 + 接管机制。
-
-    宿主的分段本来就是"每段一条消息 + 按打字速度模拟打字"，插件接管后照此复刻，
-    所以这里没有"是否多条发送"这类开关——要关分段就关 ``enable``，要关打字就把 ``typing_speed`` 设 0。
-    """
+    """分段、打字速度与后处理接管。"""
 
     __ui_label__ = "分段"
     __ui_icon__ = "content_cut"
@@ -1131,11 +1289,11 @@ class ResponseSplitterSectionConfig(PluginConfigBase):
 
 
 class EmojiAfterReplySectionConfig(PluginConfigBase):
-    """planner 回复后概率补发表情包配置。"""
+    """整轮回复没带表情包时按概率补发一张。"""
 
     __ui_label__ = "回复后表情包"
     __ui_icon__ = "mood"
-    __ui_order__ = 8
+    __ui_order__ = 9
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Emoji After Reply",
@@ -1215,7 +1373,7 @@ class EmojiAfterReplySectionConfig(PluginConfigBase):
         },
     )
     planner_emoji_tools: List[str] = Field(
-        default_factory=lambda: ["send_emoji", "emoji_like", "emoji_like_list"],
+        default_factory=lambda: ["send_emoji"],
         description=(
             "planner 计划调用这些工具（``maisaka.planner.after_response`` 的 output_items 工具名）时，"
             "视为本轮已由 planner 自行处理表情，本插件不再补发；留空则关闭该判定"
@@ -1246,11 +1404,11 @@ class EmojiAfterReplySectionConfig(PluginConfigBase):
 
 
 class EmojiFollowSectionConfig(PluginConfigBase):
-    """群友连续表情包跟发配置。"""
+    """群友连续发表情包时跟发一张。"""
 
     __ui_label__ = "表情包跟风"
     __ui_icon__ = "emoji_emotions"
-    __ui_order__ = 9
+    __ui_order__ = 10
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Emoji Follow",
@@ -1282,28 +1440,18 @@ class EmojiFollowSectionConfig(PluginConfigBase):
     threshold: int = Field(
         default=2,
         ge=1,
-        description=(
-            "群友在群聊里**连续**发送多少条表情包后触发跟发（默认 2）。"
-            "**中间插入任何非表情包内容都会重新计数**：文本/图片/语音、系统通知（戳一戳、撤回等）、"
-            "bot 自己的发言、其它插件的注入记录都算打断；只有 bot 自己回环的**表情包**不算"
-            "（它本来也是表情包，且让它打断会导致本插件跟发的那张把自己的连击清掉）"
-        ),
+        description="群友连续发送多少条表情包后触发跟发（中间出现任何非表情包消息即重新计数）",
         json_schema_extra={
             "label": "触发条数",
-            "x-toml-comment": (
-                "群友连续发多少条表情包后触发跟发（默认 2）。中间插入任何非表情包内容"
-                "（含系统通知与 bot 自己的发言）都会重新计数。"
-            ),
+            "x-toml-comment": "连续多少条表情包后触发。",
             **_ui_i18n(
                 "Threshold",
-                "Follow once group members send this many stickers in a row (default 2). "
-                "Any non-sticker content in between resets the count: text, images, voice, system "
-                "notices (pokes, recalls), the bot's own messages, and other plugins' injected records.",
+                "Follow once group members send this many stickers in a row; any non-sticker message resets the count.",
             ),
         },
     )
     probability: float = Field(
-        default=0.5,
+        default=0.4,
         ge=0.0,
         le=1.0,
         description="达到条数后实际跟发的概率（0~1）",
@@ -1352,17 +1500,14 @@ class EmojiFollowSectionConfig(PluginConfigBase):
     )
 
 
+# 任意来源（planner 的 send_emoji 工具、其它插件、本插件自身）的表情包消息入库后，该聊天流
+# 进入冷却；冷却期内本插件不会主动发送表情包（回复后表情包与表情包跟风共用同一冷却）。
 class EmojiCooldownSectionConfig(PluginConfigBase):
-    """聊天流表情包冷却配置。
-
-    任意来源（planner 的 send_emoji 工具、其它插件、本插件自身）的表情包消息
-    入库后，该聊天流进入冷却；冷却期内本插件不会主动发送表情包（回复后表情包
-    与表情包跟风共用同一冷却）。
-    """
+    """同一聊天流里本插件发表情包的最小间隔。"""
 
     __ui_label__ = "表情包冷却"
     __ui_icon__ = "timer"
-    __ui_order__ = 11
+    __ui_order__ = 12
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Emoji Cooldown",
@@ -1371,7 +1516,7 @@ class EmojiCooldownSectionConfig(PluginConfigBase):
     }
 
     seconds: float = Field(
-        default=300.0,
+        default=180.0,
         ge=0.0,
         description="聊天流表情包冷却时长（秒）：任意来源的表情包入库后，冷却期内插件不主动发送表情包",
         json_schema_extra={
@@ -1401,11 +1546,11 @@ class EmojiCooldownSectionConfig(PluginConfigBase):
 
 
 class TextRulesSectionConfig(PluginConfigBase):
-    """出站文本替换/覆盖规则配置。"""
+    """对 bot 出站纯文本做替换或整条覆盖。"""
 
     __ui_label__ = "文本替换规则"
     __ui_icon__ = "find_replace"
-    __ui_order__ = 10
+    __ui_order__ = 11
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Text Rules",
@@ -1446,71 +1591,34 @@ class TextRulesSectionConfig(PluginConfigBase):
     )
 
 
+# 试验性原因：依赖宿主视觉模型任务的输出质量、token 消耗随表情库规模增长，且以宿主描述
+# 标签为关联键存在固有的合并折衷（见 emoji_meanings.py）。
 class EmojiMeaningSectionConfig(PluginConfigBase):
-    """表情包含义库与上下文注入配置（试验性功能，默认关闭）。
+    """按表情包哈希补录准确含义，并把它写进发给模型的上下文。"""
 
-    试验性原因：依赖宿主视觉模型任务的输出质量、token 消耗随表情库规模增长，
-    且以宿主描述标签为关联键存在固有的合并折衷（见 emoji_meanings.py）。
-    """
-
-    __ui_label__ = "表情包含义库（试验性）"
+    __ui_label__ = "表情包含义库"
     __ui_icon__ = "image_search"
-    __ui_order__ = 12
+    __ui_order__ = 8
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
-            "title": "Emoji Meaning Library (Experimental)",
-            "description": "Backfill precise emoji meanings and inject them into the replyer context. Experimental; disabled by default.",
+            "title": "Emoji Meaning Library",
+            "description": "Backfill precise emoji meanings and rewrite them into the outgoing model context.",
         },
     }
 
     enabled: bool = Field(
-        default=False,
-        description="是否启用表情包含义库（试验性功能，默认关闭；周期补录 + 新表情包即时补录）",
-        json_schema_extra={
-            "label": "启用含义库（试验性）",
-            "x-toml-comment": "启用表情包含义库（试验性）：为表情包生成并维护准确含义。",
-            **_ui_i18n(
-                "Enabled (experimental)",
-                "Periodically backfill meanings for existing emojis and instantly for newly registered ones. Experimental: disabled by default.",
-            ),
-        },
-    )
-    inject_enabled: bool = Field(
         default=True,
-        description="是否在回复前把上下文中出现的表情包含义注入 replyer 提示词",
-        json_schema_extra={
-            "label": "启用上下文注入",
-            "x-toml-comment": "把表情包含义注入 replyer 上下文。",
-            **_ui_i18n(
-                "Context injection",
-                "Inject meanings of emojis found in the replied-to message and recent messages into the replyer prompt.",
-            ),
-        },
-    )
-    inject_request_types: List[str] = Field(
-        default_factory=lambda: ["maisaka.replyer"],
         description=(
-            "只对这些 replyer 请求类型注入含义（对应 maisaka.replyer.before_request 的 request_type）："
-            "默认只注入 planner 拉起的正常回复流程；插件自己生成的回复（如 generator_api / plugin.*）不注入。"
-            "留空表示不过滤，写 * 表示全部注入"
+            "是否启用表情包含义库。含义按宿主 image_hash（sha256）存储；"
+            "补录通道：planner 决策时按需补录（默认）+ 新表情包注册即时补录"
         ),
         json_schema_extra={
-            "label": "注入的请求类型",
-            "x-toml-comment": "注入到哪些请求类型（如 replyer）。",
-            "rows": 3,
+            "label": "启用含义库",
+            "x-toml-comment": "启用表情包含义库：为表情包生成并维护准确含义。",
             **_ui_i18n(
-                "Inject for request types",
-                "Only inject for these replyer request types (maisaka.replyer = the normal planner-pulled reply flow). Replies generated by plugins themselves (generator_api / plugin.*) are left alone. Empty disables filtering; * means all.",
+                "Enabled",
+                "Backfill meanings for the emojis a planner turn actually sees, plus instantly for newly registered ones.",
             ),
-        },
-    )
-    model_task: str = Field(
-        default="vlm",
-        description="生成含义使用的模型任务名（对应 model_config 的 model_task_config 键，如 vlm）",
-        json_schema_extra={
-            "label": "模型任务名",
-            "x-toml-comment": "用哪个模型任务生成含义。",
-            **_ui_i18n("Model task", "Model task name for meaning generation (see model_task_config, e.g. vlm)."),
         },
     )
     generation_prompt: str = Field(
@@ -1523,6 +1631,33 @@ class EmojiMeaningSectionConfig(PluginConfigBase):
             **_ui_i18n("Generation prompt", "Custom prompt for meaning generation; empty uses the built-in one."),
         },
     )
+    rewrite_scope: List[str] = Field(
+        default_factory=lambda: ["replyer", "planner"],
+        description=(
+            "把上下文里 `[表情包: 标签]` 就地替换为含义库描述的**作用范围**："
+            "`replyer`（回复生成，默认）/ `planner`（规划）。可多选；留空表示不替换。"
+            "替换只发生在“发给模型的请求”里，不改宿主数据，随时可回退"
+        ),
+        json_schema_extra={
+            "label": "标签替换范围",
+            "x-toml-comment": "把表情包标签替换为含义库描述的范围（replyer / planner）。",
+            "rows": 2,
+            **_ui_i18n(
+                "Label rewrite scope",
+                "Where to rewrite `[emoji: label]` into the plugin's own description: replyer (default) / planner. "
+                "Multi-select; empty disables rewriting. Rewriting only touches the outgoing request, never host data.",
+            ),
+        },
+    )
+    model_task: str = Field(
+        default="vlm",
+        description="生成含义使用的模型任务名（对应 model_config 的 model_task_config 键，如 vlm）",
+        json_schema_extra={
+            "label": "模型任务名",
+            "x-toml-comment": "用哪个模型任务生成含义。",
+            **_ui_i18n("Model task", "Model task name for meaning generation (see model_task_config, e.g. vlm)."),
+        },
+    )
     max_tokens: int = Field(
         default=256,
         ge=32,
@@ -1532,16 +1667,6 @@ class EmojiMeaningSectionConfig(PluginConfigBase):
             "label": "生成 max_tokens",
             "x-toml-comment": "生成含义时的 max_tokens。",
             **_ui_i18n("Max tokens", "max_tokens for each meaning generation call."),
-        },
-    )
-    scan_interval_seconds: float = Field(
-        default=1800.0,
-        ge=60.0,
-        description="周期补录通道：扫描宿主表情库间隔（秒）",
-        json_schema_extra={
-            "label": "库扫描间隔（秒）",
-            "x-toml-comment": "多久扫一遍库、把缺含义的表情包入队。",
-            **_ui_i18n("Scan interval (seconds)", "How often to scan the host emoji library for unrecorded emojis."),
         },
     )
     worker_interval_seconds: float = Field(
@@ -1590,15 +1715,21 @@ class EmojiMeaningSectionConfig(PluginConfigBase):
             **_ui_i18n("Max meaning length", "Meaning texts are truncated to this length."),
         },
     )
-    inject_max_emojis: int = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description="单次回复最多注入的表情包含义条数",
+    meaning_ttl_days: int = Field(
+        default=30,
+        ge=0,
+        description=(
+            "含义保留天数：超过这么多天**没被用过**（也没更新过）的记录会被删除；0 表示不淘汰。"
+            "“用过”按注入时回写的最近使用时间算，所以经常出现的表情包不会被删掉"
+        ),
         json_schema_extra={
-            "label": "单次注入条数上限",
-            "x-toml-comment": "单次往上下文里注入多少条含义。",
-            **_ui_i18n("Injection limit", "Max emoji meanings injected per reply."),
+            "label": "含义保留天数",
+            "x-toml-comment": "多少天没用过的含义会被淘汰（0 = 不淘汰）。",
+            **_ui_i18n(
+                "Meaning retention (days)",
+                "Meanings unused (and unmodified) for this many days are deleted; 0 disables eviction. "
+                "Usage is tracked when a meaning is rewritten into a request, so frequently seen emojis are kept.",
+            ),
         },
     )
 
@@ -1613,9 +1744,8 @@ class BetterPostProcessingConfig(PluginConfigBase):
        ``[quote_reply_private]`` 引用回复（私聊）→ ``[quote_reply_private_weights]`` 它的权重；
     3. ``[chinese_typo]`` 错别字 → ``[chinese_typo_weights]`` 它的纠正方式权重；
     4. ``[response_splitter]`` 分段（分割参数 + 打字速度 + 接管机制）；
-    5. 其它功能节（表情包 / 文本规则）；
-    6. **试验性功能一律放最后**（当前是 ``[emoji_meaning]`` 表情包含义库）——新增试验性配置节
-       时请加在本类末尾，别插到前面，否则用户升级时看到的分节顺序会乱。
+    5. ``[emoji_meaning]`` 表情包含义库（排在"分段"与"回复后表情包"之间）；
+    6. 其它功能节（回复后表情包 / 表情包跟风 / 文本替换规则 / 表情包冷却）。
 
     不区分"宿主提供的"还是"插件提供的"：同一个功能的开关都放同一个板块，宿主本来就有的参数
     直接用宿主的字段名与说明；**权重类参数一律另开一个权重板块、紧跟在它的功能板块之后**。
@@ -1640,13 +1770,13 @@ class BetterPostProcessingConfig(PluginConfigBase):
     )
     # ---- 分段 ----
     response_splitter: ResponseSplitterSectionConfig = Field(default_factory=ResponseSplitterSectionConfig)
+    # ---- 表情包含义库（放在"分段"与"回复后表情包"之间）----
+    emoji_meaning: EmojiMeaningSectionConfig = Field(default_factory=EmojiMeaningSectionConfig)
     # ---- 其它功能 ----
     emoji_after_reply: EmojiAfterReplySectionConfig = Field(default_factory=EmojiAfterReplySectionConfig)
     emoji_follow: EmojiFollowSectionConfig = Field(default_factory=EmojiFollowSectionConfig)
     text_rules: TextRulesSectionConfig = Field(default_factory=TextRulesSectionConfig)
     emoji_cooldown: EmojiCooldownSectionConfig = Field(default_factory=EmojiCooldownSectionConfig)
-    # ---- 试验性功能：**必须在最后** ----
-    emoji_meaning: EmojiMeaningSectionConfig = Field(default_factory=EmojiMeaningSectionConfig)
 
 
 class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, MaiBotPlugin):
@@ -1668,6 +1798,8 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         super().__init__()
         # 缓存的宿主全局配置关键值；在 on_load 与 bot 配置热重载时刷新。
         self._cfg: Dict[str, Any] = {}
+        # 插件文件日志（<插件目录>/logs/plugin.log）的实际路径；未启用时为 None。
+        self._trace_log_path: "Path | None" = None
         # 插件自身配置解析出的派生状态；在 on_load 与配置热更新时重建。
         self._parsed_rules = ParsedRules()
         self._init_quote_takeover()
@@ -1687,19 +1819,35 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         # "对话已推进"/"回复目标超时"首次触发时用 info 记录，后续降为 debug。
         self._stale_adjust_logged = False
         self._stale_age_logged = False
-        # 表情包含义库与补录队列。
+        # "强制直发阈值"被「对话已推进阈值」压制时首次用 info 记录，后续降为 debug。
+        self._direct_threshold_clamped_logged = False
+        # 表情包含义库与补录队列（**键统一是宿主 image_hash / sha256**）。
         self._meaning_store: Optional[EmojiMeaningStore] = None
-        self._meaning_queue: Deque[str] = deque()
+        # 待补录队列：(image_hash, 描述)；描述只用于展示与回退键。
+        self._meaning_queue: Deque[Tuple[str, str]] = deque()
         self._meaning_queued: set[str] = set()
         self._meaning_attempts: Dict[str, int] = {}
         self._meaning_misses: Dict[str, int] = {}
         self._meaning_sample_k = _MEANING_SAMPLE_K_START
-        # 多次生成失败后放弃的描述标签；周期扫描不再入队，注册钩子可将其复活。
+        # 多次生成失败后放弃的 hash；库扫描不再入队，注册钩子/planner 按需可将其复活。
         self._meaning_abandoned: set[str] = set()
-        # 会话近期表情包描述缓存（供 replyer 注入）：session_id -> deque[(单调时钟, 描述)]。
-        self._session_emoji_descs: Dict[str, Deque[Tuple[float, str]]] = {}
-        # 被回复消息中的表情包描述缓存：message_id -> (单调时钟, 描述列表)。
-        self._target_emoji_cache: Dict[str, Tuple[float, List[str]]] = {}
+        # 入站载荷自带的图片 base64 缓存：image_hash -> base64（生成时优先用它，省一次读盘）。
+        self._meaning_inline_bytes: "OrderedDict[str, str]" = OrderedDict()
+        # planner 按需补录的节流状态：session_id -> (单调时钟, 上次扫过的时间窗右端)。
+        self._meaning_scan_state: Dict[str, Tuple[float, float]] = {}
+        # 本轮用过的含义（内存攒着，由工作循环批量回写 last_used_at）：
+        # 热路径只做集合 add，不写库；这样 TTL 淘汰不会误删活跃使用的记录。
+        self._meaning_used: set[str] = set()
+        # 上次淘汰过期含义的单调时钟（节流，避免每轮都扫库）。
+        self._meaning_purge_at: float = 0.0
+        # 宿主根目录缓存（按 hash 读图片文件用；找不到就是空列表）。
+        self._host_roots: List[Path] = []
+        # 会话近期表情包引用缓存（供 replyer 注入与跟风）：
+        # session_id -> deque[(单调时钟, image_hash, 描述)]。
+        self._session_emoji_refs: Dict[str, Deque[Tuple[float, str, str]]] = {}
+        # 入站消息里的表情包引用（reply 路径"本地映射优先"用）：
+        # message_id -> (单调时钟, session_id, [(hash, 描述)])。
+        self._message_emoji_refs: "OrderedDict[str, Tuple[float, str, List[Tuple[str, str]]]]" = OrderedDict()
         # 后台任务集合（on_unload 时统一取消）。
         self._tasks: set[asyncio.Task] = set()
         self._init_post_process_takeover()
@@ -1760,16 +1908,6 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             plugin_section.pop("config_version", None)
             if not plugin_section:
                 migrated.pop("plugin", None)
-        # 0.11.3：`[emoji_follow] threshold` 的默认值由 3 调成 2（用户要求"连续 2 条即跟发"）。
-        # 老配置里这一项一定被宿主写成了旧默认值 3，如果原样带进新默认值，升上来还是 3、
-        # 用户会以为"改了没生效"。因此：**值恰好等于旧默认 3 时丢弃它**，让新默认 2 生效；
-        # 真想要 3 的话手改一下即可（那时值是 3 但语义上仍是"用户显式设置"，无法区分——
-        # 这里选择让新默认生效，因为"没改过"是绝大多数情况）。
-        follow_section = migrated.get("emoji_follow")
-        if isinstance(follow_section, dict) and follow_section.get("threshold") == OLD_FOLLOW_THRESHOLD:
-            follow_section.pop("threshold", None)
-            if not follow_section:
-                migrated.pop("emoji_follow", None)
         return migrated
 
     def get_default_config(self) -> Dict[str, Any]:
@@ -1795,12 +1933,20 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                 if value is not None:
                     defaults.setdefault(section, {})[field] = value
         # 旧配置里显式写过的值优先于"宿主现值"（用户自己填的当然最优先）。
-        for section, values in self._legacy_config_values().items():
+        legacy_values = self._legacy_config_values()
+        for section, values in legacy_values.items():
             if not isinstance(values, dict):
                 continue
             target = defaults.setdefault(section, {})
             if isinstance(target, dict):
                 target.update(values)
+        self.ctx.logger.debug(
+            "生成默认配置：宿主 bot_config.toml %s；镜像字段 %d 项%s；旧配置带进 %d 个板块",
+            "读取成功（镜像字段已填宿主现值）" if host_values else "读取失败（镜像字段保持留空＝跟随宿主）",
+            len(_HOST_MIRROR_FIELDS) + len(_HOST_MIRROR_EXTRA_FIELDS),
+            "（已由宿主现值填好）" if host_values else "（留空）",
+            len(legacy_values),
+        )
         return defaults
 
     def get_webui_config_schema(self, **kwargs: Any) -> Dict[str, Any]:
@@ -1965,12 +2111,14 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
     # ------------------------------------------------------------------
 
     async def on_load(self) -> None:
+        # 先把文件日志挂上：之后所有 self.ctx.logger.xxx（含 debug）都会落到
+        # <插件目录>/logs/plugin.log，便于部署到服务器后长时间收集日志复查。
+        self._trace_log_path = install_trace_log(self.ctx.logger, Path(__file__).resolve().parent)
         self._rebuild_derived_state()
         self._write_config_comments()
         await self._refresh_global_config()
         self._initialize_meaning_store()
         # 循环无条件启动（内部按配置与库可用性自门控），保证含义库关闭时状态清理仍有节奏。
-        self._track_task(asyncio.create_task(self._meaning_scan_loop()))
         self._track_task(asyncio.create_task(self._meaning_worker_loop()))
         # 后处理接管激活时预热拼音/字频/词频（后台线程，避免首次接管回复卡顿）。
         if self._post_process_takeover_active():
@@ -2003,6 +2151,13 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             self._meaning_store.count() if self._meaning_store is not None else 0,
             self.config.emoji_cooldown.seconds,
         )
+        if self._trace_log_path is not None:
+            self.ctx.logger.info("插件文件日志：%s（含 debug 级，8MB 滚动 ×6 份）", self._trace_log_path)
+        else:
+            self.ctx.logger.warning(
+                "插件文件日志未能启用（插件目录不可写？）——日志仍会进宿主日志。预期路径：%s",
+                current_log_path(Path(__file__).resolve().parent),
+            )
         takeover_active = self._post_process_takeover_active()
         # 模块可用性（前置条件：需要宿主关闭哪些能力）：启动时打印一次，配置变更时再打印。
         self._log_module_status(reason="启动")
@@ -2015,6 +2170,7 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                 self.ctx.logger.error("后处理接管不可用，本次回复将由框架自行处理：%s", exc)
 
     async def on_unload(self) -> None:
+        uninstall_trace_log(self.ctx.logger)
         # 周期任务与**多段发送的补发任务**一起取消：补发任务不在 self._tasks 里，
         # 漏掉会出现"卸载/热重载后仍在向会话补发"或"补发半途而废"。
         follow_up_tasks = [
@@ -2093,6 +2249,27 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         self._cfg = values
         # 分段/错别字参数可能已变化，作废旧处理器，下次按新参数重建。
         self._processor = None
+        self.ctx.logger.debug(
+            "宿主配置快照已刷新：引用回复=%s 丰富回复=%s 回复后处理=%s；"
+            "分段[enable=%s max_length=%s max_sentence=%s max_split=%s 颜文字保护=%s 溢出全返回=%s]；"
+            "错字[enable=%s error_rate=%s min_freq=%s tone=%s word=%s]；打字速度=%s；bot 昵称=%s",
+            values.get("enable_reply_quote"),
+            values.get("experimental.enable_rich_reply"),
+            values.get("response_post_process.enable_response_post_process"),
+            values.get("splitter_enable"),
+            values.get("splitter_max_length"),
+            values.get("splitter_max_sentence_num"),
+            values.get("splitter_max_split_num"),
+            values.get("splitter_enable_kaomoji_protection"),
+            values.get("splitter_enable_overflow_return_all"),
+            values.get("typo_enable"),
+            values.get("typo_error_rate"),
+            values.get("typo_min_freq"),
+            values.get("typo_tone_error_rate"),
+            values.get("typo_word_replace_rate"),
+            values.get("typing_speed"),
+            values.get("bot_nickname"),
+        )
 
     async def _read_global_config(self, path: str, default: Any) -> Any:
         """读取单个宿主全局配置项；能力被拒/读取异常时回退默认值。"""
@@ -2201,6 +2378,18 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                 quote_target = str(quote_bucket.get(self._text_key(outbound_text)) or "").strip()
 
         try:
+            # 假 @ 过滤必须排在「文本规则」与「回复方式抽取」**之前**：先清掉 LLM 手写的文本 @，
+            # 后面抽到 @ 回复时注入的真实 at 才会是这条消息里唯一的一个 @。
+            changed = self._strip_leading_fake_at(
+                message,
+                session_id=session_id,
+                reply_message_id=reply_message_id,
+                own_follow_up=own_follow_up,
+            ) or changed
+        except Exception as exc:
+            self.ctx.logger.warning("过滤假 @ 失败，保持原样: %s", exc)
+
+        try:
             changed = self._apply_text_rules_to_message(
                 message,
                 session_id=session_id,
@@ -2225,6 +2414,101 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         if not changed:
             return {"action": "continue"}
         return {"action": "continue", "modified_kwargs": modified}
+
+    # ------------------------------------------------------------------
+    # 出站：过滤"假 @"（LLM 手写的纯文本 @）
+    # ------------------------------------------------------------------
+
+    def _fake_at_filter_active(self) -> bool:
+        """「过滤假 @」是否生效：插件开启 + 开关打开 + **丰富回复门控**允许。
+
+        假 @ 指 LLM 在正文里手写的 ``@某人``：它只是普通文本，宿主与适配器都**不会**把它转成
+        真实 at 段（宿主里 str→AtComponent 只有反序列化与显式构造两条路，没有"按昵称查用户"；
+        适配器的文本段是原样下发），所以 QQ 里它不提醒任何人。留着它再叠上「引用回复接管」
+        抽到 @ 时注入的**真实** at，一条消息里就会出现两个 @（0.11.3 线上事故）。
+
+        本功能与两个接管**同口径**：宿主开着「丰富回复」且 ``[plugin] rich_reply_gate`` 开启时，
+        插件整体不介入，这里也不动任何文本。宿主配置读不到（``_cfg`` 里没有该项）时按"允许"
+        处理——此时两个接管本就静默，清掉无意义的文本 @ 只会更干净。
+        """
+        if not self._plugin_enabled():
+            return False
+        if not bool(getattr(self.config.plugin, "filter_fake_at", True)):
+            return False
+        if not self._rich_reply_gate():
+            return True  # 门控关掉 = 宿主开着丰富回复也允许介入
+        return not bool(self._cfg.get("experimental.enable_rich_reply"))
+
+    def _strip_leading_fake_at(
+        self,
+        message: Dict[str, Any],
+        *,
+        session_id: str = "",
+        reply_message_id: str = "",
+        own_follow_up: bool = False,
+    ) -> bool:
+        """删掉出站文本**开头**的「@某人 + 空格」（原地修改传入副本）；有改动返回 True。
+
+        只认同时满足两条的（用户明确的口径）：
+
+        1. 出现在**消息正文最前面**（首个非空文本组件的开头；开头已是真实 at 组件时不管）；
+        2. ``@名字`` 后面**跟着空格**（半角/全角空格、Tab、NBSP 都算，不含换行）。
+
+        两条一起才动手，是为了不误伤 ``a@b.com``、``@某人，``（名字后直接跟标点）这类写法。
+        删掉的是 ``@ + 名字 + 后面那段空白``；**删完只剩空白时不删**（免得把消息发成空的）。
+
+        作用范围与文本规则一致：只处理**bot 本轮回复自己发出的消息**（含多段发送由插件补发的
+        分段），其它插件用 ``ctx.send.*`` 直接发出的文本一律不动。
+        """
+        if not self._fake_at_filter_active():
+            return False
+        if not own_follow_up and not self._message_in_reply_flow(session_id, reply_message_id):
+            self.ctx.logger.debug(
+                "跳过假 @ 过滤：该发送不属于 bot 本轮回复（会话 %s，reply_message_id=%s）",
+                session_id or "?",
+                reply_message_id or "-",
+            )
+            return False
+        components = message.get("raw_message")
+        if not isinstance(components, list):
+            return False
+        for index, component in enumerate(components):
+            if not isinstance(component, dict):
+                continue
+            component_type = str(component.get("type") or "")
+            if component_type == "at":
+                # 开头就是真实 at 组件：不归这里管（是否重复由 quote_takeover 判）。
+                return False
+            if component_type != "text":
+                continue
+            data = str(component.get("data") or "")
+            if not data.strip():
+                continue
+            match = _FAKE_AT_PATTERN.match(data.lstrip())
+            if match is None:
+                return False
+            stripped = data.lstrip()[match.end():]
+            if not stripped.strip():
+                self.ctx.logger.debug(
+                    "过滤假 @：删掉后正文为空，保留原样（会话 %s）", session_id or "?"
+                )
+                return False
+            new_components = list(components)
+            new_components[index] = {**component, "data": stripped}
+            message["raw_message"] = new_components
+            processed = message.get("processed_plain_text")
+            if isinstance(processed, str) and processed:
+                processed_match = _FAKE_AT_PATTERN.match(processed.lstrip())
+                if processed_match is not None:
+                    message["processed_plain_text"] = processed.lstrip()[processed_match.end():]
+            self.ctx.logger.info(
+                "已过滤正文开头的假 @：%r → %r（会话 %s）",
+                match.group(0),
+                stripped[:40],
+                session_id or "?",
+            )
+            return True
+        return False
 
     def _apply_text_rules_to_message(
         self,
@@ -2339,21 +2623,50 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             return False
         reply_round = self._reply_rounds.get(session_id)
         if reply_round is None:
+            self.ctx.logger.debug(
+                "本轮回复判定=否：会话 %s 没有登记过回复轮（其它插件/命令响应发出？）", session_id
+            )
             return False
         if not reply_round.get("output_seen"):
             arming = float(self.config.emoji_after_reply.first_send_timeout_seconds)
             if arming <= 0:
                 arming = _REPLY_FLOW_ARM_FALLBACK_SECONDS
-            if time.monotonic() - float(reply_round.get("started", 0.0)) > arming:
+            waited = time.monotonic() - float(reply_round.get("started", 0.0))
+            if waited > arming:
+                self.ctx.logger.debug(
+                    "本轮回复判定=否：轮 #%s 还没见到自己的出站消息且已等 %.1f 秒 > %.1f 秒"
+                    "（这轮回复多半没真发出去，会话 %s）",
+                    reply_round.get("id"),
+                    waited,
+                    arming,
+                    session_id,
+                )
                 return False
         normalized_reply_id = str(reply_message_id or "").strip()
         if not normalized_reply_id:
+            self.ctx.logger.debug("本轮回复判定=否：出站消息没有 reply_message_id（会话 %s）", session_id)
             return False
         round_target_id = str(reply_round.get("target_id") or "").strip()
         if round_target_id and normalized_reply_id == round_target_id:
+            self.ctx.logger.debug(
+                "本轮回复判定=是：指向本轮目标消息（轮 #%s，msg_id=%s，会话 %s）",
+                reply_round.get("id"),
+                normalized_reply_id,
+                session_id,
+            )
             return True
         sent_ids = reply_round.get("sent_ids")
-        return isinstance(sent_ids, list) and normalized_reply_id in sent_ids
+        hit = isinstance(sent_ids, list) and normalized_reply_id in sent_ids
+        self.ctx.logger.debug(
+            "本轮回复判定=%s：%s 轮 #%s 已观测到的出站消息（轮目标=%s，已观测=%s，会话 %s）",
+            "是" if hit else "否",
+            "命中" if hit else "未命中",
+            reply_round.get("id"),
+            round_target_id or "-",
+            list(sent_ids) if isinstance(sent_ids, list) else "-",
+            session_id,
+        )
+        return hit
 
     @staticmethod
     def _remember_round_sent_id(reply_round: Dict[str, Any], message_id: Any) -> None:
@@ -2434,6 +2747,15 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             # 引用回复接管是否已抽取过回复方式（同一轮只在首条文本分段抽取一次）。
             "style_done": False,
         }
+        self.ctx.logger.info(
+            "回复轮登记 #%d（会话 %s）：目标消息=%s，本轮已有表情包=%s，planner 已计划表情=%s，正文=%r",
+            self._reply_round_seq,
+            session_id,
+            str(kwargs.get("reply_message_id") or "").strip() or "-",
+            had_emoji,
+            self._reply_rounds[session_id]["planned_emoji"],
+            self._reply_rounds[session_id]["response"][:60],
+        )
         self._prune_stale_state(now)
 
     # ------------------------------------------------------------------
@@ -2676,64 +2998,63 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_inbound_emoji_observer(self, **kwargs: Any) -> None:
-        """统计群聊里**连续**入站的表情包条数，攒够 ``threshold`` 后按配置模式跟发一张。
-
-        "连续"的定义（0.11.3 收紧，见下面 ②）：**中间没有插入任何非表情包信息**。
-        任何一条非表情包入站内容——群友的文本/图片/语音、**系统通知**（戳一戳、撤回、
-        入群提示等 ``is_notify`` 记录）、**bot 自己发出的文本**、**其它插件注入的合成记录**
-        ——都会把连击清零，下一张表情包从 1 重新数起。
-
-        只有两类东西**不打断**（都写在下面 ①）：
-
-        1. **bot 自己 / 插件注入的"表情包"**：适配器把出站表情回环成入站时的产物
-           （NapCat/SnowLuma 出站表情按 ``image/sub_type=1`` 下发、入站判为 emoji）。
-           它本身**就是表情包**，不构成"插入的非表情包信息"；而且如果让它打断，
-           本插件跟发的那一张会自己把自己的连击清掉。所以它既不计数也不打断。
-           关掉 ``ignore_self_messages`` 时按普通群消息处理（会计数）——那是给
-           "适配器已经做了 self 过滤"的部署用的。
-        2. **无法归属会话的载荷**（``message`` 不是 dict，或没有 ``session_id``）：
-           既不能计数也不知道该清谁的连击，只能跳过。
-
-        含表情包组件的**混合消息**（如「哈哈哈 + 表情包」）按"发了表情包"处理：
-        它会**继续**连击而不是打断——用户确实发了表情包，而且这不属于"两条消息之间
-        插入了别的东西"。
-        """
         if not self._plugin_enabled():
             return
         message = kwargs.get("message")
         if not isinstance(message, dict):
             return
+        if bool(message.get("is_notify", False)):
+            return
         session_id = str(message.get("session_id") or "").strip()
+        if not session_id:
+            return
+
+        # —— 先记录"消息 → 表情包引用"映射（**含 bot 自己的消息**，0.13.17 起）——
+        # 含义库注入（`_rewrite_emoji_labels_in_items`）按 item 文本里的 `msg_id` 反查本地映射，
+        # 拿到 hash 才能"按 hash"精确匹配。bot 自己的消息也必须记：
+        #   * 不记 → 只能退化成"按描述"匹配（标签文本 = 宿主 description）；
+        #   * 空标签（`[表情包]`，宿主 description 为空）时，两条路都断了 → 那条标签注入不了。
+        # 这里**只写缓存**，与跟风连击无关 —— 连击仍在下面的 self 过滤处 return。
+        now = time.monotonic()
+        refs = extract_emoji_refs_from_message(message)
+        if refs:
+            # 会话近期表情包缓存服务于 replyer 含义注入，群聊/私聊都要记录（带 hash）。
+            self._remember_session_emoji_refs(session_id, now, refs)
+            # 同时按 message_id 记一份：reply 路径被回复消息时可以直接命中，省一次取消息 RPC。
+            self._remember_message_emoji_refs(message, session_id, now, refs)
+            if self.config.emoji_meaning.enabled:
+                # 顺手把载荷自带的图片字节缓存下来，含义生成时就不必再读盘。
+                self._remember_inline_emoji_bytes(message)
+                # 载荷里的组件 ``data`` 就是宿主渲染后的 ``[表情包: 描述]``：含义若是在
+                # "描述还没出"时算出来的，这里就能把描述补上（只填空、幂等）。
+                self._backfill_emoji_descriptions(refs)
+
+        # bot 自己的消息（以及插件自注入的合成记录）不是"群友表情包"：宿主没有 self 过滤，
+        # 适配器关闭"忽略自身消息"时，bot 刚发的表情包会回环成入站表情组件（NapCat/SnowLuma
+        # 出站表情按 image/sub_type=1 下发，入站会判为 emoji）。这类消息既不计入连击、
+        # 也不打断连击，直接忽略 —— 但**上面的引用映射已经记过了**，含义注入照常可用。
+        if self.config.emoji_follow.ignore_self_messages and self._is_self_message(message):
+            self.ctx.logger.debug("忽略自身/注入消息，不参与表情包跟风统计（会话 %s）", session_id)
+            return
 
         components = message.get("raw_message")
+        # ① 组件形态（多模态 / 文本模式都可能带组件）——**旧判定，保留**。
         has_emoji = isinstance(components, list) and any(
             isinstance(component, dict) and str(component.get("type") or "") == "emoji"
             for component in components
         )
-        is_notify = bool(message.get("is_notify", False))
-        cfg = self.config.emoji_follow
-        # ① bot 自己（或插件注入）的**表情包**回环：不计入、也不打断连击。
-        #    含义缓存同样不记录（那不是"群友发的图"）。
-        if has_emoji and cfg.ignore_self_messages and self._is_self_message(message):
-            self.ctx.logger.debug("忽略自身/注入消息，不参与表情包跟风统计（会话 %s）", session_id)
-            return
-        if not session_id:
-            return
-        # ② 任何"非表情包内容"一律打断连击（含系统通知、bot 自己的文本、其它插件的注入记录）。
-        if not has_emoji or is_notify:
-            if self._emoji_streaks.pop(session_id, None) is not None:
-                self.ctx.logger.debug(
-                    "表情包连击被打断：收到了非表情包内容（会话 %s，is_notify=%s）", session_id, is_notify
-                )
+        # ② 文本形态兜底：整条文本以 `[表情包` 开头、以 `]` 结尾（宿主把表情包渲染成文本时）。
+        if not has_emoji:
+            has_emoji = self._text_looks_like_emoji(message)
+        if not has_emoji:
+            # 连续计数被非表情包消息打断，归零。
+            self._emoji_streaks.pop(session_id, None)
             return
 
-        now = time.monotonic()
-        descs = extract_emoji_descriptions_from_message(message)
-        # 会话近期表情包缓存服务于 replyer 含义注入，群聊/私聊都要记录。
-        if descs:
-            self._remember_session_emoji_descs(session_id, now, descs)
+        descs = [desc for _image_hash, desc in refs if desc]
 
         # —— 表情包跟风（仅群聊）——
+        cfg = self.config.emoji_follow
         if not cfg.enabled or not self._is_group_message(message):
             return
 
@@ -2752,6 +3073,25 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         # 触发后立即重新计数；概率/冷却落空也需重新攒满 threshold 才会再次尝试。
         self._emoji_streaks.pop(session_id, None)
         self._track_task(asyncio.create_task(self._decide_follow_emoji(session_id, str(streak.get("last_desc") or ""))))
+
+    @staticmethod
+    def _text_looks_like_emoji(message: Dict[str, Any]) -> bool:
+        """文本形态的表情包判定：整条文本以 ``[表情包`` 开头、以 ``]`` 结尾。
+
+        用于**文本模式**下宿主把表情包渲染成文本（或组件形态不可用）时的兜底 ——
+        与组件判定（``type == "emoji"``）**并存**，多模态与文本模式都兼容。
+        取 ``processed_plain_text``，缺失时退回拼接 ``raw_message`` 里的文本段。
+        """
+        text = str(message.get("processed_plain_text") or "").strip()
+        if not text:
+            components = message.get("raw_message")
+            if isinstance(components, list):
+                text = "".join(
+                    str(component.get("text") or "")
+                    for component in components
+                    if isinstance(component, dict) and str(component.get("type") or "") == "text"
+                ).strip()
+        return text.startswith("[表情包") and text.endswith("]")
 
     @staticmethod
     def _is_self_message(message: Dict[str, Any]) -> bool:
@@ -2783,54 +3123,111 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                 return True
         return False
 
-    def _remember_session_emoji_descs(self, session_id: str, now: float, descs: List[str]) -> None:
-        """把入站消息中的表情包描述追加进会话缓存（限长限时效，按消息内出现顺序入桶）。"""
-        bucket = self._session_emoji_descs.get(session_id)
+    def _remember_message_emoji_refs(
+        self,
+        message: Dict[str, Any],
+        session_id: str,
+        now: float,
+        refs: List[Tuple[str, str]],
+    ) -> None:
+        """记下"这条入站消息 → 表情包引用"，供 reply 路径按 ``message_id`` 直接定位（0 RPC）。
+
+        键取 ``message_id``：宿主自己的 ``get_message_by_id`` 不给 ``chat_id`` 时也是按它取
+        ``latest``，两边口径一致。值里带 ``session_id`` 只用于日志与诊断。纯缓存，
+        所以用 LRU + TTL 兜住容量；取不到时会回落到 ``message.get_by_id``。
+        """
+        message_id = str(message.get("message_id") or "").strip()
+        if not message_id or not refs:
+            return
+        previous = self._message_emoji_refs.get(message_id)
+        if previous is not None and previous[1] != session_id:
+            # 宿主消息库的索引是 (platform, message_id) 而非全局唯一：同 id 撞会话时
+            # 与宿主 ``limit_mode="latest"`` 一致——后写的覆盖先写的，只留一条 debug 痕迹。
+            self.ctx.logger.debug(
+                "表情包消息映射 id 冲突：message_id=%s 原属会话 %s，被会话 %s 覆盖",
+                message_id,
+                previous[1],
+                session_id,
+            )
+        self._message_emoji_refs[message_id] = (now, session_id, list(refs))
+        self._message_emoji_refs.move_to_end(message_id)
+        while len(self._message_emoji_refs) > _MESSAGE_EMOJI_REFS_MAX_ENTRIES:
+            self._message_emoji_refs.popitem(last=False)
+
+    def _cached_message_emoji_refs(self, message_id: str, now: float) -> List[Tuple[str, str]]:
+        """按 ``message_id`` 从本地映射取表情包引用（过期即删）；没有返回空列表。"""
+        normalized_id = str(message_id or "").strip()
+        if not normalized_id:
+            return []
+        entry = self._message_emoji_refs.get(normalized_id)
+        if entry is None:
+            return []
+        if now - entry[0] > _MESSAGE_EMOJI_REFS_TTL_SECONDS:
+            self._message_emoji_refs.pop(normalized_id, None)
+            return []
+        return list(entry[2])
+
+    def _backfill_emoji_descriptions(self, refs: List[Tuple[str, str]]) -> None:
+        """用入站载荷里的 ``[表情包: 描述]`` 回填含义库中"描述还空着"的记录。
+
+        入站载荷的组件 ``data`` 就是宿主渲染后的描述，因此这是**比注册钩子更早、更可靠**
+        的来源：即使插件是在宿主生成描述**之后**才加载/重启的（register 钩子早已错过），
+        下一次该表情出现时描述也会被补上。只填空、不覆盖（``backfill_description`` 自带），幂等。
+        """
+        if self._meaning_store is None or not self.config.emoji_meaning.enabled:
+            return
+        for image_hash, description in refs:
+            if not image_hash or not description:
+                continue
+            try:
+                if self._meaning_store.backfill_description(image_hash, description):
+                    self.ctx.logger.debug(
+                        "已回填表情包描述（来源=入站载荷 hash=%s desc=%r）",
+                        image_hash[:12],
+                        description,
+                    )
+            except Exception as exc:
+                self.ctx.logger.debug("回填表情包描述失败（hash=%s）: %s", image_hash[:12], exc)
+
+    def _remember_session_emoji_refs(
+        self, session_id: str, now: float, refs: List[Tuple[str, str]]
+    ) -> None:
+        """把入站消息中的表情包引用 ``(hash, 描述)`` 追加进会话缓存（限长限时效，按出现顺序入桶）。"""
+        bucket = self._session_emoji_refs.get(session_id)
         if bucket is None:
             bucket = deque()
-            self._session_emoji_descs[session_id] = bucket
-        for desc in descs:
-            bucket.append((now, desc))
+            self._session_emoji_refs[session_id] = bucket
+        for image_hash, description in refs:
+            bucket.append((now, image_hash, description))
         while len(bucket) > _SESSION_EMOJI_MAX_ENTRIES:
             bucket.popleft()
 
-    def _recent_emoji_descs(self, session_id: str) -> List[str]:
-        """读取会话近期表情包描述（新→旧，剔除过期项）。"""
+    def _recent_emoji_refs(self, session_id: str) -> List[Tuple[str, str]]:
+        """读取会话近期表情包引用（新→旧，剔除过期项，按 hash / 描述去重）。"""
         if not session_id:
             return []
-        bucket = self._session_emoji_descs.get(session_id)
+        bucket = self._session_emoji_refs.get(session_id)
         if not bucket:
             return []
         now = time.monotonic()
         while bucket and now - bucket[0][0] > _SESSION_EMOJI_TTL_SECONDS:
             bucket.popleft()
-        return [desc for _, desc in reversed(bucket)]
+        refs: List[Tuple[str, str]] = []
+        seen: set[str] = set()
+        for _ts, image_hash, description in reversed(bucket):
+            key = image_hash or description
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            refs.append((image_hash, description))
+        return refs
 
-    async def _lookup_target_emoji_descs(self, reply_message_id: str) -> List[str]:
-        """查询被回复消息中出现的表情包描述（带 TTL 缓存；失败返回空）。"""
-        now = time.monotonic()
-        cached = self._target_emoji_cache.get(reply_message_id)
-        if cached is not None and now - cached[0] <= _TARGET_EMOJI_TTL_SECONDS:
-            return cached[1]
-
+    def _recent_emoji_descs(self, session_id: str) -> List[str]:
+        """读取会话近期表情包描述（新→旧，去重；供表情包跟风的"同情绪"复用）。"""
         descs: List[str] = []
-        try:
-            result = await self.ctx.message.get_by_id(reply_message_id)
-            if isinstance(result, dict) and result.get("success") is not False:
-                descs = extract_emoji_descriptions_from_message(result)
-        except Exception as exc:
-            self.ctx.logger.debug("查询被回复消息的表情包失败（message_id=%s）: %s", reply_message_id, exc)
-
-        if len(self._target_emoji_cache) >= _TARGET_EMOJI_MAX_ENTRIES:
-            for key in [
-                key
-                for key, entry in self._target_emoji_cache.items()
-                if now - entry[0] > _TARGET_EMOJI_TTL_SECONDS
-            ]:
-                self._target_emoji_cache.pop(key, None)
-            if len(self._target_emoji_cache) >= _TARGET_EMOJI_MAX_ENTRIES:
-                self._target_emoji_cache.clear()
-        self._target_emoji_cache[reply_message_id] = (now, descs)
+        for _image_hash, description in self._recent_emoji_refs(session_id):
+            if description and description not in descs:
+                descs.append(description)
         return descs
 
     async def _decide_follow_emoji(self, session_id: str, last_desc: str) -> None:
@@ -2938,211 +3335,591 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             return
         # 宿主在 hook 触发后才把 description 写回 emoji 对象，因此优先读 hook 载荷的 description。
         description = str(kwargs.get("description") or "").strip()
+        emoji_payload = kwargs.get("emoji")
+        if not isinstance(emoji_payload, dict):
+            emoji_payload = {}
         if not description:
-            emoji_payload = kwargs.get("emoji")
-            if isinstance(emoji_payload, dict):
-                description = str(emoji_payload.get("description") or "").strip()
-        if not description:
+            description = str(emoji_payload.get("description") or "").strip()
+        # 载荷里的 file_hash 就是 Images.image_hash（sha256），按它入队即可精确锁定这张图。
+        image_hash = str(emoji_payload.get("file_hash") or "").strip()
+        if not image_hash or not description:
+            self.ctx.logger.debug(
+                "跳过新表情包含义补录：载荷缺少 hash 或描述（hash=%r desc=%r）", image_hash, description
+            )
             return
+        # 这张图的含义可能是在"宿主还没生成描述"时按 hash 算出来的：现在描述出来了就回填，
+        # 注入文本里的标签才不会是"（标签未生成）"。
+        if self._meaning_store.backfill_description(image_hash, description):
+            self.ctx.logger.debug("已回填表情包描述（hash=%s desc=%r）", image_hash[:12], description)
         # 新注册是"复活"放弃条目的唯一入口。
-        self._meaning_abandoned.discard(description)
-        self._enqueue_emoji_meaning(description, force=True)
+        self._meaning_abandoned.discard(image_hash)
+        self._enqueue_emoji_meaning(image_hash, description, force=True)
 
     @HookHandler(
-        "maisaka.replyer.before_request",
-        name="replyer_emoji_meaning_injector",
-        description="planner 拉起的回复流程里，把上下文表情包的准确含义注入 extra_prompt",
+        "maisaka.planner.before_request",
+        name="planner_emoji_meaning_scan",
+        description="observe：planner 决策前扫一遍本轮上下文出现的表情包，给缺含义的那些按需补录",
+        mode=HookMode.OBSERVE,
+        order=HookOrder.NORMAL,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_planner_emoji_meaning_scan(self, **kwargs: Any) -> None:
+        """planner 按需补录：只补"这一轮真的出现在上下文里"的表情包。
+
+        这是**唯一**的批量补录通道：token 消耗随实际使用量走、不随表情库规模走。
+        （0.13.11 起移除了「库扫描补录」——全库扫描既慢又贵，而没出现在上下文里的表情包
+        本来也不影响聊天。）
+
+        取表情包的方式：从 ``items`` 里找出带 ``[表情包: …]`` 的上下文项、收集它们的
+        ``meta.timestamp``，再用 ``message.get_by_time_in_chat``（**不带二进制**）把该时间窗内的
+        消息拉回来——消息里的 emoji 组件自带 ``hash``（宿主全链路拿它当唯一 id），
+        所以补录是"按 id"的，不依赖描述是否已经生成。
+        """
+        cfg = self.config.emoji_meaning
+        if not self._plugin_enabled() or not cfg.enabled:
+            return
+        if self._meaning_store is None:
+            return
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not session_id:
+            return
+        items = kwargs.get("items")
+        if not isinstance(items, list) or not items:
+            return
+        window = self._planner_turn_emoji_window(items)
+        if window is None:
+            placeholders = self._planner_media_placeholders(items)
+            if placeholders:
+                self.ctx.logger.debug(
+                    "planner 按需补录跳过：本轮上下文的媒体是适配器降级的**文本占位**（%s）——"
+                    "宿主侧没有 emoji 组件、没有 hash、没有字节，含义库无从下手（会话 %s）",
+                    "、".join(placeholders),
+                    session_id,
+                )
+            return
+        start_time, end_time = window
+        now = time.monotonic()
+        last = self._meaning_scan_state.get(session_id)
+        if last is not None and now - last[0] < _MEANING_SCAN_MIN_INTERVAL_SECONDS:
+            self.ctx.logger.debug(
+                "planner 按需补录跳过：节流中（距上次扫描 %.1f 秒 < %.1f 秒，会话 %s）",
+                now - last[0],
+                _MEANING_SCAN_MIN_INTERVAL_SECONDS,
+                session_id[:12],
+            )
+            return  # 节流：同一会话短时间内的多轮 planner 只扫一次
+        if last is not None and end_time <= last[1]:
+            self.ctx.logger.debug(
+                "planner 按需补录跳过：上下文时间窗没有往后走（右端 %.3f ≤ 上次 %.3f，会话 %s）",
+                end_time,
+                last[1],
+                session_id[:12],
+            )
+            return  # 上下文没有往后走（同一批历史），不必重复取消息
+        self._meaning_scan_state[session_id] = (now, end_time)
+
+        refs = await self._fetch_emoji_refs_in_window(session_id, start_time, end_time)
+        if not refs:
+            self.ctx.logger.debug(
+                "planner 按需补录跳过：窗口 %.1f~%.1f 内没有带 hash 的表情包（会话 %s）",
+                start_time,
+                end_time,
+                session_id,
+            )
+            return
+        known = self._meaning_store.known_hashes()
+        enqueued = 0
+        for image_hash, description in refs:
+            if image_hash in known or image_hash in self._meaning_queued:
+                continue
+            if image_hash in self._meaning_abandoned:
+                # 放弃名单里的不复活：连续失败 max_attempts 次说明这张图多半没法用，
+                # 每轮 planner 都重试只会刷日志。复活的唯一入口是"重新注册"钩子。
+                continue
+            self._enqueue_emoji_meaning(image_hash, description)
+            enqueued += 1
+        if enqueued:
+            self.ctx.logger.info(
+                "planner 按需补录：本轮上下文出现 %d 个表情包，其中 %d 个缺含义已入队（会话 %s）",
+                len(refs),
+                enqueued,
+                session_id,
+            )
+        else:
+            self.ctx.logger.debug(
+                "planner 按需补录：本轮 %d 个表情包都已有含义 / 已在队列 / 已放弃（会话 %s）",
+                len(refs),
+                session_id,
+            )
+
+    @staticmethod
+    def _planner_media_placeholders(items: List[Any]) -> List[str]:
+        """本轮上下文里出现的"适配器降级媒体占位"文本（去重保序，最多 3 个，仅用于日志）。"""
+        found: List[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            texts: List[str] = []
+            parts = item.get("parts")
+            if isinstance(parts, list):
+                for part in parts:
+                    if isinstance(part, dict) and str(part.get("type") or "") == "text":
+                        texts.append(str(part.get("text") or ""))
+            if isinstance(item.get("text_parts"), list):
+                texts.extend(str(text) for text in item["text_parts"])
+            for text in texts:
+                for hint in _MEDIA_PLACEHOLDER_HINTS:
+                    if hint in text and hint not in found:
+                        found.append(hint)
+                        if len(found) >= 3:
+                            return found
+        return found
+
+    @staticmethod
+    def _planner_turn_emoji_window(items: List[Any]) -> Optional[Tuple[float, float]]:
+        """本轮 planner 上下文里出现表情包的时间窗；没出现返回 ``None``。
+
+        逐项扫文本部分找 ``[表情包…]``，命中就取该项 ``meta.timestamp``——历史项的时间戳就是
+        原始消息时间（宿主 ``maisaka/context/messages.py`` 用 ``session_message.timestamp``
+        建项），快照里是 ISO 字符串（``request_snapshot._serialize_item_meta``）。
+        """
+        stamps: List[float] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            texts: List[str] = []
+            parts = item.get("parts")
+            if isinstance(parts, list):
+                for part in parts:
+                    if isinstance(part, dict) and str(part.get("type") or "") == "text":
+                        texts.append(str(part.get("text") or ""))
+            if isinstance(item.get("text_parts"), list):
+                texts.extend(str(text) for text in item["text_parts"])
+            if not any("[表情包" in text for text in texts):
+                continue
+            meta = item.get("meta")
+            if not isinstance(meta, dict):
+                continue
+            stamp = _parse_iso_timestamp(meta.get("timestamp"))
+            if stamp > 0:
+                stamps.append(stamp)
+        if not stamps:
+            return None
+        return (
+            min(stamps) - _MEANING_SCAN_WINDOW_PAD_SECONDS,
+            max(stamps) + _MEANING_SCAN_WINDOW_PAD_SECONDS,
+        )
+
+    async def _fetch_emoji_refs_in_window(
+        self, session_id: str, start_time: float, end_time: float
+    ) -> List[Tuple[str, str]]:
+        """拉时间窗内的消息并收集其中的表情包引用（**不带二进制**，单次开销很小）。"""
+        try:
+            messages = await self.ctx.message.get_by_time_in_chat(
+                chat_id=session_id,
+                start_time=start_time,
+                end_time=end_time,
+                limit=_MEANING_SCAN_MSG_LIMIT,
+                include_binary_data=False,
+            )
+        except Exception as exc:
+            self.ctx.logger.debug("planner 按需补录取消息失败（会话 %s）: %s", session_id, exc)
+            return []
+        if not isinstance(messages, list):
+            self.ctx.logger.debug("planner 按需补录取消息返回形态异常: %r", type(messages).__name__)
+            return []
+        refs: List[Tuple[str, str]] = []
+        seen: set[str] = set()
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            for image_hash, description in extract_emoji_refs_from_message(message):
+                if not image_hash or image_hash in seen:
+                    continue
+                seen.add(image_hash)
+                refs.append((image_hash, description))
+        return refs
+
+    # ------------------------------------------------------------------
+    # Hook：把上下文里的表情包标签**就地替换**为含义库描述
+    # ------------------------------------------------------------------
+
+    def _rewrite_scope(self) -> set[str]:
+        """当前允许替换的范围（`replyer` / `planner`）；留空表示不替换。"""
+        raw = self.config.emoji_meaning.rewrite_scope
+        if not isinstance(raw, (list, tuple)):
+            return set()
+        names = {str(name).strip().lower() for name in raw if str(name).strip()}
+        unknown = names - {"replyer", "planner"}
+        if unknown:
+            self.ctx.logger.debug("标签替换范围里有无法识别的取值，已忽略: %s", "、".join(sorted(unknown)))
+        return names & {"replyer", "planner"}
+
+    @HookHandler(
+        "maisaka.replyer.before_model_request",
+        name="replyer_emoji_label_rewriter",
+        description="blocking：把 replyer 请求上下文里的 `[表情包: 标签]` 就地替换为含义库描述",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
         error_policy=ErrorPolicy.SKIP,
     )
-    async def handle_replyer_emoji_injector(self, **kwargs: Any) -> Dict[str, Any]:
-        request_type = str(kwargs.get("request_type") or "").strip()
-        if not self._meaning_request_type_allowed(request_type):
-            self.ctx.logger.debug(
-                "跳过表情包含义注入：request_type=%r 不在注入范围内（插件自行生成的回复不注入）",
-                request_type or "?",
-            )
-            return {"action": "continue"}
+    async def handle_replyer_emoji_label_rewrite(self, **kwargs: Any) -> Dict[str, Any]:
+        return await self._rewrite_emoji_labels_hook(kwargs, target="replyer")
 
-        modified = dict(kwargs)
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="planner_emoji_label_rewriter",
+        description="blocking：把 planner 请求上下文里的 `[表情包: 标签]` 就地替换为含义库描述",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_planner_emoji_label_rewrite(self, **kwargs: Any) -> Dict[str, Any]:
+        return await self._rewrite_emoji_labels_hook(kwargs, target="planner")
+
+    async def _rewrite_emoji_labels_hook(
+        self, kwargs: Dict[str, Any], *, target: str
+    ) -> Dict[str, Any]:
+        """把 `items` 里的表情包标签换成含义库描述；失败/无命中一律原样返回。
+
+        改的是**即将发给模型的请求**（`Context Items`），不动宿主状态、不动数据库 ——
+        所以是零副作用的：把 `rewrite_scope` 清空、或直接卸载插件即可完全回退。
+        """
+        if target not in self._rewrite_scope():
+            return {"action": "continue"}
+        items = kwargs.get("items")
+        if not isinstance(items, list) or not items:
+            return {"action": "continue"}
         try:
-            block = await self._build_emoji_meaning_block(modified)
+            rewritten_items, hits = self._rewrite_emoji_labels_in_items(
+                items, str(kwargs.get("session_id") or "").strip()
+            )
         except Exception as exc:
-            self.ctx.logger.warning("表情包含义注入失败，跳过: %s", exc)
-            return {"action": "continue", "modified_kwargs": modified}
-        if not block:
-            return {"action": "continue", "modified_kwargs": modified}
-        existing = str(modified.get("extra_prompt") or "").strip()
-        modified["extra_prompt"] = f"{existing}\n\n{block}" if existing else block
+            self.ctx.logger.warning("表情包标签替换失败，标签保持原样（%s）: %s", target, exc)
+            return {"action": "continue"}
+        if not hits or rewritten_items is None:
+            return {"action": "continue"}
+        modified = dict(kwargs)
+        modified["items"] = rewritten_items
+        self.ctx.logger.debug(
+            "表情包标签已替换为含义库描述：%d 处（%s 请求，会话 %s）",
+            hits,
+            target,
+            str(kwargs.get("session_id") or "?")[:12],
+        )
         return {"action": "continue", "modified_kwargs": modified}
 
-    def _meaning_request_type_allowed(self, request_type: str) -> bool:
-        """该 replyer 请求是否允许注入含义（默认只注入 planner 拉起的回复流程）。
+    def _rewrite_emoji_labels_in_items(
+        self, items: List[Any], session_id: str
+    ) -> Tuple[Optional[List[Any]], int]:
+        """遍历 items 替换文本段里的表情包标签；返回 (改写后的 items 或 None, 替换条数)。
 
-        宿主的回复工具以 ``request_type="maisaka.replyer"`` 取生成器；插件自己拉起
-        回复生成（``generator_api`` / ``plugin.<id>`` 等）不属于正常回复流程，不注入。
-        插件激活 planner（主动触发、注入上下文）后由 planner 拉起的 reply 仍是
-        ``maisaka.replyer``，因此照常注入。
+        只动 ``type == "text"`` 的 part 文本，其余 part / meta / item 结构**一字不动** ——
+        返回的列表与入参等长，宿主据此整体替换请求 items。
         """
-        raw_names = self.config.emoji_meaning.inject_request_types
-        if not isinstance(raw_names, (list, tuple)):
-            return True
-        names = {str(name).strip().lower() for name in raw_names if str(name).strip()}
-        if not names:
-            return True  # 留空 = 不过滤
-        if "*" in names:
-            return True
-        return str(request_type or "").strip().lower() in names
-
-    async def _build_emoji_meaning_block(self, modified: Dict[str, Any]) -> str:
-        """收集回复目标与会话近期消息中的表情包描述，从含义库生成注入文本块。"""
         cfg = self.config.emoji_meaning
-        if not self._plugin_enabled() or not cfg.enabled or not cfg.inject_enabled:
-            return ""
-        if self._meaning_store is None:
-            return ""
-
-        # 被回复的消息优先（bot 正在对某个表情包作出回应）。
-        refs: List[str] = []
-        reply_message_id = str(modified.get("reply_message_id") or "").strip()
-        if reply_message_id:
-            refs.extend(await self._lookup_target_emoji_descs(reply_message_id))
-        session_id = str(modified.get("session_id") or "").strip()
-        refs.extend(self._recent_emoji_descs(session_id))
-
-        meanings = self._meaning_store.get_meanings(refs)
-        entries: List[Tuple[str, str]] = []
-        for desc in refs:
-            if len(entries) >= cfg.inject_max_emojis:
-                break
-            meaning = meanings.get(desc)
-            if meaning and all(desc != existing_desc for existing_desc, _ in entries):
-                entries.append((desc, meaning))
-        return build_injection_block(entries)
-
-    def _enqueue_emoji_meaning(self, description: str, *, force: bool = False) -> None:
-        """把描述标签加入含义补录队列（去重、限长、放弃条目默认不再入队）。"""
-        normalized = str(description or "").strip()
-        if not normalized or len(normalized) > MAX_DESCRIPTION_LENGTH:
-            return
-        if not force and normalized in self._meaning_abandoned:
-            return
-        if normalized in self._meaning_queued:
-            return
-        self._meaning_queued.add(normalized)
-        self._meaning_queue.append(normalized)
-
-    async def _meaning_scan_loop(self) -> None:
-        """周期补录通道：定期扫描宿主表情库，把没有含义的描述加入队列。"""
-        first = True
-        while True:
-            try:
-                if first:
-                    first = False
-                    # 启动后稍等片刻，等宿主表情库就绪。
-                    await asyncio.sleep(15.0)
+        if not self._plugin_enabled() or not cfg.enabled or self._meaning_store is None:
+            return None, 0
+        now = time.monotonic()
+        hash_memo: Dict[str, Tuple[str, str]] = {}
+        desc_memo: Dict[str, Tuple[str, str]] = {}
+        result: List[Any] = []
+        total = 0
+        for item in items:
+            parts = item.get("parts") if isinstance(item, dict) else None
+            if not isinstance(parts, list):
+                result.append(item)
+                continue
+            refs = self._item_emoji_refs(item, now)
+            cursor = 0
+            hits_in_item = 0
+            new_parts: List[Any] = []
+            for part in parts:
+                if not isinstance(part, dict) or str(part.get("type") or "") != "text":
+                    new_parts.append(part)
+                    continue
+                text = part.get("text")
+                if not isinstance(text, str) or "[表情包" not in text:
+                    new_parts.append(part)
+                    continue
+                new_text, cursor, hits = self._rewrite_labels_in_text(
+                    text, refs, cursor, hash_memo, desc_memo
+                )
+                if hits:
+                    hits_in_item += hits
+                    replaced = dict(part)
+                    replaced["text"] = new_text
+                    new_parts.append(replaced)
                 else:
-                    await asyncio.sleep(max(60.0, float(self.config.emoji_meaning.scan_interval_seconds)))
-                if self.config.emoji_meaning.enabled and self._meaning_store is not None:
-                    await self._scan_emoji_library()
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                self.ctx.logger.warning("表情包含义库扫描失败: %s", exc)
-                await asyncio.sleep(60.0)
+                    new_parts.append(part)
+            if hits_in_item:
+                total += hits_in_item
+                new_item = dict(item)
+                new_item["parts"] = new_parts
+                result.append(new_item)
+            else:
+                result.append(item)
+        return (result, total) if total else (None, 0)
 
-    async def _scan_emoji_library(self) -> None:
-        """扫描宿主 images 表中的表情包，把缺少含义的描述加入补录队列。
+    @classmethod
+    def _item_message_id(cls, item: Dict[str, Any]) -> str:
+        """取 item 文本前缀里的 ``msg_id="..."``；没有返回空串。
 
-        只取"已注册、有文件、未禁用"的行：含义生成取图依赖宿主运行库（已注册且
-        文件可用的表情才会被 ``emoji.get_random`` 抽到），Images 表里仅完成描述
-        构建、未注册成功或文件缺失的行永远取不到图，不过滤会导致这些条目被
-        周期扫描无限复活。
+        前缀（``<message msg_id="…" time="…" user="…">``）恒为该项**第一段文本**，
+        由宿主 ``maisaka/context/planner_messages.py`` 生成。它是给模型看的展示格式，
+        所以这里只当作"锦上添花"的精确线索 —— 解析不到就退回按描述匹配。
         """
-        rows = await self.ctx.db.query("Images", filters={"image_type": "emoji"})
-        if not isinstance(rows, list):
-            self.ctx.logger.warning("扫描表情包库失败，database.query 返回形态异常: %r", type(rows).__name__)
-            return
-        known = self._meaning_store.known_descriptions()
-        enqueued = 0
-        for row in rows:
-            if not isinstance(row, dict) or bool(row.get("is_banned", False)):
+        parts = item.get("parts")
+        if not isinstance(parts, list):
+            return ""
+        for part in parts:
+            if not isinstance(part, dict) or str(part.get("type") or "") != "text":
                 continue
-            if not bool(row.get("is_registered", False)) or bool(row.get("no_file_flag", False)):
+            text = str(part.get("text") or "")
+            if "<message " not in text:
+                return ""
+            match = _MSG_ID_IN_PREFIX.search(text)
+            return match.group(1).strip() if match else ""
+        return ""
+
+    def _item_emoji_refs(self, item: Dict[str, Any], now: float) -> List[Tuple[str, str]]:
+        """路 A：由前缀 ``msg_id`` 查本地映射，拿到该消息的 ``[(hash, 描述)]``（**0 RPC**）。"""
+        message_id = self._item_message_id(item)
+        if not message_id:
+            return []
+        return self._cached_message_emoji_refs(message_id, now)
+
+    def _rewrite_labels_in_text(
+        self,
+        text: str,
+        refs: List[Tuple[str, str]],
+        cursor: int,
+        hash_memo: Dict[str, Tuple[str, str]],
+        desc_memo: Dict[str, Tuple[str, str]],
+    ) -> Tuple[str, int, int]:
+        """把宿主标签改写成 ``[表情包标签：X]`` 并在后面追加内容描述块；返回 (新文本, 新游标, 追加条数)。
+
+        形态：``[表情包标签：困惑,疑问][表情包图片内容描述：这是一张gif格式的表情包。一张聊天截图，…]``
+        —— **宿主标签的文字一字不动**，只是标记从 ``表情包`` 变成 ``表情包标签``（显式声明它是标签），
+        画面内容放在**另一个标记**里，并写明这张图是什么格式。
+
+        每条标签依次尝试：**路 A**（按组件顺序对应本地映射里的 hash，仅当标签为空、
+        或与本地映射记下的描述一致时才采信）→ **路 B**（用标签文本当描述去库里查）。
+        两条都拿不到含义时**原样保留**；紧跟其后已有 ``[表情包图片内容描述：`` 时也跳过（保证幂等）。
+        """
+        pieces: List[str] = []
+        last = 0
+        hits = 0
+        for match in EMOJI_LABEL_PATTERN.finditer(text):
+            label = (match.group(1) or "").strip()
+            used_hash = ""
+            meaning = ""
+            image_format = ""
+            if cursor < len(refs):
+                ref_hash, ref_desc = refs[cursor]
+                if ref_hash and (not label or not ref_desc or label == ref_desc):
+                    cached = hash_memo.get(ref_hash)
+                    if cached is None:
+                        cached = self._meaning_store.content_for_hash(ref_hash)
+                        if cached[1]:
+                            hash_memo[ref_hash] = cached
+                    used_hash, meaning, image_format = cached
+            if not meaning and label:
+                cached = desc_memo.get(label)
+                if cached is None:
+                    cached = self._meaning_store.content_for_description(label)
+                    if cached[1]:
+                        desc_memo[label] = cached
+                used_hash, meaning, image_format = cached
+            cursor += 1
+            # 已经追加过就直接跳过（重试时同一个 context_factory 会被再调一次）
+            if not meaning or text[match.end() :].startswith(EMOJI_CONTENT_SUFFIX_PREFIX):
+                if not meaning:
+                    self.ctx.logger.debug(
+                        "含义注入跳过：标签 %r 查不到含义（按 hash 路=%s，按描述路=%s）",
+                        label or "(空标签)",
+                        "命中" if used_hash else "未命中",
+                        "无从匹配（空标签）" if not label else "未命中",
+                    )
+                else:
+                    self.ctx.logger.debug(
+                        "含义注入跳过：标签 %r 后面已有内容块（重入，幂等）", label or "(空标签)"
+                    )
                 continue
-            description = str(row.get("description") or "").strip()
-            if not description or len(description) > MAX_DESCRIPTION_LENGTH:
-                continue
-            if description in known or description in self._meaning_queued:
-                continue
-            self._enqueue_emoji_meaning(description)
-            enqueued += 1
-        if enqueued:
-            self.ctx.logger.info(
-                "表情包含义补录扫描：新增待生成 %d 条（库内表情 %d，已收录 %d）",
-                enqueued,
-                len(rows),
-                len(known),
+            if used_hash:
+                # 只记内存，落库交给工作循环（热路径不写库）。
+                self._meaning_used.add(used_hash)
+            pieces.append(text[last : match.start()])
+            pieces.append(build_tagged_emoji_label(label))
+            pieces.append(build_emoji_content_suffix(meaning, image_format))
+            last = match.end()
+            hits += 1
+            self.ctx.logger.debug(
+                "含义注入：标签 %r → 已追加内容块（hash=%s，格式=%s，含义 %d 字）",
+                label or "(空标签)",
+                (used_hash or "-")[:12],
+                image_format or "-",
+                len(meaning),
             )
+        if not hits:
+            return text, cursor, 0
+        pieces.append(text[last:])
+        return "".join(pieces), cursor, hits
+
+    def _enqueue_emoji_meaning(self, image_hash: str, description: str, *, force: bool = False) -> None:
+        """把 ``(image_hash, 描述)`` 加入含义补录队列（去重、限长、放弃项默认不再入队）。
+
+        没有 hash 的表情包**不入队**：含义按 hash 存与查，拿不到 hash 就无从对齐
+        （宿主的 ``emoji.*`` 能力都不返回 hash，所以只走"消息组件 / Images 表 / 注册钩子"
+        这三条带 hash 的路）。
+        """
+        normalized_hash = str(image_hash or "").strip()
+        normalized_desc = str(description or "").strip()
+        if not normalized_hash or len(normalized_desc) > MAX_DESCRIPTION_LENGTH:
+            return
+        if not force and normalized_hash in self._meaning_abandoned:
+            return
+        if normalized_hash in self._meaning_queued:
+            return
+        self._meaning_queued.add(normalized_hash)
+        self._meaning_queue.append((normalized_hash, normalized_desc))
 
     async def _meaning_worker_loop(self) -> None:
-        """含义生成工作循环：每轮从队列取 batch_size 条，抽样取图后调 VLM。"""
+        """含义生成工作循环：每轮生成 batch_size 条；顺带做用量回写与过期淘汰。"""
         while True:
             try:
                 await asyncio.sleep(max(5.0, float(self.config.emoji_meaning.worker_interval_seconds)))
                 # 循环无条件启动，顺带承担全局状态清理的节拍（不依赖回复轮标记触发）。
                 self._prune_stale_state(time.monotonic())
                 if self.config.emoji_meaning.enabled and self._meaning_store is not None:
+                    self._flush_meaning_usage()
+                    self._purge_expired_meanings()
                     await self._process_meaning_batch()
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 self.ctx.logger.warning("表情包含义生成工作循环异常: %s", exc)
 
-    async def _process_meaning_batch(self) -> None:
-        """处理一批待补录描述：抽样取图、生成含义、入库。
+    def _flush_meaning_usage(self) -> None:
+        """把内存里攒的"这次用到了哪些含义"批量回写 ``last_used_at``。
 
-        宿主 ``emoji.get_all`` 会把整个表情库的 base64 塞进单个 RPC 帧，大库超过
-        16MB 帧上限（线上实测 47MB 被拒），因此改为 ``emoji.get_random`` 分批抽样：
-        每轮抽 k 张（帧错误自动减半、命中不足逐步恢复），命中队列描述的立即生成；
-        随机抽样对全库均匀覆盖，未命中的描述后续轮次必然命中。
+        热路径（每次请求改写标签）只往 ``self._meaning_used`` 里 add，**不写库**；
+        真正落库放在这里，一次 UPDATE 批量搞定。
+        """
+        if not self._meaning_used or self._meaning_store is None:
+            return
+        used = list(self._meaning_used)
+        self._meaning_used.clear()
+        try:
+            self._meaning_store.touch_usage(used, time.time())
+        except Exception as exc:
+            self.ctx.logger.debug("回写表情包含义使用时间失败: %s", exc)
+        else:
+            self.ctx.logger.debug("回写表情包含义使用时间：%d 条（TTL 淘汰据此判断「最近用过」）", len(used))
+
+    def _purge_expired_meanings(self) -> None:
+        """按 ``meaning_ttl_days`` 淘汰长期没用过的含义（0 = 不淘汰）；每小时最多跑一次。"""
+        ttl_days = int(self.config.emoji_meaning.meaning_ttl_days or 0)
+        if ttl_days <= 0 or self._meaning_store is None:
+            return
+        now = time.monotonic()
+        if now - self._meaning_purge_at < _MEANING_PURGE_MIN_INTERVAL_SECONDS:
+            return
+        self._meaning_purge_at = now
+        try:
+            removed = self._meaning_store.purge_expired(ttl_days, time.time())
+        except Exception as exc:
+            self.ctx.logger.warning("淘汰过期表情包含义失败: %s", exc)
+            return
+        if removed:
+            self.ctx.logger.info(
+                "已淘汰 %d 条 %d 天未使用的表情包含义（剩余 %d 条）",
+                removed,
+                ttl_days,
+                self._meaning_store.count(),
+            )
+
+    async def _process_meaning_batch(self) -> None:
+        """处理一批待补录表情包：**按 hash 取图** → 调 VLM 生成 → 按 hash 入库。
+
+        取图顺序：① 入站载荷自带的 base64 缓存（最省，见 ``_remember_inline_emoji_bytes``）；
+        ② 按 hash 读宿主图片文件（``data/images/<hash>.<ext>`` 或 ``Images.full_path``）；
+        ③ 仍拿不到才退回 ``emoji.get_random`` 抽样——抽样载荷不含 hash，改在本地对抽到的
+        base64 算 sha256 与目标比对（宿主 ``emoji.get_all`` 会把整库 base64 塞进单个 RPC 帧，
+        大库超过 16MB 帧上限、线上实测 47MB 被拒，所以抽样是唯一可用的能力通道）。
+
+        **三条路都只产出 base64 字符串**，格式一律由 ``normalize_image_for_vlm`` 按真实魔数给出
+        （需要时转 PNG），所以不存在"格式串与字节对不上"的可能；不是图片的字节直接跳过，
+        不会拿空图去问视觉模型。
         """
         cfg = self.config.emoji_meaning
-        batch: List[str] = []
+        batch: List[Tuple[str, str]] = []
         while self._meaning_queue and len(batch) < cfg.batch_size:
-            description = self._meaning_queue.popleft()
-            self._meaning_queued.discard(description)
-            batch.append(description)
+            image_hash, description = self._meaning_queue.popleft()
+            self._meaning_queued.discard(image_hash)
+            batch.append((image_hash, description))
         if not batch:
             return
 
-        sample = await self._sample_emoji_images()
-        if sample is None:
-            # 抽样失败（帧超限等）：整批顺延，抽样张数已自适应下调。
-            for description in batch:
-                self._enqueue_emoji_meaning(description, force=True)
-            return
-
-        for description in batch:
-            image = sample.get(description)
-            if image is None:
-                # 本轮抽样未命中：不计入生成失败次数，等待后续轮次命中。
-                self._record_meaning_sample_miss(description)
+        sample: Optional[Dict[str, str]] = None
+        for image_hash, description in batch:
+            image_base64 = self._take_inline_emoji_bytes(image_hash)
+            if image_base64 is None:
+                image_base64 = await self._load_emoji_bytes_by_hash(image_hash)
+            if image_base64 is None:
+                if sample is None:
+                    sample = await self._sample_emoji_images()
+                if sample is None:
+                    # 抽样失败（帧超限等）：该条顺延，抽样张数已自适应下调。
+                    self._enqueue_emoji_meaning(image_hash, description, force=True)
+                    continue
+                image_base64 = sample.get(image_hash)
+            if not image_base64:
+                # 三条路都拿不到这张图：不计入生成失败次数，等待后续轮次。
+                self._record_meaning_sample_miss(image_hash, description)
                 continue
+            # 上传前统一规范化：格式必属宿主白名单、base64 必能被 validate=True 解码。
+            # 动图会在这里被**取首帧转 PNG**，所以"送给模型的格式"与"宿主那份字节的格式"
+            # 可能不同：库里记**宿主侧原始格式**（注入文本要如实说这是张什么格式的表情包），
+            # 送给模型的用规范化后的格式。
+            host_format = detect_image_format(image_base64)
+            normalized = normalize_image_for_vlm(image_base64)
+            if normalized is None:
+                detected = host_format or "无法识别"
+                self.ctx.logger.warning(
+                    "表情包图片格式不可用，跳过（hash=%s，识别为 %s）", image_hash[:12], detected
+                )
+                self._record_meaning_failure(image_hash, description, f"图片格式不可用（{detected}）")
+                continue
+            image_payload, image_format = normalized
+            stored_format = host_format or image_format
             try:
-                meaning = await self._generate_emoji_meaning(description, image[0], image[1])
+                meaning = await self._generate_emoji_meaning(description, image_payload, image_format)
             except Exception as exc:
-                self.ctx.logger.warning("表情包含义生成失败（desc=%r）: %s", description, exc)
-                self._record_meaning_failure(description, str(exc))
+                self.ctx.logger.warning("表情包含义生成失败（hash=%s）: %s", image_hash[:12], exc)
+                self._record_meaning_failure(image_hash, description, str(exc))
                 continue
-            self._meaning_attempts.pop(description, None)
-            self._meaning_misses.pop(description, None)
-            self._meaning_store.upsert(description, meaning, image_format=image[1], source="scan")
-            self.ctx.logger.info("已收录表情包含义（desc=%r，长度 %d）", description, len(meaning))
+            self._meaning_attempts.pop(image_hash, None)
+            self._meaning_misses.pop(image_hash, None)
+            if self._meaning_store.upsert(
+                image_hash, description, meaning, image_format=stored_format, source="scan"
+            ):
+                self.ctx.logger.info(
+                    "已收录表情包含义（hash=%s desc=%r 格式=%s%s，长度 %d）",
+                    image_hash[:12],
+                    description,
+                    stored_format,
+                    "" if image_format == stored_format else f"，送模型={image_format}",
+                    len(meaning),
+                )
 
-    async def _sample_emoji_images(self) -> Optional[Dict[str, Tuple[str, str]]]:
-        """随机抽样一批表情包图片，返回 ``描述 -> (base64, 格式)``；失败返回 None。"""
+    async def _sample_emoji_images(self) -> Optional[Dict[str, str]]:
+        """随机抽样一批表情包图片，返回 ``sha256 -> base64``；失败返回 None。
+
+        抽样载荷不带 hash（宿主 ``_serialize_emoji_payload`` 只给 base64/description/emotion），
+        所以这里在本地按同一口径（sha256 原始字节）算出 key，才能与队列里的目标 hash 精确对上。
+        只回传 base64，格式交给 ``normalize_image_for_vlm`` 判。
+        """
         try:
             count_result = await self.ctx.emoji.get_count()
         except Exception as exc:
@@ -3170,33 +3947,189 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         if not isinstance(sample, list):
             self.ctx.logger.warning("表情包抽样返回形态异常: %r", type(sample).__name__)
             return None
-        desc_to_image: Dict[str, Tuple[str, str]] = {}
+        hash_to_image: Dict[str, str] = {}
         for item in sample:
             if not isinstance(item, dict):
                 continue
-            description = str(item.get("description") or "").strip()
             image_base64 = str(item.get("base64") or "")
-            if not description or not image_base64 or description in desc_to_image:
+            if not image_base64:
                 continue
-            desc_to_image[description] = (image_base64, sniff_image_format(image_base64))
-        return desc_to_image
+            image_hash = sha256_of_base64(image_base64)
+            if not image_hash or image_hash in hash_to_image:
+                continue
+            hash_to_image[image_hash] = image_base64
+        return hash_to_image
 
-    def _record_meaning_sample_miss(self, description: str) -> None:
-        """抽样未命中的描述不计入生成失败次数，仅按轮次计数，超限后放弃。"""
-        misses = self._meaning_misses.get(description, 0) + 1
-        if misses >= _MEANING_SAMPLE_MISS_CAP:
-            self._meaning_misses.pop(description, None)
-            self.ctx.logger.warning("表情包含义长期未抽样命中，放弃（desc=%r，等待 %d 轮）", description, misses)
+    def _remember_inline_emoji_bytes(self, message: Dict[str, Any]) -> None:
+        """缓存入站载荷里表情组件自带的 base64（宿主序列化时若内存里的字节已清，会按 hash 回读文件补上）。
+
+        有就存、没有就算了：生成时优先用它，省一次读盘。
+        """
+        components = message.get("raw_message")
+        if not isinstance(components, list):
             return
-        self._meaning_misses[description] = misses
-        self._enqueue_emoji_meaning(description, force=True)
+        for component in components:
+            if not isinstance(component, dict) or str(component.get("type") or "") != "emoji":
+                continue
+            image_hash = str(component.get("hash") or "").strip()
+            image_base64 = str(component.get("binary_data_base64") or "").strip()
+            if not image_hash or not image_base64:
+                continue
+            self._meaning_inline_bytes[image_hash] = image_base64
+            self._meaning_inline_bytes.move_to_end(image_hash)
+            while len(self._meaning_inline_bytes) > _MEANING_INLINE_BYTES_MAX:
+                self._meaning_inline_bytes.popitem(last=False)
+
+    def _take_inline_emoji_bytes(self, image_hash: str) -> Optional[str]:
+        """取走并删除该 hash 的入站内联图片 base64（取出即删，避免长期占内存）。"""
+        return self._meaning_inline_bytes.pop(str(image_hash or "").strip(), None)
+
+    def _resolve_host_roots(self) -> List[Path]:
+        """发现宿主根目录（按 hash 读图片文件用）；找不到返回空列表。
+
+        插件位于 ``<root>/plugins/<plugin_dir>/``，所以自身路径往上推就是宿主根；再用
+        ``ctx.paths.data_dir`` / ``runtime_dir`` 作额外线索（部署布局可能不同）。
+        判据用稳定标记 ``bot.py`` + ``data/``（参考 ``image-relook`` 插件的做法）。
+        """
+        if self._host_roots:
+            return self._host_roots
+        hints: List[Path] = [Path(__file__).resolve().parent]
+        paths = getattr(self.ctx, "paths", None)
+        for attr in ("data_dir", "runtime_dir"):
+            value = getattr(paths, attr, None) if paths is not None else None
+            if value:
+                hints.append(Path(str(value)))
+        roots: List[Path] = []
+        for hint in hints:
+            current = hint
+            for _ in range(4):
+                try:
+                    if (current / "bot.py").is_file() and (current / "data").is_dir():
+                        if current not in roots:
+                            roots.append(current)
+                        break
+                except OSError:
+                    break
+                parent = current.parent
+                if parent == current:
+                    break
+                current = parent
+        if not roots:
+            self.ctx.logger.debug("未发现宿主根目录：按 hash 读图片文件不可用（其余取图方式照常）")
+        self._host_roots = roots
+        return roots
+
+    def _read_image_file(self, path: Path) -> Optional[str]:
+        """读一张图片并转 base64；**路径必须落在宿主根目录内**，否则/失败返回 None。
+
+        只回传 base64 字符串——格式统一交给 ``normalize_image_for_vlm`` 按真实魔数判定，
+        避免"格式串与字节对不上"（宿主会直接抛 ``不受支持的图片格式``）。
+        """
+        roots = self._resolve_host_roots()
+        if not roots:
+            return None
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+        if not any(resolved.is_relative_to(root) for root in roots):
+            self.ctx.logger.debug("拒绝读取宿主根目录之外的图片: %s", resolved)
+            return None
+        try:
+            if not resolved.is_file():
+                return None
+            if resolved.stat().st_size > _MAX_IMAGE_FILE_BYTES:
+                return None
+            data = resolved.read_bytes()
+        except OSError as exc:
+            self.ctx.logger.debug("读取表情包图片失败 path=%s err=%s", resolved, exc)
+            return None
+        if not data:
+            return None
+        return base64.b64encode(data).decode("ascii")
+
+    async def _load_emoji_bytes_by_hash(self, image_hash: str) -> Optional[str]:
+        """按 hash 取表情包图片，返回 **base64 字符串**；取不到返回 None。
+
+        顺序：① ``data/images/<hash>.<ext>`` 约定路径；② ``Images`` 表按 ``image_hash`` 查
+        ``full_path`` 再读（跳过 ``no_file_flag``）。两者都要求路径落在宿主根目录内——
+        部署成 Docker / 远程（宿主文件不在本机）时自然失败，交由 ``emoji.get_random`` 抽样兜底。
+        """
+        normalized_hash = str(image_hash or "").strip()
+        if not normalized_hash:
+            return None
+        for root in self._resolve_host_roots():
+            images_dir = root / "data" / "images"
+            for ext in _IMAGE_FILE_EXTS:
+                loaded = self._read_image_file(images_dir / f"{normalized_hash}.{ext}")
+                if loaded is not None:
+                    return loaded
+        try:
+            rows = await self.ctx.db.query(
+                "Images",
+                query_type="get",
+                # 必须限定 image_type：宿主的 Images.image_hash 只是普通索引（不是唯一），
+                # 同一 hash 可以同时有 emoji 行与 image 行（同一张图既被当图片又被当表情包）。
+                # 不加这一条时 limit=1 可能取到 image 行，而它若已被清理（no_file_flag=True）
+                # 就会误判"读不到图"——尽管 emoji 行还有文件。
+                filters={"image_hash": normalized_hash, "image_type": "emoji"},
+                limit=1,
+            )
+        except Exception as exc:
+            self.ctx.logger.debug("按 hash 查 Images 失败（hash=%s）: %s", normalized_hash[:12], exc)
+            return None
+        if isinstance(rows, dict) and rows.get("success") is False:
+            self.ctx.logger.debug("按 hash 查 Images 被拒: %r", rows.get("error"))
+            return None
+        row = rows[0] if isinstance(rows, list) and rows else rows
+        if not isinstance(row, dict) or bool(row.get("no_file_flag")):
+            return None
+        full_path = str(row.get("full_path") or "").strip()
+        if not full_path:
+            return None
+        path = Path(full_path)
+        if path.is_absolute():
+            return self._read_image_file(path)
+        for root in self._resolve_host_roots():
+            loaded = self._read_image_file(root / path)
+            if loaded is not None:
+                return loaded
+        return None
+
+    def _record_meaning_sample_miss(self, image_hash: str, description: str) -> None:
+        """取不到图（文件不在本机且抽样未命中）不计入生成失败次数，仅按轮次计数，超限后放弃。"""
+        misses = self._meaning_misses.get(image_hash, 0) + 1
+        if misses >= _MEANING_SAMPLE_MISS_CAP:
+            self._meaning_misses.pop(image_hash, None)
+            self.ctx.logger.warning(
+                "表情包含义长期取不到图，放弃（hash=%s，等待 %d 轮）", image_hash[:12], misses
+            )
+            return
+        self._meaning_misses[image_hash] = misses
+        self._enqueue_emoji_meaning(image_hash, description, force=True)
 
     async def _generate_emoji_meaning(self, description: str, image_base64: str, image_format: str) -> str:
         """调用视觉模型生成一条表情包的准确含义。"""
         cfg = self.config.emoji_meaning
         prompt_text = cfg.generation_prompt.strip() or DEFAULT_GENERATION_PROMPT
         messages = build_generation_messages(prompt_text, image_base64, image_format)
-        result = await self.ctx.llm.generate(messages, model=cfg.model_task, max_tokens=cfg.max_tokens)
+        started = time.monotonic()
+        self.ctx.logger.debug(
+            "含义生成：调用视觉模型（model_task=%s，图片格式=%s，图片 base64=%d 字符，"
+            "宿主描述=%r，提示词=%s）",
+            cfg.model_task,
+            image_format,
+            len(image_base64),
+            description[:40],
+            "自定义" if cfg.generation_prompt.strip() else "内置",
+        )
+        try:
+            result = await self.ctx.llm.generate(messages, model=cfg.model_task, max_tokens=cfg.max_tokens)
+        except Exception as exc:
+            self.ctx.logger.warning(
+                "含义生成：视觉模型调用抛异常（耗时 %.2f 秒）：%s", time.monotonic() - started, exc
+            )
+            raise
         if not isinstance(result, dict):
             raise RuntimeError(f"llm.generate 返回形态异常: {type(result).__name__}")
         if result.get("success") is False:
@@ -3206,24 +4139,30 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             raise RuntimeError("视觉模型返回空描述")
         if len(text) > cfg.max_meaning_length:
             text = text[: cfg.max_meaning_length]
+        self.ctx.logger.debug(
+            "含义生成：视觉模型返回（耗时 %.2f 秒，%d 字）：%r",
+            time.monotonic() - started,
+            len(text),
+            text[:60],
+        )
         return text
 
-    def _record_meaning_failure(self, description: str, reason: str) -> None:
-        """记录一次含义生成失败；超过上限后放弃（周期扫描不再复活，注册钩子可解除）。"""
+    def _record_meaning_failure(self, image_hash: str, description: str, reason: str) -> None:
+        """记录一次含义生成失败；超过上限后放弃（库扫描不再复活，注册钩子/planner 按需可解除）。"""
         cfg = self.config.emoji_meaning
-        attempts = self._meaning_attempts.get(description, 0) + 1
+        attempts = self._meaning_attempts.get(image_hash, 0) + 1
         if attempts >= cfg.max_attempts:
-            self._meaning_attempts.pop(description, None)
-            self._meaning_abandoned.add(description)
+            self._meaning_attempts.pop(image_hash, None)
+            self._meaning_abandoned.add(image_hash)
             self.ctx.logger.warning(
-                "表情包含义生成多次失败，放弃（desc=%r，尝试 %d 次，末次原因：%s）",
-                description,
+                "表情包含义生成多次失败，放弃（hash=%s，尝试 %d 次，末次原因：%s）",
+                image_hash[:12],
                 attempts,
                 reason,
             )
             return
-        self._meaning_attempts[description] = attempts
-        self._enqueue_emoji_meaning(description, force=True)
+        self._meaning_attempts[image_hash] = attempts
+        self._enqueue_emoji_meaning(image_hash, description, force=True)
 
     # ------------------------------------------------------------------
     # 状态清理
@@ -3231,6 +4170,7 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
 
     def _prune_stale_state(self, now: float) -> None:
         """清理长期驻留的陈旧回复轮、计数与冷却状态。"""
+        sizes_before = self._state_sizes()
         for session_id in [
             key
             for key, value in self._reply_rounds.items()
@@ -3260,17 +4200,48 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             self._chat_emoji_cooldown_start.pop(session_id, None)
         for session_id in [
             key
-            for key, bucket in self._session_emoji_descs.items()
+            for key, bucket in self._session_emoji_refs.items()
             if not bucket or now - bucket[-1][0] > _SESSION_EMOJI_TTL_SECONDS
         ]:
-            self._session_emoji_descs.pop(session_id, None)
-        for message_id in [
+            self._session_emoji_refs.pop(session_id, None)
+        for session_id in [
             key
-            for key, entry in self._target_emoji_cache.items()
-            if now - entry[0] > _TARGET_EMOJI_TTL_SECONDS
+            for key, (stamp, _end) in self._meaning_scan_state.items()
+            if now - stamp > _STALE_STREAK_SECONDS
         ]:
-            self._target_emoji_cache.pop(message_id, None)
+            self._meaning_scan_state.pop(session_id, None)
         self._prune_quote_state(now)
+        sizes_after = self._state_sizes()
+        if sizes_before != sizes_after:
+            labels = (
+                "回复轮",
+                "最近表情",
+                "计划表情",
+                "跟风连击",
+                "冷却起点",
+                "会话表情缓存",
+                "补录节流",
+            )
+            self.ctx.logger.debug(
+                "状态清理：%s",
+                "，".join(
+                    f"{name} {before}→{after}"
+                    for name, before, after in zip(labels, sizes_before, sizes_after)
+                    if before != after
+                ),
+            )
+
+    def _state_sizes(self) -> Tuple[int, ...]:
+        """各会话状态字典的当前条数（供 `_prune_stale_state` 打清理日志）。"""
+        return (
+            len(self._reply_rounds),
+            len(self._chat_emoji_last),
+            len(self._planned_emoji_until),
+            len(self._emoji_streaks),
+            len(self._chat_emoji_cooldown_start),
+            len(self._session_emoji_refs),
+            len(self._meaning_scan_state),
+        )
 
 
 def create_plugin() -> BetterPostProcessingPlugin:

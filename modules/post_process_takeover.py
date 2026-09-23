@@ -12,12 +12,17 @@ Hook 分工（多段发送）：
 4. ``maisaka.planner.before_request`` / ``chat.receive.before_process``（blocking）：补发
    未完成时先等待（带超时），避免下一轮上下文缺段、新消息与旧回复交错。
 
-错字纠正（``correction_mode_enabled``，见 ``post_processing.PostProcessor.plan``）：
+错字纠正（见 ``post_processing.PostProcessor.plan``）：
 
-- 纠正方式按权重抽取：直接发送 / 引用带错字的消息 / 撤回后重发修正句 / 不纠正；
-  ``last_correction_enabled`` 打开时"最后纠正"（本轮全部段发完后再纠正，强制引用）一并参与抽取；
+- 0.12.0 起**恒由权重池决定**（``[chinese_typo] correction_mode_enabled`` 开关已按需求移除）：
+  每处**真正出现**的错字抽一次纠正方式 = 直接发送 / 引用带错字的消息 / 撤回后重发修正句 /
+  不纠正（四个权重全设 0 = 完全不纠正）；
+- ``last_correction_enabled`` 打开时，由 ``last_correction_probability`` 决定该处纠正是否推迟到
+  **本轮全部分段发完之后**（"最后纠正"）——推迟**只改时机**，纠正方式仍是权重池抽到的那个
+  （直接补发 / 引用纠正 / 撤回重发），不再强制引用；
 - 逐段决策在**分段全部发出之前**完成，动作序列 = 第 1 段 → 其纠正 → 第 2 段 → 其纠正 → …
-  （所以"第二段出错字"的纠正一定早于第三段），"最后纠正"排在序列末尾。
+  （所以"第二段出错字"的纠正一定早于第三段），"最后纠正"排在序列末尾；
+- 撤回前先等 ``[chinese_typo] recall_delay_seconds``（留空 = 按被撤回那条的打字时长自动）。
 
 共享状态（回复轮记录、文本规则、表情包功能）留在 ``plugin.py``，本模块通过 ``self`` 访问。
 """
@@ -45,9 +50,10 @@ class FollowUpItem:
     - ``kind="text"``：发送 ``text``。``quote_previous=True`` 时引用**上一条**已发出的消息
       （宿主 ``quote_previous`` 语义 / "引用纠正"）；``quote_slot>=0`` 时引用**第 slot 段**
       的消息（"最后纠正"用）；两者都没有就不引用。
-    - ``kind="recall"``：撤回上一条已发出的消息，然后发送 ``text``（"撤回后重发"：
-      ``text`` 是修正后的整句）。撤回失败时按 ``[chinese_typo] recall_fallback`` 兜底。
-    - ``slot``：本条发送对应第几段（仅用于给"最后纠正"记录引用目标），非分段消息填 -1。
+    - ``kind="recall"``：撤回 ``recall_slot`` 指定的那条消息（``-1`` = 上一条已发出的），
+      然后发送 ``text``（"撤回后重发"：``text`` 是修正后的整句）。
+      撤回失败时按 ``[chinese_typo] recall_fallback`` 兜底。
+    - ``slot``：本条发送对应第几段（用于给"最后纠正"记录引用/撤回目标），非分段消息填 -1。
     """
 
     kind: str
@@ -55,20 +61,31 @@ class FollowUpItem:
     quote_previous: bool = False
     quote_slot: int = -1
     slot: int = -1
+    recall_slot: int = -1
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/modules/，用于定位宿主 depends-data 字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
-# 后处理接管需要从宿主全局配置读取的参数：(缓存键, 宿主配置路径, 兜底默认值)。
-# 分段/错别字/打字速度参数全部沿用宿主自身配置，改宿主配置无需改插件配置；
-# 默认值与宿主 src/config/official_configs.py 保持一致（仅在读取失败时使用）。
+# 后处理接管需要从宿主全局配置读取的参数：(缓存键, 宿主配置路径, **代码层兜底值**)。
+#
+# 分段/错别字/打字速度参数全部沿用宿主自身配置，改宿主配置无需改插件配置。
+#
+# **取值链路是四级的，前一级拿不到才退下一级**：
+#   ① 插件配置里填了具体值     → 用它（用户显式覆盖，最优先）
+#   ② 留空（``""``/「跟随宿主」）→ 用宿主**运行时**配置快照（``ctx.config.get``）
+#   ③ 宿主快照读不到           → 用本表第 3 列的**代码层兜底**
+#   ④ 第 3 列就是最终兜底      → 取自发布者实机在用的 ``config.toml``
+#
+# 也就是说：插件配置默认**留空** → 留空即**跟随宿主** → 跟随宿主失败才用这里的值。
+# 第 3 列刻意用"发布者实机验证过的一套参数"而不是宿主官方默认值，这样在
+# "宿主配置读不到"（能力异常 / 精简快照 / 单测）时得到的是可用且符合预期的行为。
 _POST_PROCESS_CONFIG_KEYS: Tuple[Tuple[str, str, Any], ...] = (
     ("splitter_enable", "response_splitter.enable", True),
     ("splitter_max_length", "response_splitter.max_length", 512),
     ("splitter_max_sentence_num", "response_splitter.max_sentence_num", 8),
-    ("splitter_max_split_num", "response_splitter.max_split_num", 3),
+    ("splitter_max_split_num", "response_splitter.max_split_num", 4),
     ("splitter_enable_kaomoji_protection", "response_splitter.enable_kaomoji_protection", False),
-    ("splitter_enable_overflow_return_all", "response_splitter.enable_overflow_return_all", False),
+    ("splitter_enable_overflow_return_all", "response_splitter.enable_overflow_return_all", True),
     ("typo_enable", "chinese_typo.enable", True),
     ("typo_enable_correction_quote", "chinese_typo.enable_correction_quote", True),
     ("typo_correction_quote_probability", "chinese_typo.correction_quote_probability", 1.0),
@@ -76,10 +93,13 @@ _POST_PROCESS_CONFIG_KEYS: Tuple[Tuple[str, str, Any], ...] = (
     ("typo_min_freq", "chinese_typo.min_freq", 9),
     ("typo_tone_error_rate", "chinese_typo.tone_error_rate", 0.1),
     ("typo_word_replace_rate", "chinese_typo.word_replace_rate", 0.006),
-    ("bot_nickname", "bot.nickname", "麦麦"),
+    ("bot_nickname", "bot.nickname", "普瑞赛斯"),
+    # 「撤回反应时间」留空时按打字速度自动决定，需要宿主的速度值（见 ``_recall_delay_seconds``）。
+    ("typing_speed", "response_post_process.typing_speed", 1.0),
 )
 
-# 宿主配置快照读不到时的兜底（与宿主 src/config/official_configs.py 的默认值一致）。
+# 宿主配置快照读不到时的**最终代码层兜底**（= ``_POST_PROCESS_CONFIG_KEYS`` 第 3 列，
+# 取自发布者实机在用的 config.toml）。见上方"取值链路是四级的"注释。
 _HOST_CONFIG_DEFAULTS: Dict[str, Any] = {key: default for key, _path, default in _POST_PROCESS_CONFIG_KEYS}
 
 # 宿主已有参数在插件配置里的位置：(PostProcessor 形参, 插件配置节, 插件字段,
@@ -129,24 +149,6 @@ _HOST_MIRROR_FIELDS: Tuple[Tuple[str, str, str, str, str, str, str], ...] = (
         "enable_overflow_return_all",
     ),
     ("typo_enable", "chinese_typo", "enable", "typo_enable", "switch", "chinese_typo", "enable"),
-    (
-        "typo_enable_correction_quote",
-        "chinese_typo",
-        "enable_correction_quote",
-        "typo_enable_correction_quote",
-        "switch",
-        "chinese_typo",
-        "enable_correction_quote",
-    ),
-    (
-        "typo_correction_quote_probability",
-        "chinese_typo",
-        "correction_quote_probability",
-        "typo_correction_quote_probability",
-        "float",
-        "chinese_typo",
-        "correction_quote_probability",
-    ),
     ("typo_error_rate", "chinese_typo", "error_rate", "typo_error_rate", "float", "chinese_typo", "error_rate"),
     ("typo_min_freq", "chinese_typo", "min_freq", "typo_min_freq", "int", "chinese_typo", "min_freq"),
     (
@@ -168,6 +170,14 @@ _HOST_MIRROR_FIELDS: Tuple[Tuple[str, str, str, str, str, str, str], ...] = (
         "word_replace_rate",
     ),
     ("bot_nickname", "response_splitter", "fallback_nickname", "bot_nickname", "text", "bot", "nickname"),
+)
+
+# 只喂给**宿主复刻路径**（``PostProcessor.process``）的宿主参数：(PostProcessor 形参, ``_cfg`` 短键)。
+# 0.12.0 起纠正是否引用完全由权重池决定，这两个宿主开关**不再在插件配置里暴露镜像项**，
+# 因此也不参与 ``get_default_config`` 的"宿主现值当默认值"逻辑，只按宿主值构造处理器。
+_HOST_ONLY_PROCESSOR_PARAMS: Tuple[Tuple[str, str], ...] = (
+    ("typo_enable_correction_quote", "typo_enable_correction_quote"),
+    ("typo_correction_quote_probability", "typo_correction_quote_probability"),
 )
 
 # 不属于 ``PostProcessor`` 形参、但同样是"宿主已有参数 + 留空跟随宿主"的项：
@@ -234,6 +244,8 @@ _TYPING_SINGLE_CHAR_EXTRA_SECONDS = 0.3
 # ``if random.random() < 0.5: 发错字句 + 更正段 else: 整句换成正确句``）。
 # 插件照抄这个值、**不对外暴露**——错字多久出现一次由宿主【单字错字概率】``error_rate`` 决定，
 # 不搞第二个"错字概率"配置项。
+# 注意：**另一半**门控（"50% 才给纠正建议"）在接管分支里已被绕过（``PostProcessor.plan``
+# 以 ``force_suggestion=True`` 调生成器），否则会出现"打了错字却既不纠正也不撤回"。
 _HOST_TYPO_VISIBLE_PROBABILITY = 0.5
 
 # 预分段缓存 TTL：Hook 之间靠 (会话, 首段文本) 关联，超时未消费即丢弃。
@@ -369,6 +381,8 @@ class PostProcessTakeoverMixin:
                 params[param] = self._resolve_mirror(section, field, cache_key, kind)
                 if self._mirror_is_explicit(section, field):
                     sources[param] = "插件值"
+            for param, cache_key in _HOST_ONLY_PROCESSOR_PARAMS:
+                params[param] = self._host_config_value(cache_key)
             self._processor = PostProcessor(**params)
             self._processor_param_sources = sources
             self._log_effective_params(params, sources)
@@ -382,7 +396,7 @@ class PostProcessTakeoverMixin:
         self.ctx.logger.info(
             "后处理接管参数：分段enable=%s(%s) 长度=%s 句数=%s 条数=%s 颜文字=%s 超限全文=%s | "
             "错字enable=%s(%s) error_rate=%s(%s) min_freq=%s(%s) tone=%s(%s) word=%s(%s) "
-            "纠正引用=%s 引用概率=%s(%s) 昵称=%s(%s)",
+            "昵称=%s(%s)",
             params.get("splitter_enable"),
             sources.get("splitter_enable", "宿主值"),
             params.get("splitter_max_length"),
@@ -400,9 +414,6 @@ class PostProcessTakeoverMixin:
             sources.get("typo_tone_error_rate", "宿主值"),
             params.get("typo_word_replace_rate"),
             sources.get("typo_word_replace_rate", "宿主值"),
-            params.get("typo_enable_correction_quote"),
-            params.get("typo_correction_quote_probability"),
-            sources.get("typo_correction_quote_probability", "宿主值"),
             params.get("bot_nickname"),
             sources.get("bot_nickname", "宿主值"),
         )
@@ -441,8 +452,9 @@ class PostProcessTakeoverMixin:
         except (TypeError, ValueError):
             return None
 
-    def _simulated_typing_seconds(self, text: str) -> Optional[float]:
-        """按宿主 ``calculate_typing_time`` 的公式算打字等待秒数（跟随宿主时返回 ``None``）。
+    @staticmethod
+    def _typing_seconds_for(text: str, speed: float) -> float:
+        """按宿主 ``calculate_typing_time`` 的公式算打字耗时（``speed`` 已解析成数值）。
 
         逐项对齐宿主（1.2.3 ``src/chat/utils/utils.py``）：
 
@@ -451,10 +463,10 @@ class PostProcessTakeoverMixin:
            免得"填 0 想关掉打字"在一个字的回复上表现不一致。
         2. 其它情况：中文 0.3s/字、其余 0.15s/字符，求和后乘 ``typing_speed``；
            ``typing_speed <= 0`` → 0（不等待）。
+
+        同一个公式同时服务于"补发分段的打字等待"（``_simulated_typing_seconds``）与
+        "撤回反应时间的自动值"（``_recall_delay_seconds``）。
         """
-        speed = self._typing_speed_override()
-        if speed is None:
-            return None
         sample = str(text or "")
         chinese_chars = sum("\u4e00" <= char <= "\u9fff" for char in sample)
         if chinese_chars == 1 and len(sample.strip()) == 1:
@@ -466,6 +478,36 @@ class PostProcessTakeoverMixin:
             for char in sample
         )
         return total * speed
+
+    def _simulated_typing_seconds(self, text: str) -> Optional[float]:
+        """补发分段的打字等待秒数；``typing_speed`` 留空（跟随宿主）时返回 ``None``。"""
+        speed = self._typing_speed_override()
+        if speed is None:
+            return None
+        return self._typing_seconds_for(text, speed)
+
+    def _recall_delay_seconds(self, recalled_text: str) -> float:
+        """撤回前的"反应时间"（秒）——``[chinese_typo] recall_delay_seconds``。
+
+        留空（默认）= 按打字速度自动：拿**被撤回那条消息的正文**按宿主的打字公式算一遍
+        （中文 0.3s/字、其它 0.15s/字符，乘生效的打字速度），也就是"刚把这句话打完才发现
+        打错了"的时间量级——长句等得久、短句几乎立刻撤回。
+        填了数字（支持小数点）就用它（``0`` = 立刻撤回）；填了非法值退回自动并记一条 warning。
+        """
+        raw = getattr(self.config.chinese_typo, "recall_delay_seconds", "")
+        text = str(raw).strip()
+        if text:
+            try:
+                return max(0.0, float(text))
+            except (TypeError, ValueError):
+                self.ctx.logger.warning("撤回反应时间 %r 不是数字，改为按打字速度自动决定", raw)
+        speed = self._typing_speed_override()
+        if speed is None:
+            try:
+                speed = float(self._host_config_value("typing_speed"))
+            except (TypeError, ValueError):
+                speed = 1.0
+        return max(0.0, self._typing_seconds_for(recalled_text, speed))
 
 
     async def _warmup_processor(self) -> None:
@@ -485,38 +527,13 @@ class PostProcessTakeoverMixin:
         """
         return self._post_process_takeover_active()
 
-    def _correction_branch_active(self, *, warn: bool = True) -> bool:
-        """错字纠正方式分支是否生效（需要多段发送：纠正动作要单独成消息）。"""
-        if not bool(getattr(self.config.chinese_typo, "correction_mode_enabled", False)):
-            return False
-        if not self._multi_message_active():
-            if warn:
-                self.ctx.logger.warning(
-                    "错字纠正方式已开启，但后处理接管未生效——纠正动作无法单独成消息，"
-                    "本轮仍按宿主原逻辑处理"
-                )
-            return False
-        return True
-
-    def _quote_correction_effective(self) -> bool:
-        """更正段能否引用"那条带错字的消息"（宿主开关 ``[chinese_typo] enable_correction_quote``）。
-
-        - **未开启「错字纠正方式」分支**：完全等同宿主 ``enable_correction_quote``
-          （留空 = 跟随宿主），关掉就不引用，更正段直接发。
-        - **开启该分支**：该开关**不参与判定**，引用与否由 ``weight_correction_quote``
-          （以及撤回失败的兜底 ``recall_fallback``）决定——否则权重抽到"引用"会被这个开关
-          悄悄降级成"直接发送"，配置自相矛盾。
-        """
-        if self._correction_branch_active(warn=False):
-            return True
-        return bool(self._get_processor().typo_enable_correction_quote)
-
     def _choose_correction_mode(self, segment_index: int, suggestion: str) -> Optional[str]:
         """按权重抽取某一段错字的纠正方式（跑在处理线程里，只用 random + 配置）。
 
         权重池：``direct``（直接发送）/``quote``（引用带错字的消息）/``recall``（撤回后重发
-        修正句）/``none``（不纠正）；``last_correction_enabled`` 打开时 ``last``（最后纠正）
-        一并参与抽取。权重全为 0 时按"不纠正"处理。
+        修正句）/``none``（不纠正）。权重全为 0 时按"不纠正"处理（= 完全关掉纠正）。
+        "最后纠正"**不在池子里**——它是"把抽到的纠正推迟到本轮分段发完之后"，由
+        ``_should_defer_correction`` 单独决定（见 ``[chinese_typo_weights]`` 的 last_correction_*）。
 
         **本方法在工作线程里执行，不要碰 ``self.ctx``**：日志在回到事件循环后再统一记录
         （见 ``handle_before_post_process`` 里的"错字纠正方式"日志）。
@@ -529,12 +546,38 @@ class PostProcessTakeoverMixin:
             "recall": max(0, int(getattr(cfg, "weight_correction_recall", 0))),
             "none": max(0, int(getattr(cfg, "weight_correction_none", 0))),
         }
-        if bool(getattr(cfg, "last_correction_enabled", False)):
-            weights["last"] = max(0, int(getattr(cfg, "weight_correction_last", 0)))
         styles = [name for name, weight in weights.items() if weight > 0]
         if not styles:
             return "none"
         return random.choices(styles, weights=[float(weights[name]) for name in styles], k=1)[0]
+
+    def _should_defer_correction(self, segment_index: int) -> bool:
+        """该处纠正是否推迟到本轮全部分段发完之后（"最后纠正"，跑在处理线程里）。
+
+        ``[chinese_typo_weights] last_correction_enabled`` 是总开关；打开后按
+        ``last_correction_probability``（0~1）抽取：抽中才推迟，否则紧跟该段之后执行。
+        **推迟只改时机**——纠正方式仍是 ``_choose_correction_mode`` 抽到的那个
+        （直接补发 / 引用纠正 / 撤回重发），不再强制引用；抽到"不纠正"时什么都不会发生。
+        """
+        _ = segment_index  # 仅为可读的签名保留，线程内不做任何 I/O
+        cfg = self.config.chinese_typo_weights
+        if not bool(getattr(cfg, "last_correction_enabled", False)):
+            return False
+        probability = self._defer_probability(cfg)
+        if probability <= 0.0:
+            return False
+        if probability >= 1.0:
+            return True
+        return random.random() < probability
+
+    @staticmethod
+    def _defer_probability(cfg: Any) -> float:
+        """解析「最后纠正概率」并夹到 0~1（非法值按 0 = 从不推迟处理）。"""
+        try:
+            value = float(getattr(cfg, "last_correction_probability", 1.0))
+        except (TypeError, ValueError):
+            return 0.0
+        return min(1.0, max(0.0, value))
 
     def _yield_to_other_plugins(self, kwargs: Dict[str, Any]) -> bool:
         """本轮是否已被其它插件认领（例如智能分段插件），是则让位。
@@ -827,79 +870,100 @@ class PostProcessTakeoverMixin:
         return False
 
 
-    async def _purge_recalled_message(self, message_id: str) -> bool:
-        """把被撤回的那条消息从宿主消息库里删掉（``[chinese_typo] recall_purge``）。
-
-        说明：宿主的"正常撤回"只是把 NapCat 的 ``notice.group_recall`` 当成一条
-        ``is_notify`` 通知消息入库（"[事件] xxx 撤回了一条消息"），**不会**删除原消息；
-        这里按需求做"原消息彻底消失"，走已声明的 ``database.delete`` 能力删 ``Messages`` 表
-        对应行（表名 ``mai_messages``，按平台消息 id 过滤）。
-        """
-        if not bool(getattr(self.config.chinese_typo, "recall_purge", True)):
-            return False
-        normalized = str(message_id or "").strip()
-        if not normalized:
-            return False
-        try:
-            resp = await self.ctx.db.delete("Messages", {"message_id": normalized})
-        except Exception as exc:
-            self.ctx.logger.warning("撤回后清理消息库失败（%s）: %s", normalized, exc)
-            return False
-        if isinstance(resp, dict) and resp.get("success") is False:
-            self.ctx.logger.warning("撤回后清理消息库被拒（%s）: %r", normalized, resp.get("error"))
-            return False
-        self.ctx.logger.info("已把被撤回的消息移出消息库：%s", normalized)
-        return True
-
-
     async def _run_follow_up_items(
         self,
         session_id: str,
         items: List["FollowUpItem"],
         *,
         typing: bool,
-        quote_correction: bool,
         previous_message_id: str,
+        first_text: str = "",
     ) -> None:
         """按顺序执行补发动作序列（分段 / 直接纠正 / 引用纠正 / 撤回重发 / 最后纠正）。
 
         顺序即语义：某一段的纠正动作紧跟该段之后执行，**早于后续分段**；"最后纠正"
-        排在序列末尾、引用它所属那一段的消息。
+        排在序列末尾——按抽到的纠正方式引用它所属那一段的消息（``quote_slot``）、
+        撤回它所属那一段的消息（``recall_slot``）、或直接补发（``direct``）。
+
+        ``first_text``：**首段**（由宿主发出）的正文。撤回反应时间留空时按"被撤回那条的
+        打字时长"自动决定，首段的正文只能由调用方传进来（``handle_after_build_message``
+        登记的那份）。
         """
         previous_id = previous_message_id
+        previous_text = first_text
         sent_slots: Dict[int, str] = {0: previous_message_id} if previous_message_id else {}
-        # 紧跟其后的动作是"撤回"的消息：不写进 Maisaka 历史，让 bot 自己的上下文里只剩修正句。
-        recalled_next = {
-            index
-            for index in range(len(items) - 1)
-            if items[index].kind == "text" and items[index + 1].kind == "recall"
-        }
+        sent_slot_texts: Dict[int, str] = {0: first_text} if first_text else {}
+        # 稍后会被撤回的**段**：不写进 Maisaka 历史，让 bot 自己的上下文里只剩修正句。
+        # 判据必须按"这条 recall 到底撤回谁"来算，不能只看"紧跟其后是 recall"——
+        # "最后纠正"里的撤回排在序列末尾，它要撤回的是**前面某一段**，而紧跟其后的
+        # text 动作是别的段（旧实现会把那段误判成"将被撤回"，于是它的正文也不进历史）。
+        recalled_slots: Set[int] = set()
+        for index, item in enumerate(items):
+            if item.kind != "recall":
+                continue
+            if item.recall_slot >= 0:
+                target_slot = item.recall_slot
+            elif index > 0 and items[index - 1].kind == "text":
+                target_slot = items[index - 1].slot  # 即时撤回：撤回紧邻的上一条
+            else:
+                target_slot = -1
+            if target_slot >= 0:
+                recalled_slots.add(target_slot)
         failed = 0
         for position, item in enumerate(items, start=1):
             index = position - 1
             if item.kind == "recall":
-                recalled = await self._recall_message(previous_id)
-                if recalled:
-                    # 撤回成功后让被撤回的那条也彻底消失（默认开）：删库 + 上面已跳过历史同步。
-                    await self._purge_recalled_message(previous_id)
+                slot = item.recall_slot
+                target_id = sent_slots.get(slot, "") if slot >= 0 else previous_id
+                target_text = sent_slot_texts.get(slot, "") if slot >= 0 else previous_text
                 fallback = str(getattr(self.config.chinese_typo, "recall_fallback", "quote") or "quote")
-                if recalled:
-                    previous_id = ""
-                    quote_target = ""
-                elif fallback == "none":
-                    self.ctx.logger.warning("撤回失败且配置为不兜底，跳过该条纠正: %r", item.text[:40])
-                    continue
+                if not target_id:
+                    self.ctx.logger.warning(
+                        "撤回重发：找不到要撤回的消息 id（slot=%s），改为直接发送修正句: %r",
+                        slot,
+                        item.text[:40],
+                    )
+                    sent_id = await self._send_follow_up_text(
+                        session_id,
+                        item.text,
+                        typing=typing,
+                        previous_message_id=previous_id,
+                    )
                 else:
-                    quote_target = previous_id if fallback == "quote" else ""
-                sent_id = await self._send_follow_up_text(
-                    session_id,
-                    item.text,
-                    typing=typing,
-                    quote_target=quote_target,
-                    previous_message_id=previous_id if fallback == "quote" else "",
-                )
+                    delay = self._recall_delay_seconds(target_text or item.text)
+                    if delay > 0:
+                        self.ctx.logger.info(
+                            "撤回反应时间 %.2f 秒后撤回消息 %s（会话 %s）", delay, target_id, session_id
+                        )
+                        await asyncio.sleep(delay)
+                    recalled = await self._recall_message(target_id)
+                    if recalled:
+                        if slot < 0:
+                            # 刚补发出去的那条已被撤回：后面若还有"引用上一条"的动作，不能引用它。
+                            previous_id = ""
+                            previous_text = ""
+                        quote_target = ""
+                        base_id = ""
+                    elif fallback == "none":
+                        self.ctx.logger.warning("撤回失败且配置为不兜底，跳过该条纠正: %r", item.text[:40])
+                        continue
+                    else:
+                        # 兜底：quote = 改成引用那条错字消息发送；direct = 直接发送。
+                        quote_target = target_id if fallback == "quote" else ""
+                        base_id = target_id if fallback == "quote" else ""
+                    sent_id = await self._send_follow_up_text(
+                        session_id,
+                        item.text,
+                        typing=typing,
+                        quote_target=quote_target,
+                        previous_message_id=base_id,
+                    )
                 if sent_id:
                     previous_id = sent_id
+                    previous_text = item.text
+                    if slot >= 0:
+                        sent_slots[slot] = sent_id
+                        sent_slot_texts[slot] = item.text
                 else:
                     failed += 1
                     self.ctx.logger.error("撤回后重发失败: %r", item.text[:40])
@@ -911,7 +975,9 @@ class PostProcessTakeoverMixin:
                     self.ctx.logger.debug(
                         "最后纠正找不到第 %s 段的消息 id，改为直接发送", item.quote_slot
                     )
-            elif item.quote_previous and quote_correction:
+            elif item.quote_previous:
+                # 引用与否完全由权重池决定（``_build_correction_items`` 只在"引用纠正"时置位），
+                # 0.12.0 起不再看宿主 ``enable_correction_quote``。
                 quote_target = previous_id
             else:
                 quote_target = ""
@@ -922,12 +988,14 @@ class PostProcessTakeoverMixin:
                 typing=typing,
                 quote_target=quote_target,
                 previous_message_id=previous_id,
-                sync_history=index not in recalled_next,
+                sync_history=item.slot not in recalled_slots,
             )
             if sent_id:
                 previous_id = sent_id
+                previous_text = item.text
                 if item.slot >= 0:
                     sent_slots[item.slot] = sent_id
+                    sent_slot_texts[item.slot] = item.text
             else:
                 failed += 1
                 self.ctx.logger.error("补发消息失败，跳过第 %s 条: %r", position, item.text[:40])
@@ -982,41 +1050,33 @@ class PostProcessTakeoverMixin:
 
         enable_splitter = bool(modified.get("enable_splitter", True))
         enable_typo = bool(modified.get("enable_chinese_typo", True))
-        correction_branch = self._correction_branch_active()
         processor = self._get_processor()
         try:
-            if correction_branch:
-                # 插件扩展分支：分段与宿主一致，错字纠正方式由插件按权重抽取（逐段、发送前定好）；
-                # 错字是否可见沿用宿主那半句硬编码门控（0.5，见 post_processing.plan 的注释）。
-                plan = await asyncio.to_thread(
-                    processor.plan,
-                    response,
-                    enable_splitter=enable_splitter,
-                    enable_chinese_typo=enable_typo,
-                    choose_mode=self._choose_correction_mode,
-                    visible_probability=_HOST_TYPO_VISIBLE_PROBABILITY,
-                    max_correction_cjk=int(getattr(self.config.chinese_typo, "correction_max_cjk", 20)),
-                )
-                segments = plan.segments
-                corrections = plan.corrections
-                deferred = plan.deferred
-            else:
-                segments = await asyncio.to_thread(
-                    processor.process,
-                    response,
-                    enable_splitter=enable_splitter,
-                    enable_chinese_typo=enable_typo,
-                )
-                corrections = {}
-                deferred = ()
+            # 0.12.0 起接管**恒走 plan()**：错字纠正方式完全由权重池决定（"宿主原逻辑"分支已随
+            # ``correction_mode_enabled`` 开关一起移除；``process()`` 只作为与宿主逐行对齐的
+            # 参考实现保留，不再出现在接管链路上）。
+            # 错字是否可见仍沿用宿主那半句硬编码门控（0.5，见 post_processing.plan 的注释）。
+            plan = await asyncio.to_thread(
+                processor.plan,
+                response,
+                enable_splitter=enable_splitter,
+                enable_chinese_typo=enable_typo,
+                choose_mode=self._choose_correction_mode,
+                should_defer=self._should_defer_correction,
+                visible_probability=_HOST_TYPO_VISIBLE_PROBABILITY,
+                max_correction_cjk=int(getattr(self.config.chinese_typo, "correction_max_cjk", 20)),
+            )
+            segments = plan.segments
+            corrections = plan.corrections
+            deferred = plan.deferred
         except Exception as exc:
             self.ctx.logger.warning("后处理接管执行失败，回退为框架默认: %s", exc)
             return {"action": "continue", "modified_kwargs": modified}
 
         # 每轮一行诊断：宿主开关 / 复刻参数 / 本轮错字统计。**"改了错字概率却没反应"只能看这行**：
-        # 「enable=off」= 宿主总开关或本插件参数关着；「抽到建议=0」= 错字压根没生成
-        # （error_rate 太小 / min_freq 太高 / 词频表异常）；「出现错字>0 但段数没涨」= 宿主那半句
-        # 门控把错字换成了正确句（正常行为）。
+        # 「错字总开关=False」= 宿主总开关或本插件参数关着；「真出现错字=0」= 错字压根没生成
+        # （error_rate 太小 / min_freq 太高 / 词频表异常）；「真出现错字>0 但判定纠正=0」= 权重池
+        # 抽到"不纠正"（正常）；「回复里有错字但真出现错字=0」= 宿主那半句 0.5 门控把整句换成了正确句。
         stats = dict(getattr(processor, "last_stats", {}) or {})
         # 整词同音替换因组合数超上限而跳过的**累计**次数（见 post_processing._MAX_HOMOPHONE_COMBINATIONS）：
         # 宿主原逻辑在长词上会卡死，本插件加了硬上限，非 0 就说明确实撞上了那个规模。
@@ -1026,8 +1086,8 @@ class PostProcessTakeoverMixin:
             combo_skips = 0
         self.ctx.logger.info(
             "后处理接管统计：宿主开关[分段=%s 错字=%s] 生效参数[错字总开关=%s error_rate=%s(源%s) "
-            "min_freq=%s tone=%s word_replace=%s 分段=%s 最多条数=%s] → 抽到纠正建议=%s 句、"
-            "真出现错字=%s 句、%s、共 %s 段%s",
+            "min_freq=%s tone=%s word_replace=%s 分段=%s 最多条数=%s] → 真出现错字=%s 句、"
+            "判定纠正=%s 处（纠正方式=权重池）、共 %s 段%s",
             enable_splitter,
             enable_typo,
             getattr(processor, "typo_enable", None),
@@ -1038,9 +1098,8 @@ class PostProcessTakeoverMixin:
             getattr(processor, "typo_word_replace_rate", None),
             getattr(processor, "splitter_enable", None),
             getattr(processor, "splitter_max_split_num", None),
-            stats.get("suggestions"),
             stats.get("typo_sentences"),
-            "纠正方式分支" if correction_branch else "宿主原逻辑",
+            stats.get("corrections"),
             len(segments),
             ("、整词替换跳过=%d(累计)" % combo_skips) if combo_skips else "",
         )
@@ -1076,7 +1135,10 @@ class PostProcessTakeoverMixin:
                         session_id,
                         "；".join(
                             [f"第 {index} 段→{decision.mode}" for index, decision in sorted(corrections.items())]
-                            + [f"第 {decision.segment_index} 段→last(最后纠正)" for decision in deferred]
+                            + [
+                                f"第 {decision.segment_index} 段→{decision.mode}(最后纠正)"
+                                for decision in deferred
+                            ]
                         ),
                     )
                 return {"action": "continue", "modified_kwargs": modified}
@@ -1098,10 +1160,8 @@ class PostProcessTakeoverMixin:
         """把"分段 + 错字纠正计划"摊平成一个按序执行的补发动作序列。
 
         顺序即语义：第 1 段（宿主发）→ 第 1 段的纠正 → 第 2 段 → 第 2 段的纠正 → …
-        → 最后纠正（引用它所属那一段）。所以"第二段的错字纠正"一定早于第三段发出。
-
-        "更正段是否真的引用"不在这里定，而是由 ``_quote_correction_effective()`` 在补发时
-        统一判定（详见该方法）。
+        → 最后纠正（按抽到的纠正方式引用 / 撤回它所属那一段的消息）。所以"第二段的错字
+        纠正"一定早于第三段发出。
         """
         items: List[FollowUpItem] = []
         for index in range(1, len(segments)):
@@ -1122,26 +1182,34 @@ class PostProcessTakeoverMixin:
             # 首段由宿主发出，它的纠正动作排在序列最前（紧随首段）。
             items[0:0] = self._build_correction_items(first_decision)
         for decision in deferred:
-            items.append(
-                FollowUpItem(
-                    kind="text",
-                    text=decision.text,
-                    quote_slot=decision.segment_index,  # 强制引用：不引用会看不出在纠正谁
-                )
-            )
+            items.extend(self._build_correction_items(decision, deferred=True))
         return items
 
     @staticmethod
-    def _build_correction_items(decision: Any) -> List["FollowUpItem"]:
-        """单个纠正动作 → 动作序列片段（``none`` 已在上游过滤掉）。"""
+    def _build_correction_items(decision: Any, *, deferred: bool = False) -> List["FollowUpItem"]:
+        """单个纠正动作 → 动作序列片段（``none`` 已在上游过滤掉）。
+
+        ``deferred=True``（"最后纠正"）时动作排在序列**末尾**，因此不能再用"上一条"定位：
+        引用改成 ``quote_slot``、撤回改成 ``recall_slot``，都指向它所属那一段的消息。
+        纠正方式本身与即时纠正完全一致——"最后纠正"只改时机，不再强制引用。
+        """
         mode = str(getattr(decision, "mode", "none"))
+        slot = int(getattr(decision, "segment_index", -1))
         if mode == "direct":
             return [FollowUpItem(kind="text", text=str(decision.text))]
         if mode == "quote":
+            if deferred:
+                return [FollowUpItem(kind="text", text=str(decision.text), quote_slot=slot)]
             return [FollowUpItem(kind="text", text=str(decision.text), quote_previous=True)]
         if mode == "recall":
             # 撤回带错字的那条，然后重发修正后的整句（撤回了就必须给完整内容）。
-            return [FollowUpItem(kind="recall", text=str(decision.sentence or decision.text))]
+            return [
+                FollowUpItem(
+                    kind="recall",
+                    text=str(decision.sentence or decision.text),
+                    recall_slot=slot if deferred else -1,
+                )
+            ]
         return []
 
     # Hook 2c：多段发送——登记待补发分段（blocking）
@@ -1193,7 +1261,8 @@ class PostProcessTakeoverMixin:
                 # 分段打字复刻宿主的 `typing=index > 0`：补发的分段一律带打字等待
                 # （宿主那侧由【打字速度】决定等多久，0 = 不等）。
                 "typing": True,
-                "quote_correction": self._quote_correction_effective(),
+                # 首段正文：撤回反应时间留空时按它的打字时长自动决定（见 _recall_delay_seconds）。
+                "first_text": outbound_text,
                 "registered_at": time.monotonic(),
             },
         )
@@ -1248,8 +1317,8 @@ class PostProcessTakeoverMixin:
                 session_id,
                 items,
                 typing=bool(entry.get("typing", True)),
-                quote_correction=bool(entry.get("quote_correction", True)),
                 previous_message_id=previous_message_id,
+                first_text=str(entry.get("first_text") or ""),
             )
         )
         self._track_follow_up_task(session_id, task)

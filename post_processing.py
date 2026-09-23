@@ -27,6 +27,15 @@
 源码一致；唯一无法通过宿主 Hook 复刻的是“每条分段作为独立平台消息发送”——
 ``maisaka.reply.before_post_process`` 载荷只能返回单个字符串，因此接管后把各
 分段以换行连接成一条消息交付，正文与换行结构与原逻辑一致。
+
+与宿主**有意不同**的两处（都在下面显式标注，方便比对上游改动）：
+
+1. 整词同音替换的组合数硬上限（``_MAX_HOMOPHONE_COMBINATIONS``）：宿主无条件穷举，
+   长词会指数爆炸把线程占死；
+2. **@提及保护**（``_AT_MENTION_PATTERN`` / ``ChineseTypoGenerator.protect_at_mentions``）：
+   ``@昵称`` 里的昵称**不参与错字生成**。宿主会把昵称一起改错（实测：正文里的
+   ``@凯特艾`` 被改成 ``@凯特爱``），配合 ``quote_takeover`` 注入的真实 at 组件，
+   群里就变成“@凯特艾 @凯特爱”——像 bot 同时 @ 了两个人（0.11.3 线上事故）。
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ import json
 import math
 import os
 import random
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -168,6 +178,59 @@ class ProcessedResponseSegment:
 
 
 # ---------------------------------------------------------------------------
+# @提及保护（**与宿主不同的一处**，见模块 docstring）
+# ---------------------------------------------------------------------------
+
+# ``@`` 后面允许作为"昵称"的字符：中日韩汉字（含扩展 A）、半/全角字母数字、下划线、
+# 连字符、间隔号。**不含空白与标点**——所以 ``@凯特艾，`` 只会匹配到 ``@凯特艾``。
+_AT_MENTION_PATTERN = re.compile(
+    r"@[0-9A-Za-z_\-\u00b7\u3400-\u4dbf\u4e00-\u9fff\uff10-\uff19\uff21-\uff3a\uff41-\uff5a]{1,32}"
+)
+
+
+def _protect_at_mentions(text: str) -> Tuple[str, Dict[str, str]]:
+    """把句子里的 ``@昵称`` 换成不含汉字的占位符，返回 ``(替换后的句子, 占位符映射)``。
+
+    为什么需要：错字生成器是"逐词逐字"改字的，``@凯特艾`` 对它来说只是普通文本，
+    于是会产出 ``@凯特爱``（同音字）。配合 ``quote_takeover`` 注入的真实 at 组件，
+    群里就出现两个不同的 @，看起来像 bot 同时 @ 了两个人。
+    占位符全部由非汉字字符组成（``_is_chinese_char`` 判否），因此 jieba 怎么切都不会
+    被改，交给 ``_restore_at_mentions`` 原样换回来。
+    """
+    if not text or "@" not in text:
+        return text, {}
+    mapping: Dict[str, str] = {}
+
+    def _replace(match: Any) -> str:
+        placeholder = f"__AT_MENTION_{len(mapping)}__"
+        mapping[placeholder] = match.group(0)
+        return placeholder
+
+    return _AT_MENTION_PATTERN.sub(_replace, text), mapping
+
+
+def _restore_at_mentions(text: str, mapping: Dict[str, str]) -> str:
+    """把 ``_protect_at_mentions`` 的占位符还原成原文（``mapping`` 为空时原样返回）。"""
+    if not mapping:
+        return text
+    for placeholder, mention in mapping.items():
+        text = text.replace(placeholder, mention)
+    return text
+
+
+def match_leading_at_mention(text: str) -> Optional[str]:
+    """``text`` 开头若是**字面** ``@昵称``（不是真实 at 组件），返回该提及原文；否则 ``None``。
+
+    ``quote_takeover`` 用它判断"正文里 planner 已经自己 @ 过人了"，避免再注入一个真实
+    at 组件导致一条消息里出现两个 @（0.11.3 线上事故）。两个模块共用同一条正则口径。
+    """
+    if not text:
+        return None
+    match = _AT_MENTION_PATTERN.match(text.lstrip())
+    return match.group(0) if match else None
+
+
+# ---------------------------------------------------------------------------
 # 错别字生成器（复刻 src/chat/utils/typo_generator.py::ChineseTypoGenerator）
 # ---------------------------------------------------------------------------
 
@@ -183,12 +246,16 @@ class ChineseTypoGenerator:
         word_replace_rate: float = 0.3,
         max_freq_diff: int = 200,
         project_root: Optional[Path] = None,
+        protect_at_mentions: bool = True,
     ) -> None:
         self.error_rate = error_rate
         self.min_freq = min_freq
         self.tone_error_rate = tone_error_rate
         self.word_replace_rate = word_replace_rate
         self.max_freq_diff = max_freq_diff
+        # **与宿主不同的一处**：``True``（默认）时 ``@昵称`` 不参与错字生成，见
+        # ``_protect_at_mentions``。宿主没有这道保护，会把昵称一起改错。
+        self.protect_at_mentions = bool(protect_at_mentions)
 
         self.pinyin_dict = _load_pinyin_dict()
         self.char_frequency = _load_char_frequency(project_root)
@@ -320,14 +387,28 @@ class ChineseTypoGenerator:
         sorted_homophones = sorted(homophones, key=lambda x: x[1], reverse=True)
         return [w for w, _ in sorted_homophones[:5]]
 
-    def create_typo_sentence(self, sentence: str) -> Tuple[str, Optional[str]]:
-        """创建含同音字错误的句子，返回 (错字句, 纠正建议)。"""
+    def create_typo_sentence(
+        self, sentence: str, *, force_suggestion: bool = False
+    ) -> Tuple[str, Optional[str]]:
+        """创建含同音字错误的句子，返回 (错字句, 纠正建议)。
+
+        ``force_suggestion=True``：**跳过宿主那句硬编码的「50% 才给纠正建议」门控**——
+        只要句子真的被改动过就一定给出纠正建议。插件接管分支用它保证"每处错字都能被
+        权重池判一次"，否则会出现"打了错字却既不纠正也不撤回"：线上 02:32:47 的实测
+        现象就是 `抽到纠正建议=0 句、真出现错字=1 句`，于是"撤回重发"永远不会触发
+        （宿主原逻辑里没有纠正建议就没有任何纠正动作）。
+        宿主复刻路径（``PostProcessor.process``）不传该参数，行为与宿主逐字一致。
+        """
+        source = sentence
+        mention_mapping: Dict[str, str] = {}
+        if self.protect_at_mentions:
+            source, mention_mapping = _protect_at_mentions(sentence)
         result: List[str] = []
         word_typos: List[Tuple[str, str]] = []
         char_typos: List[Tuple[str, str]] = []
         current_pos = 0
 
-        words = self._segment_sentence(sentence)
+        words = self._segment_sentence(source)
 
         for word in words:
             if all(not _is_chinese_char(c) for c in word):
@@ -383,7 +464,9 @@ class ChineseTypoGenerator:
                 current_pos += len(word)
 
         correction_suggestion: Optional[str] = None
-        if random.random() < 0.5:
+        # 宿主这里是 ``if random.random() < 0.5:``；``force_suggestion`` 时**连随机数都不抽**
+        # （接管分支要求"有错字就一定有纠正建议"，见方法 docstring）。
+        if force_suggestion or random.random() < 0.5:
             if word_typos:
                 _, correct_word = random.choice(word_typos)
                 correction_suggestion = correct_word
@@ -391,7 +474,7 @@ class ChineseTypoGenerator:
                 _, correct_char = random.choice(char_typos)
                 correction_suggestion = correct_char
 
-        return "".join(result), correction_suggestion
+        return _restore_at_mentions("".join(result), mention_mapping), correction_suggestion
 
 
 # ---------------------------------------------------------------------------
@@ -637,8 +720,8 @@ class CorrectionDecision:
     """某个分段的错字纠正决定（新增分支用，不参与宿主复刻路径）。"""
 
     segment_index: int
-    mode: str  # "direct" | "quote" | "recall" | "last"
-    text: str  # direct/quote/last：纠正建议（与宿主一致，通常是一个字/词）
+    mode: str  # "direct" | "quote" | "recall"（"最后纠正"只改时机，不再是单独取值）
+    text: str  # direct/quote：纠正建议（与宿主一致，通常是一个字/词）
     sentence: str = ""  # recall：修正后的整句（撤回后必须重发完整内容）
 
 
@@ -674,6 +757,7 @@ class PostProcessor:
         typo_tone_error_rate: float = 0.1,
         typo_word_replace_rate: float = 0.006,
         bot_nickname: str = "麦麦",
+        typo_protect_at_mentions: bool = True,
     ) -> None:
         if DEPENDENCY_ERROR is not None:
             raise RuntimeError(
@@ -697,6 +781,8 @@ class PostProcessor:
         self.typo_tone_error_rate = float(typo_tone_error_rate)
         self.typo_word_replace_rate = float(typo_word_replace_rate)
         self.bot_nickname = (bot_nickname or "麦麦").strip()
+        # **与宿主不同的一处**：``@昵称`` 不参与错字生成（见 ``_protect_at_mentions``）。
+        self.typo_protect_at_mentions = bool(typo_protect_at_mentions)
 
         self._typo_generator: Optional[ChineseTypoGenerator] = None
         # 最近一次 ``process`` / ``plan`` 的统计（插件用来打诊断日志：
@@ -717,6 +803,7 @@ class PostProcessor:
                 tone_error_rate=self.typo_tone_error_rate,
                 word_replace_rate=self.typo_word_replace_rate,
                 project_root=self.project_root,
+                protect_at_mentions=self.typo_protect_at_mentions,
             )
         return self._typo_generator
 
@@ -813,19 +900,27 @@ class PostProcessor:
         enable_splitter: bool = True,
         enable_chinese_typo: bool = True,
         choose_mode: Optional[Callable[[int, str], Optional[str]]] = None,
+        should_defer: Optional[Callable[[int], bool]] = None,
         visible_probability: float = 1.0,
         max_correction_cjk: int = 0,
     ) -> ResponsePlan:
-        """新增分支：分段与宿主一致，**错字纠正方式由 ``choose_mode`` 决定**。
+        """接管分支：分段与宿主一致，**错字纠正方式由 ``choose_mode`` 决定**。
 
         ``choose_mode(segment_index, suggestion)`` 返回 ``"direct"`` / ``"quote"`` /
-        ``"recall"`` / ``"last"``，其余（含 ``None``）视为**不纠正**——错字留在消息里。
-        返回的 ``corrections`` 表示"紧跟该段之后执行"的纠正动作，``deferred`` 表示
-        "本轮全部段发完之后再执行"的纠正动作（对应"最后纠正"方式）。
+        ``"recall"``，其余（含 ``None``）视为**不纠正**——错字留在消息里。
 
-        ``visible_probability``：宿主那句硬编码的 0.5 门控——抽到纠正建议时，以该概率
+        **本分支不再使用宿主那句"50% 才给纠正建议"的门控**（``create_typo_sentence``
+        以 ``force_suggestion=True`` 调用）：只要错字真的出现，就一定会抽一次纠正方式。
+        宿主原逻辑里"没抽到纠正建议"就等于"没有任何纠正动作"，会出现"打了错字却既不
+        纠正也不撤回"（0.11.3 线上实测），与"纠正方式由权重池决定"的语义矛盾。
+
+        ``should_defer(segment_index)`` 为真时，该处纠正进 ``deferred``（"最后纠正"：
+        动作推迟到本轮全部段发完之后执行），**纠正方式不变**——所以"最后纠正"也可以是
+        直接补发 / 引用纠正 / 撤回重发；为假（或未传）时紧跟该段之后执行（``corrections``）。
+
+        ``visible_probability``：宿主那句硬编码的 0.5 门控——错字出现时，以该概率
         **发送带错字的消息**（随后按 ``choose_mode`` 纠正），否则**整句替换为正确句**
-        （等于没打错）。取 0.5 即与宿主完全同频；取 1.0 表示错字一律可见。
+        （等于没打错）。取 0.5 即与宿主同频；取 1.0 表示错字一律可见。
 
         ``max_correction_cjk``：分段汉字数**超过**该值时该处错字**不纠正**（错字留着），
         用于"长消息不乱补"；``0`` = 不限制。
@@ -854,7 +949,10 @@ class PostProcessor:
             if not (self.typo_enable and enable_chinese_typo):
                 segments.append(ProcessedResponseSegment(sentence))
                 continue
-            typoed_text, suggestion = typo_generator.create_typo_sentence(sentence)
+            # force_suggestion=True：跳过宿主"50% 才给纠正建议"的门控，见方法 docstring。
+            typoed_text, suggestion = typo_generator.create_typo_sentence(
+                sentence, force_suggestion=True
+            )
             if typoed_text != sentence:
                 typo_sentences += 1
             if suggestion:
@@ -873,7 +971,7 @@ class PostProcessor:
                 # 超限：错字可见但不纠正（也不消耗纠正方式抽取）。
                 continue
             mode = str(choose_mode(index, suggestion) or "none") if choose_mode else "none"
-            if mode not in {"direct", "quote", "recall", "last"}:
+            if mode not in {"direct", "quote", "recall"}:
                 continue
             decision = CorrectionDecision(
                 segment_index=index,
@@ -881,7 +979,7 @@ class PostProcessor:
                 text=suggestion,
                 sentence=sentence,
             )
-            if mode == "last":
+            if should_defer is not None and should_defer(index):
                 deferred.append(decision)
             else:
                 corrections[index] = decision
