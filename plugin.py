@@ -190,7 +190,7 @@ from .modules.post_process_takeover import (
 from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
 
-SUPPORTED_CONFIG_VERSION = "0.13.17"
+SUPPORTED_CONFIG_VERSION = "0.13.18"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -1992,116 +1992,12 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                     comments.setdefault(section_name, {})[field_name] = comment
         return comments
 
-    def _write_config_comments(self) -> None:
-        """给 ``config.toml`` 补上每项的行尾注释（缺注释才写，写过就跳过）。
-
-        为什么这么写：宿主的插件配置写入器不含注释，插件只能自己补。**逐行文本处理**
-        而不是用 tomlkit——这一版 tomlkit 把布尔值解析成普通 ``bool``（没有 ``.comment()``），
-        用它反而加不上注释；逐行处理还能顺手跳过数组/内联表这类多行值。
-        只**补注释**、绝不改值：值后面已经有 ``#`` 的、值是数组/表开头的、不是 ``键 = 值`` 形式的
-        行都原样跳过。之后的合并（宿主 Runner 与 WebUI 都走增量合并）会保留这些注释。
-
-        **两道"绝不改值"的保险**（0.11.2 加固，对应安全审查中-2）：
-
-        1. 识别 TOML **三引号多行字符串**：``generation_prompt`` 就是多行字段，它的起始行
-           ``generation_prompt = \"\"\"`` 形状上像"键 = 值"，朴素实现会把注释追加到字符串
-           **内部**从而改掉值；进入多行状态后整段原样跳过，直到闭合的三引号。
-        2. 写盘前用 ``tomllib`` 把**改前**与**改后**都解析一遍并断言结果相等：万一还有
-           没预料到的 TOML 形态被误伤，宁可**不写**（注释只是锦上添花），也绝不改用户的配置值。
-        """
-        path = Path(__file__).resolve().parent / "config.toml"
-        if not path.is_file():
-            return
-        try:
-            comments = self._config_toml_comments()
-            original = path.read_text(encoding="utf-8")
-            lines = original.splitlines()
-            header = "# 更好的消息后处理：配置按功能板块排版（引用回复 / 错别字 / 分段）；宿主已有的参数留空 = 跟随宿主。"
-            changed = False
-            if not any(line.strip() == header for line in lines[:5]):
-                lines.insert(0, header)
-                changed = True
-            section = ""
-            rendered: list[str] = []
-            in_multiline = False
-            for line in lines:
-                stripped = line.strip()
-                if in_multiline:
-                    # 三引号字符串内部：一个字符都不要动。
-                    rendered.append(line)
-                    if stripped.count('"""') % 2 == 1:
-                        in_multiline = False
-                    continue
-                if stripped.startswith("[") and stripped.endswith("]"):
-                    section = stripped.strip("[]").strip()
-                    rendered.append(line)
-                    continue
-                if section and "=" in line and not stripped.startswith("#"):
-                    key, _, value = stripped.partition("=")
-                    key = key.strip()
-                    value = value.strip()
-                    if value.count('"""') % 2 == 1:
-                        # 多行字符串起始行：本行与后续行全部原样跳过。
-                        in_multiline = True
-                        rendered.append(line)
-                        continue
-                    comment = comments.get(section, {}).get(key)
-                    if (
-                        comment
-                        and "#" not in value
-                        and value
-                        and not value.startswith(("[", "{"))
-                    ):
-                        rendered.append(f"{line.rstrip()}  # {comment}")
-                        changed = True
-                        continue
-                rendered.append(line)
-            if changed:
-                candidate = "\n".join(rendered) + "\n"
-                if not self._toml_values_unchanged(original, candidate):
-                    self._log_quiet(
-                        "warning",
-                        "补 config.toml 注释会改动配置值，已放弃本次写入（配置未被修改）: %s",
-                        path,
-                    )
-                    return
-                path.write_text(candidate, encoding="utf-8")
-                self._log_quiet("info", "已为 config.toml 补齐配置项注释: %s", path)
-        except Exception as exc:  # 注释只是锦上添花，失败绝不影响插件运行
-            self._log_quiet("debug", "补 config.toml 注释失败（忽略）: %s", exc)
-
-    @staticmethod
-    def _toml_values_unchanged(before: str, after: str) -> bool:
-        """断言"只补注释"没有改动任何配置值（解析失败按"已改动"处理，宁可不写）。
-
-        ``tomllib`` 是 Python 3.11+ 标准库；环境不支持时退回 ``tomlkit``；两者都没有就
-        不做这道校验（不能因为校验器缺失就让注释功能整体失效）。
-        """
-        parse: Optional[Callable[[str], Any]] = None
-        try:
-            import tomllib
-
-            parse = tomllib.loads
-        except Exception:
-            try:
-                import tomlkit
-
-                parse = lambda text: tomlkit.parse(text).unwrap()  # noqa: E731
-            except Exception:
-                return True
-        try:
-            assert parse is not None
-            return bool(parse(before) == parse(after))
-        except Exception:
-            return False
-
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
 
     async def on_load(self) -> None:
         self._rebuild_derived_state()
-        self._write_config_comments()
         await self._refresh_global_config()
         self._initialize_meaning_store()
         # 循环无条件启动（内部按配置与库可用性自门控），保证含义库关闭时状态清理仍有节奏。
