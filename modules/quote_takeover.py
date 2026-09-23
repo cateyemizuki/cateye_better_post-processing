@@ -18,6 +18,8 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..post_processing import match_leading_at_mention
+
 # @ 目标发送者查询缓存时长与容量上限（失败项用更短的负缓存，避免失败路径反复 RPC）。
 _TARGET_CACHE_TTL_SECONDS = 600.0
 _TARGET_CACHE_NEGATIVE_TTL_SECONDS = 30.0
@@ -186,11 +188,13 @@ class QuoteTakeoverMixin:
         style_taken_before = self._style_taken_before(session_id, reply_message_id)
         self._remember_styled_target(session_id, reply_message_id)
 
-        # 「同一消息只引用一次」：优先级最高，先于"目标超时/对话已推进"两条过旧规则——
+        # 「同一消息只引用一次」：优先级最高，先于"目标超时/强制直发/对话已推进"三条过旧规则——
         # 一旦这条目标消息被引用过（本插件抽到引用，或被观测到以引用方式发出），
         # 之后对该消息的任何回复都不再引用，即使已经超出 stale_age_seconds 的时间限制。
         # 抽到"直接回复"不消耗这次机会：下一轮 planner 再回复同一条消息时仍可能抽到引用。
         quote_cfg = self._quote_section_config(message)
+        # 是否在 @ 后额外补一个空格组件（默认 False，见 [quote_reply] at_trailing_space）。
+        at_with_space = bool(getattr(quote_cfg, "at_trailing_space", False))
         if bool(quote_cfg.quote_once_per_target) and self._quoted_before(session_id, reply_message_id):
             self.ctx.logger.debug(
                 "目标消息已被引用过，本次不再引用（会话 %s，reply_message_id=%s，%s）",
@@ -200,13 +204,16 @@ class QuoteTakeoverMixin:
             )
             return False
 
-        # 目标消息过旧的两条规则（超时优先）：
+        # 目标消息过旧的规则（超时优先，其次条数）：
         # 1) 目标发出超过 stale_age_seconds 秒 → 强制直接回复（不引用、也不 @）；
-        # 2) 目标之后已出现 ≥ stale_threshold_messages 条消息 → 剔除直接回复、调低 @ 权重。
+        # 2) 目标之后已出现的消息数未达到 force_direct_threshold_messages（强制直发阈值）→
+        #    强制直接回复（不引用、也不 @）；
+        # 3) 目标之后已出现 ≥ stale_threshold_messages 条消息 → 剔除直接回复、调低 @ 权重。
         stale_threshold = int(quote_cfg.stale_threshold_messages)
         stale_age = float(quote_cfg.stale_age_seconds)
+        direct_threshold = self._effective_direct_threshold(quote_cfg)
         weights: Optional[Dict[str, float]] = None
-        if stale_threshold > 0 or stale_age > 0:
+        if stale_threshold > 0 or stale_age > 0 or direct_threshold > 0:
             target_info = await self._lookup_reply_target(reply_message_id)
             if target_info is not None:
                 target_ts = target_info[3]
@@ -227,30 +234,44 @@ class QuoteTakeoverMixin:
                             stale_age,
                         )
                     return False
-                if stale_threshold > 0:
+                if stale_threshold > 0 or direct_threshold > 0:
                     count = await self._count_messages_after_target(
-                        session_id, reply_message_id, target_ts, quote_cfg
+                        session_id,
+                        reply_message_id,
+                        target_ts,
+                        quote_cfg,
+                        limit=max(stale_threshold, direct_threshold) + 1,
                     )
-                    if count >= stale_threshold:
-                        weights = self._build_stale_weights(
-                            self._weights_for_message(message), self._quote_weights_config(message)
-                        )
-                        if not self._stale_adjust_logged:
-                            self._stale_adjust_logged = True
-                            self.ctx.logger.info(
-                                "首次触发对话已推进调整：回复目标之后已有 %d 条消息（≥%d），"
-                                "本次起将剔除直接回复并调整 @ 权重 %s",
-                                count,
-                                stale_threshold,
-                                weights,
-                            )
-                        else:
+                    if count >= 0:
+                        if direct_threshold > 0 and count < direct_threshold:
+                            # 「强制直发」：对话还很新（目标后消息不足 direct_threshold 条），
+                            # 本次回复强制直接回复——既不引用也不 @。
                             self.ctx.logger.debug(
-                                "回复目标已过旧（其后 %d 条消息 ≥ %d），调整回复方式权重: %s",
+                                "目标后消息数 %d 未达强制直发阈值 %d，直接回复（不引用、也不 @）",
                                 count,
-                                stale_threshold,
-                                weights,
+                                direct_threshold,
                             )
+                            return False
+                        if stale_threshold > 0 and count >= stale_threshold:
+                            weights = self._build_stale_weights(
+                                self._weights_for_message(message), self._quote_weights_config(message)
+                            )
+                            if not self._stale_adjust_logged:
+                                self._stale_adjust_logged = True
+                                self.ctx.logger.info(
+                                    "首次触发对话已推进调整：回复目标之后已有 %d 条消息（≥%d），"
+                                    "本次起将剔除直接回复并调整 @ 权重 %s",
+                                    count,
+                                    stale_threshold,
+                                    weights,
+                                )
+                            else:
+                                self.ctx.logger.debug(
+                                    "回复目标已过旧（其后 %d 条消息 ≥ %d），调整回复方式权重: %s",
+                                    count,
+                                    stale_threshold,
+                                    weights,
+                                )
 
         # 私聊只有"引用/不引用"两种可能：权重池与过旧调整都不产生 @（防御性再兜一次）。
         if not self._is_group_message(message):
@@ -281,6 +302,58 @@ class QuoteTakeoverMixin:
             target = await self._lookup_reply_target(reply_message_id)
             if target is not None:
                 user_id, nickname, cardname = target[0], target[1], target[2]
+                literal_mention = self._leading_text_at_mention(message.get("raw_message"))
+                if literal_mention is not None:
+                    component_index, mention, mention_name = literal_mention
+                    if self._mention_matches_target(mention_name, nickname, cardname):
+                        # 正文开头已经是"字面 @目标昵称"（planner 自己写进正文的，不是 at 组件）：
+                        # 把它**换成真实 at 组件**，而不是再补一个 @ ——否则渲染出来是两个 @，
+                        # 目标还可能收到两次提醒（0.11.3 线上事故：@凯特艾 @凯特爱）。
+                        replaced = self._strip_leading_text_mention(
+                            message.get("raw_message"), component_index, mention
+                        )
+                        injected = self._inject_at_component(
+                            replaced,
+                            user_id=user_id,
+                            nickname=nickname,
+                            cardname=cardname,
+                            with_space=at_with_space,
+                        )
+                        message["raw_message"] = injected
+                        self.ctx.logger.info(
+                            "回复方式=%s（字面 @ 升级为真实 @）：前缀组件 %s（会话 %s，引用=%s）",
+                            style,
+                            self._describe_components(self._component_prefix(injected, 3)),
+                            session_id,
+                            style == "quote_at",
+                        )
+                        if bool(getattr(quote_cfg, "style_once_per_target", True)):
+                            self._remember_quoted_target(session_id, reply_message_id)
+                        if style == "quote_at":
+                            modified["set_reply"] = True
+                            self._remember_quoted_target(session_id, reply_message_id)
+                        return True
+                    # 开头 @ 的是别人：正文已经有 @ 了，**不再补第二个**（"一条消息只 @ 一次"）。
+                    # 但**空格口径仍要对齐**（0.13.17）：这条路原本"原样发出"，空格数由模型写，
+                    # 于是群里会出现 0/1/2 三种；这里统一成"恰好一个半角空格"。
+                    normalized_mention = self._normalize_text_mention_spacing(
+                        message.get("raw_message"), component_index, mention
+                    )
+                    if normalized_mention is not None:
+                        message["raw_message"] = normalized_mention
+                    self.ctx.logger.info(
+                        "回复方式=%s（正文开头已有字面 @%s，不是本轮目标，跳过 @ 注入%s）：%s（会话 %s）",
+                        style,
+                        mention_name,
+                        "，仅统一空格" if normalized_mention is not None else "",
+                        self._describe_components(self._component_prefix(message.get("raw_message"), 3)),
+                        session_id,
+                    )
+                    if style == "quote_at":
+                        modified["set_reply"] = True
+                        self._remember_quoted_target(session_id, reply_message_id)
+                        return True
+                    return normalized_mention is not None
                 if self._has_leading_at(message.get("raw_message")):
                     # 消息开头已经有一个 @（planner 富回复 attach_at，或其它插件注入）：
                     # 不重复 @。宿主 1.2.3 的 attach_at 是 [at, ...]、1.2.5+ 是
@@ -290,7 +363,9 @@ class QuoteTakeoverMixin:
                     # **但空格口径仍要统一**：0.10.7 起这里不再"直接放行"，而是把已存在的
                     # @ 后面的空白也规范化成一个半角空格（宿主 1.2.3 不加空格、1.2.5+ 加一个、
                     # 别的注入方可能加两个），否则同一个插件在不同来源下会输出 0/1/2 个空格。
-                    normalized = self._normalize_leading_at_spacing(message.get("raw_message"))
+                    normalized = self._normalize_leading_at_spacing(
+                        message.get("raw_message"), with_space=at_with_space
+                    )
                     if normalized is not None:
                         message["raw_message"] = normalized
                         prefix = self._describe_components(self._component_prefix(normalized, 3))
@@ -317,6 +392,7 @@ class QuoteTakeoverMixin:
                     user_id=user_id,
                     nickname=nickname,
                     cardname=cardname,
+                    with_space=at_with_space,
                 )
                 message["raw_message"] = injected
                 self.ctx.logger.info(
@@ -450,16 +526,55 @@ class QuoteTakeoverMixin:
         return weights
 
 
+    def _effective_direct_threshold(self, quote_cfg: Any) -> int:
+        """取「强制直发阈值」的有效值：必须**小于**「对话已推进阈值」，超出时为旧阈值让步。
+
+        语义（与 WebUI 标签/字段说明一致）：目标之后的消息数**未达到**该值（对话还很新）
+        时强制直接回复（不引用、也不 @）。本项与决定"是否剔除直接回复"的
+        ``stale_threshold_messages``（对话已推进阈值）互补，因此必须小于它：
+        配置值 ≥ 旧阈值时自动压到「对话已推进阈值 − 1」（例如旧阈值 3、本项填 4 → 按 2 生效；
+        旧阈值为 1 时压到 0 = 关闭）。旧阈值本身为 0（未启用对话已推进判定）时不设上限。
+        0 = 关闭。首次压制时用 info 记录，后续降为 debug。
+        """
+        try:
+            raw = int(getattr(quote_cfg, "force_direct_threshold_messages", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        if raw <= 0:
+            return 0
+        stale_threshold = int(quote_cfg.stale_threshold_messages)
+        if stale_threshold <= 0 or raw < stale_threshold:
+            return raw
+        clamped = max(0, stale_threshold - 1)
+        if not getattr(self, "_direct_threshold_clamped_logged", False):
+            self._direct_threshold_clamped_logged = True
+            self.ctx.logger.info(
+                "强制直发阈值 %d 不小于对话已推进阈值 %d，为旧阈值让步：按 %d 生效",
+                raw,
+                stale_threshold,
+                clamped,
+            )
+        else:
+            self.ctx.logger.debug(
+                "强制直发阈值 %d 被对话已推进阈值 %d 压制，按 %d 生效",
+                raw,
+                stale_threshold,
+                clamped,
+            )
+        return clamped
+
     async def _count_messages_after_target(
-        self, session_id: str, target_id: str, target_ts: float, cfg: Any
+        self, session_id: str, target_id: str, target_ts: float, cfg: Any, limit: Optional[int] = None
     ) -> int:
         """统计目标消息之后入库的消息条数；失败或时间戳缺失返回 -1（回退为不调整）。
 
-        查询区间为 ``[目标时间戳, 现在]``，limit 取 ``阈值+1``（latest 模式）：
+        查询区间为 ``[目标时间戳, 现在]``，limit 默认取 ``对话已推进阈值+1``（latest 模式）：
         区间内消息多于阈值时必然返回阈值+1 条，足以判定；目标消息自身按
-        message_id 剔除。``cfg`` 是该会话类型的功能配置节（群聊 / 私聊阈值各自独立）。
+        message_id 剔除。传入 ``limit`` 时（「强制直发阈值」与「对话已推进阈值」共用一次
+        统计）取 ``max(两个阈值) + 1``，足以同时判定两条阈值。``cfg`` 是该会话类型的
+        功能配置节（群聊 / 私聊阈值各自独立）。
         """
-        threshold = int(cfg.stale_threshold_messages)
+        threshold = int(limit if limit is not None else cfg.stale_threshold_messages)
         if not session_id or target_ts <= 0:
             return -1
         try:
@@ -532,12 +647,21 @@ class QuoteTakeoverMixin:
         return "[" + ", ".join(parts) + "]"
 
     @classmethod
-    def _normalize_leading_at_spacing(cls, raw_message: Any) -> Optional[List[Any]]:
-        """把"已存在的开头 @"后面的空白规范化成**恰好一个半角空格**。
+    def _normalize_leading_at_spacing(
+        cls, raw_message: Any, *, with_space: bool = False
+    ) -> Optional[List[Any]]:
+        """规范化"已存在的开头 @"后面的空白。返回 ``None`` 表示**无需改动**。
 
-        为什么需要：``attach_at``/别的插件注入的 @ 后面带几个空格不由我们决定
-        （宿主 1.2.3 是 ``[at, ...]`、1.2.5+ 是 ``[at, " ", ...]``、其它插件可能更多），
-        不统一就会出现"有时候一个空格、有时候两个"。返回 ``None`` 表示**无需改动**。
+        为什么需要：``attach_at`` / 别的插件注入的 @ 后面带几个空格不由我们决定
+        （宿主 1.2.3 是 ``[at, ...]``、1.2.5+ 是 ``[at, " ", ...]``、其它插件可能更多），
+        不统一就会出现"有时候一个空格、有时候两个"。
+
+        口径（0.13.12 起）：
+
+        - ``with_space=False``（**默认**）：**删掉** at 后面所有纯空白文本段，只留
+          ``[at, 正文]`` —— 宿主渲染时 ``" ".join`` 会自己补一个空格，正好一个；
+        - ``with_space=True``：把空白段并成**恰好一个半角空格**组件（0.10.8 的旧口径）；
+        - 两种口径都会抹掉正文自带的前导空白。
         """
         if not isinstance(raw_message, list):
             return None
@@ -568,26 +692,32 @@ class QuoteTakeoverMixin:
             cursor += 1
 
         changed = False
-        if whitespace_indices:
-            first = whitespace_indices[0]
-            if len(whitespace_indices) > 1 or str(components[first].get("data") or "") != " ":
-                changed = True
-            components[first] = {"type": "text", "data": " "}
-            for index in reversed(whitespace_indices[1:]):
-                components.pop(index)
-                changed = True
+        if with_space:
+            if whitespace_indices:
+                first = whitespace_indices[0]
+                if len(whitespace_indices) > 1 or str(components[first].get("data") or "") != " ":
+                    changed = True
+                components[first] = {"type": "text", "data": " "}
+                for index in reversed(whitespace_indices[1:]):
+                    components.pop(index)
+                    changed = True
 
-        # at 后面直接跟正文（0 个空格）：补一个空格。
-        if not whitespace_indices:
-            body_index = at_index + 1
-            has_body_text = any(
-                isinstance(item, dict)
-                and str(item.get("type") or "") == "text"
-                and str(item.get("data") or "").strip()
-                for item in components[body_index:]
-            )
-            if has_body_text:
-                components.insert(at_index + 1, {"type": "text", "data": " "})
+            # at 后面直接跟正文（0 个空格）：补一个空格。
+            if not whitespace_indices:
+                body_index = at_index + 1
+                has_body_text = any(
+                    isinstance(item, dict)
+                    and str(item.get("type") or "") == "text"
+                    and str(item.get("data") or "").strip()
+                    for item in components[body_index:]
+                )
+                if has_body_text:
+                    components.insert(at_index + 1, {"type": "text", "data": " "})
+                    changed = True
+        elif whitespace_indices:
+            # 默认口径：at 后面的纯空白段全部删掉（宿主渲染时自己会补一个空格）。
+            for index in reversed(whitespace_indices):
+                components.pop(index)
                 changed = True
 
         # 正文自带前导空白（"@某人  正文"的另一种来源）：抹掉。
@@ -604,6 +734,95 @@ class QuoteTakeoverMixin:
             break
 
         return components if changed else None
+
+    @staticmethod
+    def _leading_text_at_mention(raw_message: Any) -> Optional[Tuple[int, str, str]]:
+        """正文开头若是**字面** ``@昵称``，返回 ``(组件下标, 提及原文, 昵称)``；否则 ``None``。
+
+        为什么需要：planner 有时会把 @ 直接写进正文（``@凯特艾 行吧多想了``），那只是普通
+        文本、不是 at 组件。此时若再注入一个真实 at，一条消息里就会出现两个 @；若那个字面
+        昵称又被错字生成器改过（宿主会改），两个 @ 的名字还不一样。
+        遇到真实 at 组件（``_has_leading_at`` 的管辖范围）或开头没有 @ 时返回 ``None``。
+        """
+        components = raw_message if isinstance(raw_message, list) else []
+        for index, component in enumerate(components):
+            if not isinstance(component, dict):
+                continue
+            component_type = str(component.get("type") or "")
+            if component_type == "at":
+                return None  # 已有真实 at 组件：交给 _has_leading_at 处理
+            if component_type != "text":
+                continue
+            data = str(component.get("data") or "")
+            if not data.strip():
+                continue
+            mention = match_leading_at_mention(data)
+            if not mention:
+                return None
+            return index, mention, mention[1:]
+        return None
+
+    @staticmethod
+    def _mention_matches_target(name: str, nickname: str, cardname: str) -> bool:
+        """字面 @ 的昵称是否就是被回复消息的发送者（群名片优先，昵称兜底）。"""
+        normalized = str(name or "").strip().casefold()
+        if not normalized:
+            return False
+        for candidate in (cardname, nickname):
+            text = str(candidate or "").strip().casefold()
+            if text and text == normalized:
+                return True
+        return False
+
+    @staticmethod
+    def _strip_leading_text_mention(raw_message: Any, component_index: int, mention: str) -> List[Any]:
+        """把正文开头那段**字面** @提及 从文本组件里删掉（供随后注入真实 at 组件）。
+
+        返回新列表、不改入参；删完的剩余空白由 ``_inject_at_component`` 统一规范化。
+        """
+        components: List[Any] = list(raw_message) if isinstance(raw_message, list) else []
+        if not (0 <= component_index < len(components)):
+            return components
+        component = components[component_index]
+        if not isinstance(component, dict):
+            return components
+        data = str(component.get("data") or "")
+        remainder = data.lstrip()[len(mention):]
+        components[component_index] = {**component, "data": remainder.lstrip()}
+        return components
+
+    @staticmethod
+    def _normalize_text_mention_spacing(
+        raw_message: Any, component_index: int, mention: str
+    ) -> Optional[List[Any]]:
+        """把**字面** @提及 后面的空白规范成**恰好一个半角空格**；无需改动返回 ``None``。
+
+        为什么需要（0.13.17）：正文开头是"字面 @别人"时本插件会**跳过 @ 注入、原样发出**，
+        于是那条消息的空格数**完全由模型写的文本决定**（实测 0 / 1 / 2 都可能）——
+        而插件自己注入真实 at 时空格数是**恒定**的（由 ``at_trailing_space`` 决定 0 或 1）。
+        两条路口径不一致，群里就会看到"有时候 @ 后没空格、有时候一个、有时候两个"。
+        这里把字面 @ 也对齐到"恰好一个"。
+
+        只处理"后面确实还有正文"的情况（只剩 ``@某人`` 时不动，免得把消息弄空）。
+        """
+        components: List[Any] = list(raw_message) if isinstance(raw_message, list) else []
+        if not (0 <= component_index < len(components)):
+            return None
+        component = components[component_index]
+        if not isinstance(component, dict):
+            return None
+        data = str(component.get("data") or "")
+        head = data.lstrip()
+        if not head.startswith(mention):
+            return None
+        remainder = head[len(mention) :].lstrip()
+        if not remainder:
+            return None
+        normalized = f"{mention} {remainder}"
+        if normalized == data:
+            return None
+        components[component_index] = {**component, "data": normalized}
+        return components
 
     @staticmethod
     def _has_leading_at(raw_message: Any) -> bool:
@@ -661,16 +880,25 @@ class QuoteTakeoverMixin:
         user_id: str,
         nickname: str,
         cardname: str,
+        with_space: bool = False,
     ) -> List[Any]:
-        """把 at 组件（及其后的**一个半角空格**）插入组件列表首位（返回新列表，不修改入参）。
+        """把 at 组件插入组件列表首位（返回新列表，不修改入参）。
 
-        空格口径（0.10.2 起统一）：
+        空格口径（0.13.12 起，由 ``[quote_reply] at_trailing_space`` 决定）：
 
-        - 注入前先 ``_strip_body_leading_whitespace`` 抹掉正文自带的前导空白；
-        - 然后**恒定补一个半角空格**组件 —— 正文原来带不带空白、带几个、带的是不是
-          全角空格，结果都是"@昵称 正文"，不会出现两个空格；
-        - 宿主自己已经 @ 过的情况不归这里管（调用方用 ``_has_leading_at`` 先判断，
-          含 1.2.5+ 宿主自带的 ``[at, " "]`` 与 1.2.3 的 ``[at]``）。
+        - 注入前**一律**先 ``_strip_body_leading_whitespace`` 抹掉正文自带的前导空白 ——
+          这一步无论补不补空格都要做，否则正文自带的空白会和渲染层的空格叠加；
+        - ``with_space=False``（**默认**）：只插 ``at``，**不插空格组件**。
+          宿主 ``send_service._build_processed_plain_text()`` 用 ``" ".join(parts)`` 拼接
+          每个组件、**组件之间自己会补一个空格**，所以 ``[at, 正文]`` 渲染出来正好是
+          ``@昵称 正文``（一个空格）。此时若再插一个空格组件，就会渲染成
+          ``@昵称`` + join空格 + ``' '`` + join空格 + ``正文`` = **三个空格**，
+          而且会跟着 ``processed_plain_text`` 进消息库、上下文与记忆抽取。
+          宿主 1.2.3 自己的 ``attach_at`` 也是 ``[at, 正文]``，口径一致。
+        - ``with_space=True``：保留旧行为（恒定补一个半角空格组件），
+          给"某些客户端 at 段后不自动补空格"导致粘连的环境用。
+
+        宿主自己已经 @ 过的情况不归这里管（调用方用 ``_has_leading_at`` 先判断）。
         """
         components = cls._strip_body_leading_whitespace(
             list(raw_message) if isinstance(raw_message, list) else []
@@ -686,7 +914,7 @@ class QuoteTakeoverMixin:
         prefix: List[Any] = [at_component]
         # 正文里还有文本组件时才补空格；消息完全没有文本（纯图片/表情）时不补，
         # 免得留下一个悬挂的空格段。
-        if any(
+        if with_space and any(
             isinstance(component, dict) and str(component.get("type") or "") == "text"
             for component in components
         ):
