@@ -78,6 +78,8 @@
    那只是普通文本（宿主与适配器都**不会**把它转成真实 at 段，QQ 里不提醒任何人；模型是照抄
    宿主渲染进上下文的「@昵称」文本）。出站前把**消息开头**的 ``@某人 + 空格`` 整段删掉，
    这样抽到 @ 回复时注入的**真实 at** 才是消息里唯一的一个 @。
+   **0.14.2 起只删「本轮回复目标」那个名字**：@ 的是别人时保留原文，否则删掉之后再注入
+   回复目标的真实 at，等于把话 @ 给了另一个人（详见 ``_fake_at_mention_is_target``）。
    只受「丰富回复门控」约束，作用范围与文本规则一致（只动 bot 本轮回复自己的消息）。
 
    生效范围（0.7.1 收紧）：只处理**本插件已登记的回复轮**（由
@@ -88,8 +90,11 @@
    Ciallo 消息）一律不动；宿主已设置 ``set_reply`` 的发送也不重复处理。轮记录在
    "回复后表情包"判定完成后仍然保留（只标记 ``emoji_done``），否则 4 秒静默后
    分段才发出的回复会因记录消失而退化为逐条抽取。
-   @ 注入为 ``[at, 文本" "]`` 两段（与宿主 ``attach_at`` 口径一致，QQ 不会自动补
-   空格）；原文本已以空白开头时不再重复补，已带前导 at 时不重复 @。
+   @ 注入形态由 ``[plugin] at_trailing_space`` 决定（**按宿主版本选**）：
+   ``false``（MaiBot 1.2.5 起的默认）→ ``[at, 正文]``，宿主渲染时 ``" ".join`` 自己补一个空格；
+   ``true``（1.2.5 以前应开启）→ ``[at, " ", 正文]``，补一个显式空格组件（宿主那时不插，
+   不补的话 QQ 里 ``@昵称`` 会与正文粘连）。两种口径下正文自带的前导空白都会先被抹掉，
+   已带前导 at 时不重复 @。详见 README「@ 与正文之间的空格」。
    同一轮回复只抽取一次（首段生效），后续分段保持原样——与宿主分段语义一致
    （分段循环里仅首段携带对目标消息的引用意图，错别字更正段由宿主原生引用）。
 3. 回复后表情包（``[emoji_after_reply]``）：以 ``maisaka.reply.before_post_process``
@@ -105,6 +110,16 @@
    工具调用名（``planner_emoji_tools``），命中即为该会话打"本轮 planner 自行处理
    表情"标记（``planned_emoji_ttl_seconds`` 秒），本轮不再补发（贴表情类工具同样
    计入，避免"planner 贴了表情、插件又补一张"）。
+
+   **0.14.2 起判定时机改成"等本轮 planner 收尾"**（修"回复完补一张、宿主随后又发一张"）：
+   planner 是 action loop，``reply`` 发出消息后宿主会带着工具结果**再请求一次模型**，
+   模型完全可能在下一轮才调 ``send_emoji``。只按"最后一条出站消息静默 N 秒"判定，
+   窗口很容易落在"下一轮请求还没回来"或"正在选图"的中间。现在补发判定要求
+   **出站静默 + 主 planner 无在途请求**（``maisaka.planner.before_request`` 里
+   ``tool_definitions`` 非空即视为"主 planner 有一轮在跑"，其 ``after_response`` 清掉；
+   子代理的 ``tool_definitions`` 为空，不参与），上界是本轮有效期。
+   另有一道**不依赖工具名配置**的保险：宿主 ``send_emoji`` 工具开始选图时触发
+   ``emoji.maisaka.before_select``，插件收到即把本轮标记成"已有表情包在路上"。
 
    回复轮只有在 ``first_send_timeout_seconds`` 秒内看到本轮出站消息才算成立：
    超时说明这轮回复并没有真的发出去（发送失败 / 被其它插件在
@@ -131,7 +146,8 @@
    由视觉模型生成的"准确内容"，并在**发给模型的请求**里把上下文中的
    ``[表情包: 标签]`` **就地替换**为库里的描述（``maisaka.replyer.before_model_request``
    与 ``maisaka.planner.before_request`` 改写 Context Items；范围由 ``rewrite_scope``
-   控制，**默认只改 replyer**）。改的只是"即将发给模型的请求"，不动宿主数据、随时可回退。
+   控制，**默认 replyer 与 planner 都改**，留空 = 都不改）。
+   改的只是"即将发给模型的请求"，不动宿主数据、随时可回退。
    **关联键是宿主 image_hash（sha256）**——组件 ``EmojiComponent.binary_hash`` 就是
    ``Images.image_hash``，描述只是展示字段（表情库维护会按描述"取消注册旧的、注册新的"，
    按描述存会把含义错挂给新图）。标签定位优先用 item 前缀的 ``msg_id`` 查本地映射、
@@ -190,7 +206,7 @@ from .modules.post_process_takeover import (
 from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
 
-SUPPORTED_CONFIG_VERSION = "0.13.18"
+SUPPORTED_CONFIG_VERSION = "0.14.2"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -236,6 +252,21 @@ _MEANING_PURGE_MIN_INTERVAL_SECONDS = 3600.0
 # 兜底，所以容量与时效都可以给得比较紧。
 _MESSAGE_EMOJI_REFS_MAX_ENTRIES = 512
 _MESSAGE_EMOJI_REFS_TTL_SECONDS = 3600.0
+
+# 「这个会话是群聊」的记忆（session_id 集合，LRU 限长）。
+#
+# 为什么需要：**出站**消息的群/私聊只能靠 ``message_info.group_info`` 判定，而宿主
+# ``send_service._build_outbound_session_message()`` 只在 ``target_stream.group_name``
+# （或流上下文消息的群名）**非空**时才填它：
+#     group_info = None
+#     if target_stream.group_id:
+#         group_name = ... ; if group_name: group_info = GroupInfo(...)
+# 群名缺失时出站消息的 ``group_info`` 就是 None → 插件会把群聊当成私聊：
+# 权重池按 ``allow_at=False`` 清零、@ 永不出现、而且读的是 ``[quote_reply_private]`` 配置节，
+# 现象是"这个群怎么都不 @ 人"且日志里看不出来。
+# 入站消息的 ``group_info`` 一定是准的（群聊 = dict、私聊 = None），所以按 session_id 记一份；
+# 会话类型不会变，因此**不设 TTL**，只按 LRU 限长。
+_GROUP_SESSIONS_MAX_ENTRIES = 512
 
 # item 文本前缀里的消息 id（`<message msg_id="…" …>`，宿主 planner_messages 生成）。
 _MSG_ID_IN_PREFIX = re.compile(r'msg_id="([^"]*)"')
@@ -1332,26 +1363,35 @@ class EmojiAfterReplySectionConfig(PluginConfigBase):
     quiet_seconds: float = Field(
         default=4.0,
         ge=0.5,
-        description="回复分段发送完成后等待多少秒没有新出站消息，才认定本轮结束（**最少 0.5 秒**，默认 4）",
+        description=(
+            "回复分段发送完成后等待多少秒没有新出站消息，才认定本轮结束（**最少 0.5 秒**，默认 4）。"
+            "0.14.2 起还要**同时**满足「主 planner 没有在途请求」才判定——planner 是 action loop，"
+            "reply 之后它可能再来一轮才调 send_emoji，只看静默会把补发抢在宿主前面（群里两个表情包）"
+        ),
         json_schema_extra={
             "label": "静默判定时长（秒）",
-            "x-toml-comment": "群聊安静这么久才考虑补发（避免打断热火朝天的聊天）。",
+            "x-toml-comment": "群聊安静这么久、且 planner 本轮不再有在途请求时，才考虑补发。",
             **_ui_i18n(
                 "Quiet window (seconds)",
-                "Wait this many seconds without new outgoing messages before treating the round as finished.",
+                "Wait this many seconds without new outgoing messages AND with no in-flight planner "
+                "request before treating the round as finished.",
             ),
         },
     )
     round_window_seconds: float = Field(
         default=90.0,
         ge=1.0,
-        description="从回复生成开始，超过多少秒未等到出站消息则丢弃该轮记录",
+        description=(
+            "从回复生成开始，超过多少秒未等到出站消息则丢弃该轮记录；也是「等待 planner 本轮结束」的"
+            "上界（到点按不再等处理，保证补发仍然来得及判定）"
+        ),
         json_schema_extra={
             "label": "回复轮窗口（秒）",
-            "x-toml-comment": "判定「同一轮回复」的时间窗。",
+            "x-toml-comment": "判定「同一轮回复」的时间窗，也是等待 planner 收尾的上界。",
             **_ui_i18n(
                 "Round window (seconds)",
-                "Discard the round record if no outgoing message arrives within this many seconds.",
+                "Discard the round record if no outgoing message arrives within this many seconds; "
+                "also caps how long the plugin waits for the planner turn to settle.",
             ),
         },
     )
@@ -1375,7 +1415,9 @@ class EmojiAfterReplySectionConfig(PluginConfigBase):
         default_factory=lambda: ["send_emoji"],
         description=(
             "planner 计划调用这些工具（``maisaka.planner.after_response`` 的 output_items 工具名）时，"
-            "视为本轮已由 planner 自行处理表情，本插件不再补发；留空则关闭该判定"
+            "视为本轮已由 planner 自行处理表情，本插件不再补发；留空则关闭该判定。"
+            "0.14.2 起还有一道**不依赖这个名单**的保险：宿主 ``send_emoji`` 工具开始选图时会触发"
+            "``emoji.maisaka.before_select``，插件收到就把本轮标记成「已有表情包」"
         ),
         json_schema_extra={
             "label": "planner 表情工具名",
@@ -1383,7 +1425,9 @@ class EmojiAfterReplySectionConfig(PluginConfigBase):
             "rows": 3,
             **_ui_i18n(
                 "Planner emoji tool names",
-                "When the planner plans to call any of these tools, the round counts as already carrying an emoji and no extra one is sent. Empty disables the check.",
+                "When the planner plans to call any of these tools, the round counts as already carrying "
+                "an emoji and no extra one is sent. Empty disables the check. Since 0.14.2 the host's "
+                "emoji.maisaka.before_select hook is also observed, so this list is not the only guard.",
             ),
         },
     )
@@ -1809,6 +1853,12 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         self._chat_emoji_last: Dict[str, float] = {}
         # planner 本轮已计划自行发表情/贴表情的标记截止时刻：session_id -> 单调时钟上限。
         self._planned_emoji_until: Dict[str, float] = {}
+        # 主 planner 的"本轮请求在途"标记（0.14.2，回复后表情包的判定时机用）：
+        # session_id -> 该轮请求开始时刻。见 ``_planner_round_inflight``。
+        self._planner_round_started: Dict[str, float] = {}
+        # 哪些会话的"主 planner 请求"还没等到对应响应（用于把 after_response 与主 planner 配对，
+        # 排除子代理请求 —— 子代理的 tool_definitions 为空，不进来）。
+        self._planner_main_pending: set[str] = set()
         # 聊天流表情冷却起点（仅入库的表情包记录）：session_id -> 单调时钟。
         self._chat_emoji_cooldown_start: Dict[str, float] = {}
         # 群聊连续表情包计数：session_id -> {"count", "last", "last_desc"}。
@@ -1845,6 +1895,8 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         # 入站消息里的表情包引用（reply 路径"本地映射优先"用）：
         # message_id -> (单调时钟, session_id, [(hash, 描述)])。
         self._message_emoji_refs: "OrderedDict[str, Tuple[float, str, List[Tuple[str, str]]]]" = OrderedDict()
+        # 「这个会话是群聊」的记忆（出站消息缺 group_info 时的兜底判定）：LRU 限长的 session_id 集合。
+        self._group_sessions: "OrderedDict[str, None]" = OrderedDict()
         # 后台任务集合（on_unload 时统一取消）。
         self._tasks: set[asyncio.Task] = set()
         self._init_post_process_takeover()
@@ -2233,7 +2285,9 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         try:
             # 假 @ 过滤必须排在「文本规则」与「回复方式抽取」**之前**：先清掉 LLM 手写的文本 @，
             # 后面抽到 @ 回复时注入的真实 at 才会是这条消息里唯一的一个 @。
-            changed = self._strip_leading_fake_at(
+            # 但它**只删"本轮回复目标"那个名字**（0.14.2 修）：删掉别人名字后再 @ 回复目标，
+            # 会把话 @ 给另一个人（详见方法 docstring）。
+            changed = await self._strip_leading_fake_at(
                 message,
                 session_id=session_id,
                 reply_message_id=reply_message_id,
@@ -2292,7 +2346,7 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             return True  # 门控关掉 = 宿主开着丰富回复也允许介入
         return not bool(self._cfg.get("experimental.enable_rich_reply"))
 
-    def _strip_leading_fake_at(
+    async def _strip_leading_fake_at(
         self,
         message: Dict[str, Any],
         *,
@@ -2312,6 +2366,19 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
 
         作用范围与文本规则一致：只处理**bot 本轮回复自己发出的消息**（含多段发送由插件补发的
         分段），其它插件用 ``ctx.send.*`` 直接发出的文本一律不动。
+
+        **0.14.2 起再收一道口子：只删"本轮回复目标"的名字。**
+        这条过滤的初衷是清掉 LLM **照抄宿主渲染进上下文的 ``@昵称``**（那正是被回复的人，
+        见 0.11.3 线上事故），不是清掉所有 @。原实现无条件删，于是：
+
+        * 删除之后若「引用回复接管」抽到 ``at`` / ``quote_at``，注入的是**本轮回复目标**的
+          真实 at —— 于是 LLM 写给**别人**的 ``@张三 你好`` 会变成 ``@李四 你好``（@ 错人）；
+        * 同时把 quote_takeover 的「开头字面 @ 别人 ⇒ 跳过注入」那条分支变成了死代码。
+
+        现在只在**确认**字面昵称就是回复目标（群名片/昵称任一相等）时才删；@ 的是别人则
+        原样保留，交给 ``quote_takeover`` 按原口径处理（抽到 @ 时跳过注入、只统一空格）。
+        目标查询失败时仍按"可能是目标"处理照删——那种情况下注入路径也拿不到目标、
+        会退化为引用回复，不会 @ 错人。
         """
         if not self._fake_at_filter_active():
             return False
@@ -2346,6 +2413,8 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                     "过滤假 @：删掉后正文为空，保留原样（会话 %s）", session_id or "?"
                 )
                 return False
+            if not await self._fake_at_mention_is_target(match.group(0), session_id, reply_message_id):
+                return False
             new_components = list(components)
             new_components[index] = {**component, "data": stripped}
             message["raw_message"] = new_components
@@ -2361,6 +2430,49 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                 session_id or "?",
             )
             return True
+        return False
+
+    async def _fake_at_mention_is_target(
+        self, mention: str, session_id: str, reply_message_id: str
+    ) -> bool:
+        """正文开头那个字面 ``@名字`` 是否就是**本轮回复目标**（是才允许删）。
+
+        为什么要问这一句（0.14.2）：假 @ 过滤的初衷是清掉 LLM **照抄宿主渲染进上下文的
+        ``@昵称``** —— 那必然就是被回复的人。但 LLM 也可能主动写 ``@张三``（张三不是本轮
+        回复目标），此时若无条件删除，后面抽到 ``at`` 会注入**回复目标**的真实 at，
+        等于把话 @ 给了另一个人。
+
+        目标查询走 ``quote_takeover._lookup_reply_target``（带 TTL 缓存，稍后
+        ``_apply_reply_style`` 再查同一个 id 时直接命中缓存、不额外发 RPC）。
+
+        返回 ``True``（允许删）的两种情况：
+
+        * 昵称/群名片与目标匹配（就是那个假 @，删掉后由接管注入真实 at）；
+        * **查不到目标**（不是回复 / 消息被清理 / 会话里没有轮记录）—— 此时注入路径同样
+          拿不到目标、会退化为引用回复，删掉字面 @ 不可能 @ 错人，保持 0.12.1 起的原行为。
+        """
+        target_id = str(reply_message_id or "").strip()
+        if not target_id and session_id:
+            reply_round = self._reply_rounds.get(session_id)
+            if isinstance(reply_round, dict):
+                # 插件自己补发的分段没有 reply_message_id，用本轮轮记录里的目标兜底。
+                target_id = str(reply_round.get("target_id") or "").strip()
+        if not target_id:
+            return True
+        target = await self._lookup_reply_target(target_id)
+        if target is None:
+            return True
+        nickname, cardname = str(target[1] or ""), str(target[2] or "")
+        name = str(mention or "").lstrip("@").strip()
+        if self._mention_matches_target(name, nickname, cardname):
+            return True
+        self.ctx.logger.info(
+            "保留正文开头的字面 @%s：它不是本轮回复目标（%s / %s），"
+            "交给引用回复接管按原口径处理（抽到 @ 时跳过注入、只统一空格）",
+            name,
+            cardname or "-",
+            nickname or "-",
+        )
         return False
 
     def _apply_text_rules_to_message(
@@ -2448,12 +2560,31 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                 message["processed_plain_text"] = apply_rules(processed, rules)
         return changed
 
-    @staticmethod
-    def _is_group_message(message: Dict[str, Any]) -> bool:
+    def _is_group_message(self, message: Dict[str, Any]) -> bool:
+        """该消息是否来自群聊。
+
+        首选 ``message_info.group_info``（入站消息一定准）。取不到时退回"本会话是群聊"的记忆
+        （``_group_sessions``，由入站 Hook 记录）——**出站**消息的 ``group_info`` 由宿主按
+        ``target_stream.group_name`` 是否非空决定，群名缺失时会是 None（详见
+        ``_GROUP_SESSIONS_MAX_ENTRIES`` 的说明），此时若直接判成私聊，群聊的 @ 就永远不会出现。
+        """
         message_info = message.get("message_info")
         if not isinstance(message_info, dict):
             return False
-        return isinstance(message_info.get("group_info"), dict)
+        if isinstance(message_info.get("group_info"), dict):
+            return True
+        session_id = str(message.get("session_id") or "").strip()
+        return bool(session_id) and session_id in self._group_sessions
+
+    def _remember_group_session(self, session_id: str) -> None:
+        """记下"这个会话是群聊"（LRU 限长；会话类型不会变，所以不设 TTL）。"""
+        normalized = str(session_id or "").strip()
+        if not normalized:
+            return
+        self._group_sessions[normalized] = None
+        self._group_sessions.move_to_end(normalized)
+        while len(self._group_sessions) > _GROUP_SESSIONS_MAX_ENTRIES:
+            self._group_sessions.popitem(last=False)
 
     def _message_in_reply_flow(self, session_id: str, reply_message_id: str) -> bool:
         """该出站消息是否属于"planner 拉起的本轮回复"。
@@ -2578,6 +2709,62 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
     # ------------------------------------------------------------------
 
     @HookHandler(
+        "maisaka.planner.before_request",
+        name="planner_round_tracker",
+        description=(
+            "observe：标记「主 planner 有一轮请求在途」，供回复后表情包判断"
+            "「本轮工具链是否还在跑」（避免 reply 之后又 send_emoji 时补出第二张）"
+        ),
+        mode=HookMode.OBSERVE,
+        order=HookOrder.EARLY,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_planner_round_tracker(self, **kwargs: Any) -> None:
+        """记录"主 planner 的一轮请求开始了"。
+
+        为什么要它（0.14.2）：planner 是 **action loop**，工具按模型输出顺序**串行**执行。
+        `reply` 把消息发出去之后，宿主会带着工具结果再请求一次模型，模型完全可能在**下一轮**
+        才调 `send_emoji`（该工具内部还要跑视觉子代理选图，耗时数秒到数十秒）。而"回复后
+        表情包"原来是"最后一条出站消息静默 `quiet_seconds` 就判定"——4 秒的窗口很容易落在
+        "下一轮模型请求还没回来"或"正在选图"的中间，于是插件先补了一张、宿主的 send_emoji
+        随后又发一张，群里出现**两个表情包**。
+
+        现在改成：只要"主 planner 还有一轮请求在途"就先不判定（见
+        ``_planner_round_inflight``），等这一轮响应回来再决定——响应里带 `send_emoji` 时
+        已有的 ``planner_emoji_tools`` 判定会直接把本轮标记成"planner 自己发"，从而跳过补发。
+
+        **只认主 planner**：子代理（行为分析 / 中期记忆 / 选图等）复用同一个 Hook 但
+        ``tool_definitions`` 为空，据此排除 —— 否则子代理的一轮请求也会被当成"本轮还在跑"。
+        """
+        if not self._plugin_enabled() or not self.config.emoji_after_reply.enabled:
+            return
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not session_id:
+            return
+        tool_definitions = kwargs.get("tool_definitions")
+        if not isinstance(tool_definitions, list) or not tool_definitions:
+            return  # 子代理（无工具）不参与"本轮是否还在跑"的判定
+        self._planner_round_started[session_id] = time.monotonic()
+        self._planner_main_pending.add(session_id)
+
+    def _planner_round_inflight(self, session_id: str) -> bool:
+        """主 planner 是否还有一轮请求没等到响应（是 → 本轮工具链还在跑，先别判定）。"""
+        if not session_id:
+            return False
+        if session_id not in self._planner_main_pending:
+            return False
+        started = self._planner_round_started.get(session_id)
+        if started is None:
+            return False
+        # 兜底：Hook 异常导致响应钩子没跑时，别让标记永久生效（超过本轮有效期即视为已结束）。
+        window = max(1.0, float(self.config.emoji_after_reply.round_window_seconds))
+        if time.monotonic() - float(started) > window:
+            self._planner_main_pending.discard(session_id)
+            self._planner_round_started.pop(session_id, None)
+            return False
+        return True
+
+    @HookHandler(
         "maisaka.planner.after_response",
         name="planner_emoji_intent_observer",
         description=(
@@ -2589,20 +2776,29 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_planner_after_response(self, **kwargs: Any) -> None:
-        """planner 决定自己发表情时提前打标记。
+        """planner 决定自己发表情时提前打标记；顺带结束"本轮请求在途"标记。
 
         宿主工具调用按模型输出顺序串行执行，且 ``send_emoji`` 内部还要跑视觉子代理
         选图，所以"planner 已经/即将发表情"这件事必须在工具执行**之前**从
         ``maisaka.planner.after_response`` 的 ``output_items`` 里读出来——只观察已
         发出的出站消息时，本插件会在表情真正发出前就判定"本轮没有表情"并补发一张。
+
+        0.14.2 起这里还负责清掉 ``planner_round_tracker`` 打的"本轮在途"标记：**每一条**
+        主 planner 响应（不管有没有工具调用）都会清，因此"本轮还在跑"的判定不会被拖长。
         """
         if not self._plugin_enabled() or not self.config.emoji_after_reply.enabled:
             return
-        tool_names = self._planner_emoji_tool_names()
-        if not tool_names:
-            return
         session_id = str(kwargs.get("session_id") or "").strip()
         if not session_id:
+            return
+        # 主 planner 的这一轮请求回来了：清掉"在途"标记（0.14.2）。
+        # 只有 before_request 见过非空 tool_definitions 的会话才会在这里被清 —— 子代理的
+        # 响应不会误清主 planner 的在途标记（子代理 after_response 之前没有对应的 pending）。
+        if session_id in self._planner_main_pending:
+            self._planner_main_pending.discard(session_id)
+            self._planner_round_started.pop(session_id, None)
+        tool_names = self._planner_emoji_tool_names()
+        if not tool_names:
             return
         output_items = kwargs.get("output_items")
         if not isinstance(output_items, list):
@@ -2622,6 +2818,50 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             tool_name,
             session_id,
             ttl,
+        )
+
+    @HookHandler(
+        "emoji.maisaka.before_select",
+        name="host_emoji_intent_observer",
+        description=(
+            "observe：宿主 send_emoji 工具开始选图时，把该会话标记成"
+            "「本轮已有表情包在路上」，避免插件再补第二张"
+        ),
+        mode=HookMode.OBSERVE,
+        order=HookOrder.EARLY,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_host_emoji_intent(self, **kwargs: Any) -> None:
+        """宿主自己即将发表情包 —— 最直接的"别补了"信号（0.14.2）。
+
+        为什么要有这条：``planner_emoji_tools`` 是**按工具名**猜"planner 打算发表情"，
+        依赖用户把工具名配全（默认只有 ``send_emoji``）。而宿主 ``send_emoji`` 内置工具在
+        真正选图前会发 ``emoji.maisaka.before_select``（``emoji_system/maisaka_tool.py``，
+        ``stream_id=tool_ctx.runtime.session_id``，与我们的 session_id 同口径）——
+        这是"表情包已经在路上"的**事实**，与工具名配置无关。
+
+        命中时做两件事：
+
+        * 把本轮回复标记成"已有表情包"（``had_emoji``）→ 补发判定直接跳过；
+        * 刷新"bot 最近发过表情"的时刻（供"本轮开始前几秒刚发过表情"的窗口判定）。
+
+        注意：本插件自己发图走 ``ctx.send.emoji`` 能力、**不经过**这个内置工具，
+        所以不存在自己把自己标记掉的循环。
+        """
+        if not self._plugin_enabled():
+            return
+        session_id = str(kwargs.get("stream_id") or "").strip()
+        if not session_id:
+            return
+        now = time.monotonic()
+        self._chat_emoji_last[session_id] = now
+        reply_round = self._reply_rounds.get(session_id)
+        if reply_round is not None:
+            reply_round["had_emoji"] = True
+        self.ctx.logger.debug(
+            "宿主 send_emoji 已开始选图（会话 %s，情绪=%r），本轮不再补发表情包",
+            session_id,
+            str(kwargs.get("requested_emotion") or ""),
         )
 
     @staticmethod
@@ -2697,6 +2937,21 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             self._chat_emoji_last[session_id] = now
             # planner 已经真的把表情发出来了，意图标记不再需要。
             self._planned_emoji_until.pop(session_id, None)
+            # 0.14.0：把"这条出站消息带哪些表情包"记进本地映射。
+            # 出站消息同样会出现在 bot 的上下文里（宿主 send_emoji 工具与本插件补发都是
+            # sync_to_maisaka_history=True），但宿主渲染**发送侧**的 emoji 组件用的是
+            # ``component.content``（发送时构造的组件只带 binary_hash、**不带描述**）——
+            # 上下文里只有无标签的 `[表情包]`，注入的"按描述路"走不通，
+            # **只能靠"按 hash 路"**，而那条路要的正是这份 `msg_id → [(hash, 描述)]` 映射
+            # （上下文里的 `[msg_id:…]` 与本处的 message_id 是同一个）。出站侧以前从不记录。
+            outbound_refs = extract_emoji_refs_from_message(message)
+            if outbound_refs:
+                self._remember_message_emoji_refs(message, session_id, now, outbound_refs)
+                self._remember_session_emoji_refs(session_id, now, outbound_refs)
+                if self.config.emoji_meaning.enabled:
+                    # 载荷里的组件 data 就是宿主渲染后的 `[表情包: 描述]`；出站侧多为空，
+                    # 但其它插件/宿主工具发出的表情可能带描述，一并回填/刷新。
+                    self._backfill_emoji_descriptions(outbound_refs)
             # 默认连 storage_message=False 的出站表情也计入冷却：其它插件（转发类插件等）
             # 常用该参数发消息，不计入时本插件会紧接着在别人的表情后再补/跟一张。
             if bool(kwargs.get("storage_message", True)) or bool(self.config.emoji_cooldown.count_unstored):
@@ -2743,13 +2998,49 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         )
 
     async def _decide_reply_emoji(self, session_id: str, token: int, quiet_seconds: float, round_id: int) -> None:
-        """等待出站消息静默后判定是否补发表情包。"""
-        try:
-            await asyncio.sleep(quiet_seconds)
-        except asyncio.CancelledError:
-            return
-        if self._outbound_tokens.get(session_id) != token:
-            return  # 期间有新的出站消息，由更晚的任务判定。
+        """等待出站静默**且本轮工具链跑完**之后，判定是否补发表情包。
+
+        为什么不能只等静默（0.14.2 修"回复完又补一张、宿主再发一张"）：planner 是 action
+        loop，``reply`` 发出消息后宿主会带着工具结果再请求一次模型，模型完全可能在**下一轮**
+        才调 ``send_emoji``（选图还要跑视觉子代理，数秒到数十秒）。只按"最后一条出站消息静默
+        ``quiet_seconds``（默认 4s）"判定，窗口很容易落在"下一轮请求还没回来"或"正在选图"的
+        中间 → 插件先补一张、宿主随后又发一张。
+
+        现在的判定条件是**两个都满足**：
+
+        1. 出站静默 ≥ ``quiet_seconds``（回复真的发完了）；
+        2. ``_planner_round_inflight()`` 为假 —— 主 planner 没有在途请求，本轮工具链已经停下来。
+
+        轮询间隔就是 ``quiet_seconds``；若某一轮响应里带了 ``send_emoji``，
+        ``planner_emoji_tools`` 判定会把本轮标记成"planner 自己发"，判定时直接跳过。
+        等待上界是本轮有效期减去一个轮询间隔（``round_window_seconds - quiet_seconds``）：
+        到点就按"不再等"放行，让 ``_consume_reply_round`` 仍然**来得及**判定（若一直等满
+        ``round_window_seconds``，那边会按"太晚"直接丢弃，反而把功能等没了）。
+        """
+        step = max(0.5, float(quiet_seconds))
+        reply_round = self._reply_rounds.get(session_id)
+        started = float(reply_round.get("started", 0.0)) if reply_round else 0.0
+        window = float(reply_round.get("window", 90.0)) if reply_round else 0.0
+        deadline = started + max(step, window - step) if reply_round else 0.0
+        while True:
+            try:
+                await asyncio.sleep(step)
+            except asyncio.CancelledError:
+                return
+            if self._outbound_tokens.get(session_id) != token:
+                return  # 期间有新的出站消息，由更晚的任务判定。
+            if not self._planner_round_inflight(session_id):
+                break
+            current = self._reply_rounds.get(session_id)
+            if current is None or int(current.get("id", 0)) != round_id:
+                return
+            if deadline and time.monotonic() >= deadline:
+                self.ctx.logger.debug(
+                    "等待 planner 本轮结束已达本轮有效期上界（%.0f 秒，会话 %s），按不再等处理",
+                    window,
+                    session_id,
+                )
+                break
         try:
             await self._consume_reply_round(session_id, round_id)
         except Exception as exc:
@@ -2793,12 +3084,15 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         if random.random() >= cfg.probability:
             return
 
-        emoji_base64 = await self._fetch_emoji_base64(cfg.emotion)
-        if not emoji_base64:
+        picked = await self._fetch_emoji_base64(cfg.emotion)
+        if not picked:
             self.ctx.logger.debug("未取到可用表情包（emotion=%r），跳过补发", cfg.emotion)
             return
+        emoji_base64, emoji_description = picked
 
-        await self._send_emoji(session_id, emoji_base64, source="回复后表情包")
+        await self._send_emoji(
+            session_id, emoji_base64, source="回复后表情包", description=emoji_description
+        )
 
     # ------------------------------------------------------------------
     # Hook 4：入站消息观察（群友连续表情包跟风）
@@ -2823,6 +3117,13 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         session_id = str(message.get("session_id") or "").strip()
         if not session_id:
             return
+
+        # —— 先记"这个会话是群聊"（出站消息缺 group_info 时的兜底判定，0.14.2）——
+        # 入站消息的 group_info 一定准确；出站消息那边宿主只在群名非空时才填它，
+        # 缺群名的群会被判成私聊（@ 永不出现、读私聊配置节）。这里按 session_id 记一份，
+        # 与下面的表情包统计无关，因此放在所有表情包判定之前、且不受各功能开关门控。
+        if self._is_group_message(message):
+            self._remember_group_session(session_id)
 
         # —— 先记录"消息 → 表情包引用"映射（**含 bot 自己的消息**，0.13.17 起）——
         # 含义库注入（`_rewrite_emoji_labels_in_items`）按 item 文本里的 `msg_id` 反查本地映射，
@@ -2995,14 +3296,17 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             if not image_hash or not description:
                 continue
             try:
-                if self._meaning_store.backfill_description(image_hash, description):
+                # 0.13.18 起用 refresh_description：**空与非空都能修**（描述变了就更新，
+                # 旧描述转存为别名）。原先的 backfill_description 只填空，
+                # "非空但变了"的记录会永久卡在"注入匹配不上"的状态。
+                if self._meaning_store.refresh_description(image_hash, description):
                     self.ctx.logger.debug(
-                        "已回填表情包描述（来源=入站载荷 hash=%s desc=%r）",
+                        "已刷新表情包描述（来源=入站载荷 hash=%s desc=%r）",
                         image_hash[:12],
                         description,
                     )
             except Exception as exc:
-                self.ctx.logger.debug("回填表情包描述失败（hash=%s）: %s", image_hash[:12], exc)
+                self.ctx.logger.debug("刷新表情包描述失败（hash=%s）: %s", image_hash[:12], exc)
 
     def _remember_session_emoji_refs(
         self, session_id: str, now: float, refs: List[Tuple[str, str]]
@@ -3067,12 +3371,15 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                     self.ctx.logger.debug("mode=specified 但未配置情绪标签，跳过跟发")
                     return
 
-            emoji_base64 = await self._fetch_emoji_base64(emotion)
-            if not emoji_base64:
+            picked = await self._fetch_emoji_base64(emotion)
+            if not picked:
                 self.ctx.logger.debug("未取到可用表情包（emotion=%r），跳过跟发", emotion)
                 return
+            emoji_base64, emoji_description = picked
 
-            await self._send_emoji(session_id, emoji_base64, source="表情包跟风")
+            await self._send_emoji(
+                session_id, emoji_base64, source="表情包跟风", description=emoji_description
+            )
         except Exception as exc:
             self.ctx.logger.warning("表情包跟风执行失败: %s", exc)
 
@@ -3080,13 +3387,19 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
     # 表情包获取与发送
     # ------------------------------------------------------------------
 
-    async def _fetch_emoji_base64(self, emotion: str) -> Optional[str]:
-        """按情绪标签（留空则随机）抽取一张表情包的 base64 数据。"""
+    async def _fetch_emoji_base64(self, emotion: str) -> Optional[Tuple[str, str]]:
+        """按情绪标签（留空则随机）抽取一张表情包，返回 ``(base64, 描述)``；取不到返回 ``None``。
+
+        0.14.0 起**连宿主的描述一起返回**：宿主 ``_serialize_emoji_payload`` 的返回里本来就有
+        ``description``，以前被丢掉了。带上它，``_send_emoji`` 就能把"这张图是什么"刷新进
+        含义库 —— 因为宿主渲染**发送侧**的 emoji 组件不带描述，上下文里只有无标签的
+        ``[表情包]``，标签只能由含义库补上。
+        """
         try:
             if emotion.strip():
                 result = await self.ctx.emoji.get_by_description(emotion.strip())
                 if isinstance(result, dict) and result.get("base64"):
-                    return str(result["base64"])
+                    return str(result["base64"]), str(result.get("description") or "").strip()
                 if isinstance(result, dict) and result.get("success") is False:
                     self.ctx.logger.warning("按情绪抽取表情包失败（emotion=%r）: %s", emotion, result.get("error"))
                 return None
@@ -3094,7 +3407,7 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             if isinstance(result, list) and result:
                 first = result[0]
                 if isinstance(first, dict) and first.get("base64"):
-                    return str(first["base64"])
+                    return str(first["base64"]), str(first.get("description") or "").strip()
             elif isinstance(result, dict) and result.get("success") is False:
                 self.ctx.logger.warning("随机抽取表情包失败: %s", result.get("error"))
             return None
@@ -3102,12 +3415,50 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             self.ctx.logger.warning("获取表情包失败: %s", exc)
             return None
 
-    async def _send_emoji(self, session_id: str, emoji_base64: str, *, source: str) -> None:
-        """用 send.emoji 能力发送表情包；失败仅记录日志。"""
+    async def _send_emoji(
+        self, session_id: str, emoji_base64: str, *, source: str, description: str = ""
+    ) -> None:
+        """用 ``send.emoji`` 能力发送表情包；失败仅记录日志。
+
+        **发送前先把这张图登记进含义库**（0.14.0）：hash 本地算（``sha256_of_base64``，
+        与宿主 ``_build_binary_component_from_base64`` 同口径），描述用宿主给的 ——
+        因为宿主渲染发送侧的 emoji 组件**不带描述**，上下文里只有无标签的 ``[表情包]``，
+        标签只能由含义库补上；库里还没有这张图时顺带入队补录。
+
+        **必须显式传 ``sync_to_maisaka_history=True``**（0.14.0 修）：宿主 ``send.emoji``
+        能力的这个参数**默认 False**，不传的话这条表情消息虽然会入库
+        （``storage_message`` 默认 True，宿主还会给它算 ``sha256`` 当 ``hash``，含义库按 hash
+        能正常补录），但**不会进入 bot 的对话上下文** —— 于是 bot 自己发过的表情在上下文里
+        完全不存在，含义库也没有可注入的对象，"跟风 / 回复后表情包"这两个功能等于单向的。
+
+        参数对齐宿主自己的 ``send_emoji`` 工具（``src/emoji_system/maisaka_tool.py``）：
+        ``storage_message=True`` / ``set_reply=False`` / ``reply_message=None`` /
+        ``sync_to_maisaka_history=True`` / ``maisaka_source_kind="guided_reply"``。
+        （本插件的分段补发走 ``ctx.send.text``，那个参数一直传着，只有 emoji 这条漏了。）
+        """
+        if self._meaning_store is not None and self.config.emoji_meaning.enabled:
+            image_hash = sha256_of_base64(emoji_base64)
+            if image_hash:
+                try:
+                    if description:
+                        self._meaning_store.refresh_description(image_hash, description)
+                    if not self._meaning_store.descriptions_for_hashes([image_hash]):
+                        self._enqueue_emoji_meaning(image_hash, description)
+                except Exception as exc:
+                    self.ctx.logger.debug(
+                        "自发表情包登记含义库失败（hash=%s）: %s", image_hash[:12], exc
+                    )
         try:
-            sent = await self.ctx.send.emoji(emoji_base64, session_id)
+            sent = await self.ctx.send.emoji(
+                emoji_base64,
+                session_id,
+                sync_to_maisaka_history=True,
+                maisaka_source_kind="guided_reply",
+            )
             if sent:
-                self.ctx.logger.info("已向会话 %s 补发表情包（%s）", session_id, source)
+                self.ctx.logger.info(
+                    "已向会话 %s 补发表情包（%s，已同步进对话上下文）", session_id, source
+                )
             else:
                 self.ctx.logger.warning("表情包发送失败（%s，会话 %s）", source, session_id)
         except Exception as exc:
@@ -3162,10 +3513,12 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                 "跳过新表情包含义补录：载荷缺少 hash 或描述（hash=%r desc=%r）", image_hash, description
             )
             return
-        # 这张图的含义可能是在"宿主还没生成描述"时按 hash 算出来的：现在描述出来了就回填，
-        # 注入文本里的标签才不会是"（标签未生成）"。
-        if self._meaning_store.backfill_description(image_hash, description):
-            self.ctx.logger.debug("已回填表情包描述（hash=%s desc=%r）", image_hash[:12], description)
+        # 这张图的含义可能是在"宿主还没生成描述"时按 hash 算出来的，也可能宿主**重新生成**
+        # 过描述：两种都要修，否则注入侧按描述匹配不上、而补录扫描只看 hash 又认为"已有含义"
+        # —— 这些表情包会永久无法注入（0.13.18 修）。refresh_description 空与非空都能修，
+        # 旧的非空描述转存为别名，旧标签照样解析。
+        if self._meaning_store.refresh_description(image_hash, description):
+            self.ctx.logger.debug("已刷新表情包描述（hash=%s desc=%r）", image_hash[:12], description)
         # 新注册是"复活"放弃条目的唯一入口。
         self._meaning_abandoned.discard(image_hash)
         self._enqueue_emoji_meaning(image_hash, description, force=True)
@@ -3231,27 +3584,73 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             )
             return
         known = self._meaning_store.known_hashes()
+        # 库里**当前**的描述：用来判断"hash 已知但描述变了"（0.13.18）。
+        stored_descs = self._meaning_store.descriptions_for_hashes(
+            [image_hash for image_hash, _desc in refs if image_hash]
+        )
         enqueued = 0
+        refreshed = 0
+        skipped_known = 0
+        skipped_queued = 0
+        skipped_abandoned = 0
+        no_hash = 0
         for image_hash, description in refs:
-            if image_hash in known or image_hash in self._meaning_queued:
+            if not image_hash:
+                # 只有描述、没有 hash 的引用（``processed_plain_text`` 兜底那条路）：
+                # 含义按 hash 存与查，没有 hash 就无从入队 —— 单独计数，别混进"已入队"。
+                no_hash += 1
                 continue
             if image_hash in self._meaning_abandoned:
                 # 放弃名单里的不复活：连续失败 max_attempts 次说明这张图多半没法用，
                 # 每轮 planner 都重试只会刷日志。复活的唯一入口是"重新注册"钩子。
+                skipped_abandoned += 1
                 continue
-            self._enqueue_emoji_meaning(image_hash, description)
-            enqueued += 1
-        if enqueued:
+            if image_hash in self._meaning_queued:
+                skipped_queued += 1
+                continue
+            if image_hash in known:
+                # **0.13.18 关键修复**：hash 已知但**描述不一致**（含义是在"宿主还没出描述"
+                # 时按 hash 算出来的，或宿主后来重新生成过描述）时，注入侧按描述会匹配不上，
+                # 而这里过去只看 hash 就跳过 —— 于是这些表情包**永久无法注入**。
+                # 现在就地刷新描述（不重新调 VLM，含义讲的是图），旧描述转存为别名。
+                if description and stored_descs.get(image_hash, "") != description:
+                    if self._meaning_store.refresh_description(image_hash, description):
+                        refreshed += 1
+                        self.ctx.logger.info(
+                            "含义库描述已刷新：hash=%s 旧描述=%r → 新描述=%r（旧描述转存为别名，"
+                            "会话 %s）",
+                            image_hash[:12],
+                            stored_descs.get(image_hash, ""),
+                            description,
+                            session_id[:12],
+                        )
+                else:
+                    skipped_known += 1
+                continue
+            if self._enqueue_emoji_meaning(image_hash, description):
+                enqueued += 1
+        if enqueued or refreshed:
             self.ctx.logger.info(
-                "planner 按需补录：本轮上下文出现 %d 个表情包，其中 %d 个缺含义已入队（会话 %s）",
+                "planner 按需补录：本轮上下文 %d 个表情包 → 新入队 %d，描述已刷新 %d"
+                "（已有含义 %d / 已在队列 %d / 已放弃 %d / 无 hash %d，会话 %s）",
                 len(refs),
                 enqueued,
+                refreshed,
+                skipped_known,
+                skipped_queued,
+                skipped_abandoned,
+                no_hash,
                 session_id,
             )
         else:
             self.ctx.logger.debug(
-                "planner 按需补录：本轮 %d 个表情包都已有含义 / 已在队列 / 已放弃（会话 %s）",
+                "planner 按需补录：本轮 %d 个表情包无需处理（已有含义 %d / 已在队列 %d / "
+                "已放弃 %d / 无 hash %d，会话 %s）",
                 len(refs),
+                skipped_known,
+                skipped_queued,
+                skipped_abandoned,
+                no_hash,
                 session_id,
             )
 
@@ -3551,8 +3950,12 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         pieces.append(text[last:])
         return "".join(pieces), cursor, hits
 
-    def _enqueue_emoji_meaning(self, image_hash: str, description: str, *, force: bool = False) -> None:
+    def _enqueue_emoji_meaning(self, image_hash: str, description: str, *, force: bool = False) -> bool:
         """把 ``(image_hash, 描述)`` 加入含义补录队列（去重、限长、放弃项默认不再入队）。
+
+        Returns:
+            bool: **是否真的入了队**。没有 hash（或描述超长 / 在放弃名单 / 已在队列）时返回
+            ``False`` —— 调用方据此计数，避免把"根本没入队"记成"已入队"（0.13.18 修）。
 
         没有 hash 的表情包**不入队**：含义按 hash 存与查，拿不到 hash 就无从对齐
         （宿主的 ``emoji.*`` 能力都不返回 hash，所以只走"消息组件 / Images 表 / 注册钩子"
@@ -3561,13 +3964,14 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         normalized_hash = str(image_hash or "").strip()
         normalized_desc = str(description or "").strip()
         if not normalized_hash or len(normalized_desc) > MAX_DESCRIPTION_LENGTH:
-            return
+            return False
         if not force and normalized_hash in self._meaning_abandoned:
-            return
+            return False
         if normalized_hash in self._meaning_queued:
-            return
+            return False
         self._meaning_queued.add(normalized_hash)
         self._meaning_queue.append((normalized_hash, normalized_desc))
+        return True
 
     async def _meaning_worker_loop(self) -> None:
         """含义生成工作循环：每轮生成 batch_size 条；顺带做用量回写与过期淘汰。"""
@@ -3944,6 +4348,13 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             key for key, until in self._planned_emoji_until.items() if now >= float(until)
         ]:
             self._planned_emoji_until.pop(session_id, None)
+        # 「主 planner 有请求在途」标记：响应钩子没回来时按本轮有效期兜底清理，防止永久驻留。
+        inflight_keep = max(1.0, float(self.config.emoji_after_reply.round_window_seconds))
+        for session_id in [
+            key for key, started in self._planner_round_started.items() if now - float(started) > inflight_keep
+        ]:
+            self._planner_round_started.pop(session_id, None)
+            self._planner_main_pending.discard(session_id)
         # 连击保鲜时长可配：清理节奏不得低于它，否则长连击窗会被清理截断。
         streak_keep = max(_STALE_STREAK_SECONDS, float(self.config.emoji_follow.streak_window_seconds))
         for session_id in [

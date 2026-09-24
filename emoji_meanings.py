@@ -114,6 +114,16 @@ CREATE TABLE IF NOT EXISTS emoji_meanings (
 )
 """
 
+# 旧描述别名：宿主那份描述**变过**（或含义是在"描述还没出"时按 hash 算出来的）时，
+# 把旧的非空描述转存到这里，注入侧按描述回退匹配时**别名也认**，旧标签照样能解析。
+_SCHEMA_ALIASES = """
+CREATE TABLE IF NOT EXISTS emoji_meaning_aliases (
+    description TEXT PRIMARY KEY,
+    image_hash TEXT NOT NULL,
+    updated_at REAL NOT NULL
+)
+"""
+
 
 def legacy_key(description: str) -> str:
     """旧库（按描述存）的行在新库里的遗留键。"""
@@ -362,6 +372,7 @@ class EmojiMeaningStore:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_emoji_meanings_description ON emoji_meanings(description)"
         )
+        self._conn.execute(_SCHEMA_ALIASES)
         self._ensure_last_used_column()
         self._conn.commit()
 
@@ -509,15 +520,93 @@ class EmojiMeaningStore:
         normalized_desc = str(description or "").strip()
         if not normalized_desc:
             return "", "", ""
-        row = self._require_conn().execute(
+        conn = self._require_conn()
+        row = conn.execute(
             "SELECT image_hash, meaning, image_format FROM emoji_meanings "
             "WHERE description = ? AND TRIM(meaning) <> '' "
             "ORDER BY LENGTH(meaning) DESC LIMIT 1",
             (normalized_desc,),
         ).fetchone()
+        if row:
+            return str(row[0] or "").strip(), str(row[1] or "").strip(), str(row[2] or "").strip()
+        # 回退：这条描述是**旧描述**（宿主重新生成过描述，或含义先按 hash 算出来、
+        # 之后描述被刷新过）—— 别名表里存着它指向的 hash，一样能解析。
+        row = conn.execute(
+            "SELECT m.image_hash, m.meaning, m.image_format FROM emoji_meaning_aliases AS a "
+            "JOIN emoji_meanings AS m ON m.image_hash = a.image_hash "
+            "WHERE a.description = ? AND TRIM(m.meaning) <> '' "
+            "ORDER BY LENGTH(m.meaning) DESC LIMIT 1",
+            (normalized_desc,),
+        ).fetchone()
         if not row:
             return "", "", ""
         return str(row[0] or "").strip(), str(row[1] or "").strip(), str(row[2] or "").strip()
+
+    def _alias_description(self, image_hash: str, description: str, now: float) -> None:
+        """把一条**旧描述**登记为别名（指向该 hash）；空描述不登记。"""
+        normalized_desc = str(description or "").strip()
+        if not normalized_desc:
+            return
+        self._require_conn().execute(
+            "INSERT INTO emoji_meaning_aliases (description, image_hash, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(description) DO UPDATE SET image_hash = excluded.image_hash, "
+            "updated_at = excluded.updated_at",
+            (normalized_desc, str(image_hash or "").strip(), now),
+        )
+
+    def refresh_description(self, image_hash: str, description: str) -> bool:
+        """库里这条记录的描述与传入不一致时**就地更新**；有改动返回 True。
+
+        与 ``backfill_description`` 的区别：那个**只填空**，本方法**空与非空都能修**
+        —— 非空但变了（宿主重新生成过描述）时把旧描述转存为**别名**再更新，
+        这样新旧两种标签都能解析。**不重新调用视觉模型**：含义讲的是图，与描述无关。
+
+        为什么必须有这条路径：补录扫描此前只判 ``hash in known_hashes()``（只看 hash），
+        于是"描述不一致"的记录被当成"已有含义"永久跳过，注入侧按描述又匹配不上 ——
+        这些表情包会**永久无法注入**（服务器日志实测：45 次注入未命中 vs 8 条新收录）。
+        """
+        normalized_hash = str(image_hash or "").strip()
+        normalized_desc = str(description or "").strip()
+        if not normalized_hash or not normalized_desc:
+            return False
+        conn = self._require_conn()
+        row = conn.execute(
+            "SELECT description FROM emoji_meanings WHERE image_hash = ?", (normalized_hash,)
+        ).fetchone()
+        if row is None:
+            return False
+        stored = str(row[0] or "").strip()
+        if stored == normalized_desc:
+            return False
+        now = time.time()
+        if stored:
+            self._alias_description(normalized_hash, stored, now)
+        conn.execute(
+            "UPDATE emoji_meanings SET description = ?, updated_at = ? WHERE image_hash = ?",
+            (normalized_desc, now, normalized_hash),
+        )
+        conn.commit()
+        return True
+
+    def descriptions_for_hashes(self, image_hashes: "Sequence[str]") -> Dict[str, str]:
+        """批量取这些 hash 在库里**当前**的描述（缺失的不返回），供扫描侧比对是否一致。"""
+        wanted = [str(h or "").strip() for h in image_hashes]
+        wanted = [h for h in wanted if h]
+        if not wanted:
+            return {}
+        found: Dict[str, str] = {}
+        conn = self._require_conn()
+        # 分批查，避免 SQL 变量数上限（SQLite 默认 999）。
+        for start in range(0, len(wanted), 400):
+            chunk = wanted[start : start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT image_hash, description FROM emoji_meanings WHERE image_hash IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for image_hash, description in rows:
+                found[str(image_hash)] = str(description or "").strip()
+        return found
 
     def touch_usage(self, image_hashes: "Sequence[str]", now: float) -> int:
         """把 ``last_used_at`` 回写成 ``now``（供 TTL 淘汰判断"最近用过"）；返回更新行数。
@@ -624,6 +713,14 @@ class EmojiMeaningStore:
             return False
         now = time.time()
         conn = self._require_conn()
+        # 覆盖前把库里已有的**不同**描述转存为别名：宿主描述变过时，旧标签也能解析。
+        previous = conn.execute(
+            "SELECT description FROM emoji_meanings WHERE image_hash = ?", (normalized_hash,)
+        ).fetchone()
+        if previous is not None:
+            stored_desc = str(previous[0] or "").strip()
+            if stored_desc and stored_desc != str(description or "").strip():
+                self._alias_description(normalized_hash, stored_desc, now)
         conn.execute(
             """
             INSERT INTO emoji_meanings

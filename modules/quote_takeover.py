@@ -105,6 +105,21 @@ class QuoteTakeoverMixin:
         """按会话类型取引用回复**功能**配置节（``[quote_reply]`` / ``[quote_reply_private]``）。"""
         return self.config.quote_reply if self._is_group_message(message) else self.config.quote_reply_private
 
+    def _at_trailing_space(self) -> bool:
+        """注入真实 @ 时是否额外补一个空格组件（``[plugin] at_trailing_space``）。
+
+        宿主版本兼容开关（0.14.1 修复）：字段住在**插件总开关所在的 ``[plugin]`` 节**，
+        群聊 / 私聊共用同一个值，**不在** ``[quote_reply]`` / ``[quote_reply_private]`` 里。
+        0.13.10 ~ 0.14.0 期间这里误读 ``quote_cfg.at_trailing_space``，
+        ``getattr`` 取不到该字段便一路返回 ``False`` —— 于是 WebUI 里把开关打开也**不生效**，
+        MaiBot 1.2.3（宿主不插空格）上 @ 与正文始终粘连。
+
+        口径见 README「`at_trailing_space`：按宿主版本选」：
+        MaiBot **1.2.5 起关闭**（宿主富回复自己会在每个 @ 组件后插一个空格组件），
+        **1.2.5 以前（不含 1.2.5）开启**（宿主不插，插件不补会与正文粘连）。
+        """
+        plugin_cfg = getattr(self.config, "plugin", None)
+        return bool(getattr(plugin_cfg, "at_trailing_space", False))
 
     def _quote_weights_config(self, message: Dict[str, Any]) -> Any:
         """按会话类型取引用回复**权重**配置节（``[quote_reply_weights]`` / ``[quote_reply_private_weights]``）。
@@ -193,8 +208,9 @@ class QuoteTakeoverMixin:
         # 之后对该消息的任何回复都不再引用，即使已经超出 stale_age_seconds 的时间限制。
         # 抽到"直接回复"不消耗这次机会：下一轮 planner 再回复同一条消息时仍可能抽到引用。
         quote_cfg = self._quote_section_config(message)
-        # 是否在 @ 后额外补一个空格组件（默认 False，见 [quote_reply] at_trailing_space）。
-        at_with_space = bool(getattr(quote_cfg, "at_trailing_space", False))
+        # 是否在 @ 后额外补一个空格组件（``[plugin] at_trailing_space``，默认 False）。
+        # 注意：开关在 ``[plugin]`` 节，**不是** ``quote_cfg``（0.14.1 修复误读）。
+        at_with_space = self._at_trailing_space()
         if bool(quote_cfg.quote_once_per_target) and self._quoted_before(session_id, reply_message_id):
             self.ctx.logger.debug(
                 "目标消息已被引用过，本次不再引用（会话 %s，reply_message_id=%s，%s）",
@@ -799,7 +815,7 @@ class QuoteTakeoverMixin:
 
         为什么需要（0.13.17）：正文开头是"字面 @别人"时本插件会**跳过 @ 注入、原样发出**，
         于是那条消息的空格数**完全由模型写的文本决定**（实测 0 / 1 / 2 都可能）——
-        而插件自己注入真实 at 时空格数是**恒定**的（由 ``at_trailing_space`` 决定 0 或 1）。
+        而插件自己注入真实 at 时空格数是**恒定**的（由 ``[plugin] at_trailing_space`` 决定 0 或 1）。
         两条路口径不一致，群里就会看到"有时候 @ 后没空格、有时候一个、有时候两个"。
         这里把字面 @ 也对齐到"恰好一个"。
 
@@ -884,7 +900,7 @@ class QuoteTakeoverMixin:
     ) -> List[Any]:
         """把 at 组件插入组件列表首位（返回新列表，不修改入参）。
 
-        空格口径（0.13.12 起，由 ``[quote_reply] at_trailing_space`` 决定）：
+        空格口径（0.13.12 起，由 ``[plugin] at_trailing_space`` 决定）：
 
         - 注入前**一律**先 ``_strip_body_leading_whitespace`` 抹掉正文自带的前导空白 ——
           这一步无论补不补空格都要做，否则正文自带的空白会和渲染层的空格叠加；
@@ -912,10 +928,15 @@ class QuoteTakeoverMixin:
             },
         }
         prefix: List[Any] = [at_component]
-        # 正文里还有文本组件时才补空格；消息完全没有文本（纯图片/表情）时不补，
-        # 免得留下一个悬挂的空格段。
+        # 正文里还有**非空**文本组件时才补空格；消息完全没有文本（纯图片/表情）时不补，
+        # 免得留下一个悬挂的空格段。这里刻意排除"空文本组件"：
+        # ``_strip_body_leading_whitespace`` 会把正文自带的前导空白段清成空串（如
+        # ``[{"text": "  你好"}]`` → ``[{"text": "你好"}]``、``[{"text": "  "}]`` → ``[{"text": ""}]``），
+        # 那种空串不是正文，若按"存在 text 组件"判定就会补出一个多余空格（0.14.1 收紧）。
         if with_space and any(
-            isinstance(component, dict) and str(component.get("type") or "") == "text"
+            isinstance(component, dict)
+            and str(component.get("type") or "") == "text"
+            and str(component.get("data") or "").strip()
             for component in components
         ):
             prefix.append({"type": "text", "data": " "})

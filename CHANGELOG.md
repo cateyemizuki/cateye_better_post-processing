@@ -8,6 +8,9 @@
 按版本从新到旧。**每一行都是一次可追溯的改动**（背景 / 根因 / 验证方式见对应条目）。
 
 
+- **`0.14.2`** — 假 @ 只删回复目标 / 群聊判定兜底 / 补表情包等 planner 收尾
+- **`0.14.1`** — 修复 `[plugin] at_trailing_space` 开关不生效（1.2.3 上 @ 与正文粘连）
+- **`0.14.0`** — 跟风/补发表情包同步进 bot 上下文 + 表情包含义「描述不一致」修复
 - **`0.13.18`** — 评审修复：版本口径统一 / 文档与实现对齐 / 不再为配置文件添加注释
 - **`0.13.17`** — bot 自身表情包走"按 hash" + 字面 @别人 的空格规范化
 - **`0.13.16`** — 镜像字段的最终代码层兜底改用发布者 config.toml 的值
@@ -46,8 +49,257 @@
 - **`0.9.1`** — 还原后处理接管（换行拼接版）
 
 > 0.9.0 及更早没有逐条留档；**0.9.1 起**为逐条记录（见下方正文）。
-
 ---
+
+## [0.14.2] - 假 @ 只删回复目标 / 群聊判定兜底 / 补表情包等 planner 收尾
+
+0.14.1 审查报告里报出的两处发现落地，外加"回复后表情包"的判定时机修复。
+
+### 一、假 @ 过滤只删「本轮回复目标」的名字（原 P1）
+
+**问题**：`_strip_leading_fake_at()` 无条件删掉正文开头的「`@某人` + 空格」。这条过滤的
+初衷是清掉 LLM **照抄宿主渲染进上下文的 `@昵称`**（那必然就是被回复的人，见 0.11.3 事故），
+但 LLM 也可能主动写 `@张三`。于是：
+
+* `@张三` 被删掉 → 随后抽到 `at` / `quote_at` 时注入的是**本轮回复目标**（李四）的真实 at
+  → 群里变成"李四被 @ 了，但话是说给张三的"；
+* 同时把 quote_takeover 里「开头字面 @ 别人 ⇒ 跳过注入」那条分支变成了**死代码**。
+
+**修法**：`_strip_leading_fake_at()` 改为 async，删之前先问一句
+`_fake_at_mention_is_target()` —— 拿本轮回复目标的昵称/群名片比对（目标 id 优先用
+`reply_message_id`，插件自己补发的分段没有它则退回轮记录的 `target_id`；
+查询复用 `_lookup_reply_target()` 的 TTL 缓存，随后 `_apply_reply_style` 再查同一 id 是命中缓存）。
+**只在与目标匹配时才删**；@ 的是别人 → 原样保留，交给引用回复接管按原口径处理。
+目标查不到时仍按原行为删——那种情况下注入路径同样拿不到目标、会退化为引用回复，不会 @ 错人。
+
+### 二、出站消息的群/私聊判定加兜底（原 P2）
+
+**问题**：`_is_group_message()` 只看 `message_info.group_info`，而宿主
+`send_service._build_outbound_session_message()` 只在 `target_stream.group_name`
+（或流上下文消息的群名）**非空**时才填它：
+
+```python
+group_info = None
+if target_stream.group_id:
+    group_name = ...; if group_name: group_info = GroupInfo(...)
+```
+
+群名缺失的群 → 出站消息 `group_info` 为 `None` → 插件按**私聊**处理：权重池被
+`allow_at=False` 清零、@ 永不出现，而且读的是 `[quote_reply_private]` 配置节
+（现象是"这个群怎么都不 @ 人"，日志里看不出来）。
+
+**修法**：新增「本会话是群聊」的记忆（`_group_sessions`，LRU 上限 512、不设 TTL——
+会话类型不会变）。入站消息的 `group_info` 一定准确，因此在 `chat.receive.after_process`
+观察者里按 `session_id` 记一份（放在所有表情包判定之前、不受各功能开关门控）；
+`_is_group_message()` 取不到 `group_info` 时用它兜底。`_is_group_message` 由 staticmethod
+改为实例方法（调用点都是 `self.`，无需改动调用方）。
+
+### 三、回复后表情包：改为「等本轮 planner 收尾」再判定
+
+**问题**：planner 是 **action loop** —— `reply` 发出消息后宿主会带着工具结果**再请求一次
+模型**，模型完全可能在**下一轮**才调 `send_emoji`（该工具内部还要跑视觉子代理选图，
+数秒到数十秒）。而补发判定只等"最后一条出站消息静默 `quiet_seconds`（默认 4 秒）"，
+窗口很容易落在"下一轮请求还没回来"或"正在选图"的中间 → 插件先补一张、宿主的
+`send_emoji` 随后又发一张，群里出现**两个表情包**。
+
+**修法（两道信号 + 一个上界）**：
+
+1. **主 planner 在途标记**：新增 `maisaka.planner.before_request` 观察者
+   `planner_round_tracker` —— `tool_definitions` **非空**即视为"主 planner 有一轮在跑"
+   （子代理的 `tool_definitions` 为空，据此排除；planner 两个 Hook 都对子代理触发，
+   而 `after_response` 载荷里**没有** `tool_definitions`，所以只能在 before 侧标记）；
+   `planner_emoji_intent_observer`（已有）在响应回来时清掉。
+   `_decide_reply_emoji()` 改成循环：**出站静默 ≥ `quiet_seconds` 且无在途请求**才判定，
+   轮询间隔就是 `quiet_seconds`。
+2. **宿主选图即抑制**：新增 `emoji.maisaka.before_select` 观察者
+   `host_emoji_intent_observer` —— 宿主 `send_emoji` 内置工具真正选图前会触发它
+   （`stream_id` 就是会话 ID），插件收到就把本轮标记成 `had_emoji` 并刷新
+   "bot 最近发过表情"。这条**不依赖 `planner_emoji_tools` 名单**，名单配漏也不会多发。
+   （本插件自己发图走 `ctx.send.emoji` 能力、不经过宿主内置工具，不存在自我标记。）
+3. **等待上界**：`round_window_seconds − quiet_seconds`。到点按"不再等"放行，让
+   `_consume_reply_round` 仍**来得及**判定——若一直等满 `round_window_seconds`，
+   那边会按"太晚"直接丢弃，反而把功能等没了。
+   `_prune_stale_state()` 里按同一上界清理可能残留的在途标记（Hook 异常时兜底）。
+
+顺带修掉 README 一处**文档漂移**：`[emoji_after_reply]` 小节原写"默认包含 `send_emoji` 与
+贴表情工具 `emoji_like`/`emoji_like_like`"，与代码默认（只有 `send_emoji`）及其自己的字段表矛盾。
+
+### 四、验证（离线，测试区 `_work_bpp_0142`）
+
+`test_0142_fixes.py` 用宿主 venv（有 `maibot_sdk` / pydantic）真实实例化插件与配置模型，
+**48 条断言全绿**，关键几条：
+
+| 用例 | 结果 |
+|---|---|
+| 目标「张三」，正文 `@张三 你好` → 删除；`@李四 你好` → **保留** | ✓ |
+| 群名片命中 / 目标查不到 / 补发分段（无 `reply_message_id`）走轮目标 | ✓ |
+| 名字后跟标点、邮箱形态、开头是真实 at、非本轮回复、开关关闭 → 一律不动 | ✓ |
+| 出站群消息缺 `group_info`：记忆前 False、记忆后 True；私聊不误判；LRU 上限 512 | ✓ |
+| 主 planner 在途 → **不判定**（旧实现在此已补发）；响应回来 → 补上判定 | ✓ |
+| 子代理请求（`tool_definitions=[]`）不标记在途 | ✓ |
+| `emoji.maisaka.before_select` → 本轮标记 `had_emoji` | ✓ |
+| 等待上界到点放行，且判定发生在本轮有效期内 | ✓ |
+
+0.14.1 的回归也全部复跑通过：空格开关 18/18、分段/合并差分全一致、
+引用与能力声明无问题、无死配置、16 个 Hook 处理器全部落在文档清单内且无重名。
+
+## [0.14.1] - 修复 `at_trailing_space` 开关不生效（1.2.3 上 @ 与正文粘连）
+
+### 一、根因：开关住在 `[plugin]`，代码却去 `[quote_reply]` 里读
+
+`[plugin] at_trailing_space`（0.13.10 新增，给 MaiBot 1.2.5 以前的宿主补 @ 尾随空格）
+字段定义在 `PluginSectionConfig`，但 `modules/quote_takeover.py` 读的是
+**引用回复功能节**：
+
+```python
+quote_cfg = self._quote_section_config(message)   # [quote_reply] / [quote_reply_private]
+at_with_space = bool(getattr(quote_cfg, "at_trailing_space", False))  # ← 恒 False
+```
+
+`QuoteReplySectionConfig` / `QuoteReplyPrivateSectionConfig` 里**没有**这个字段，
+`getattr` 带着默认值 `False` 一路兜底 —— 于是 **WebUI 里把开关打开也完全不生效**：
+`_inject_at_component(..., with_space=False)` 永远只插 `[at, 正文]`。
+在 MaiBot **1.2.3**（宿主 `attach_at` 是 `at_components + items[0].sequence.components`，
+**不插空格**）上，平台侧渲染成 `@昵称正文`，**粘连**。
+
+### 二、修法
+
+1. 新增 `QuoteTakeoverMixin._at_trailing_space()`，从**正确的位置**读开关
+   （`self.config.plugin.at_trailing_space`，群聊/私聊共用同一个值）；
+2. `_apply_reply_style()` 改用它，注入路径（① 注入 / ② 字面升级 / ④ 只规范化）
+   三条都随之拿到正确的口径；
+3. 顺手收紧 `_inject_at_component` 的补空格条件：由"存在 text 组件"改为
+   "存在**非空** text 组件"——`_strip_body_leading_whitespace` 会把正文自带的前导空白
+   段清成空串，旧判定会为"空文本 + 图片"的消息补出一个悬挂空格段；
+4. 修正 `plugin.py` 里描述 @ 注入形态的模块 docstring（原写"恒为 `[at, 文本" "]` 两段"，
+   与 0.13.12 起的默认口径矛盾）。
+
+### 三、验证（离线，测试区 `_work_bpp_0141`）
+
+- `test_at_trailing_space.py`：18 条断言全绿 —— 开关在 `[plugin]` 节被正确读到；
+  开启后组件序列 `[at, text' ', text]`（平台侧恰好一个空格、宿主纯文本三个空格）；
+  关闭后 `[at, text]`；纯图片消息不补悬挂空格；正文前导空白先被 `lstrip`；
+  已存在的开头 @（路径 ④）在开启时补空格、关闭时删掉宿主的空格组件。
+- 对照宿主源码确认口径：`send_service._build_processed_plain_text()` 用
+  `" ".join(part for part in parts if part)`；1.2.3 的 `attach_at` 确实不插空格。
+
+### 四、同一轮静态审查顺手修掉的文档漂移
+
+| 位置 | 原文 | 实际 |
+|---|---|---|
+| `plugin.py` 模块 docstring | "@ 注入为 `[at, 文本" "]` 两段" | 由 `at_trailing_space` 决定，默认 `[at, 正文]` |
+| `plugin.py` 模块 docstring | "范围由 `rewrite_scope` 控制，**默认只改 replyer**" | `default_factory=["replyer", "planner"]`，默认两者都改 |
+| `post_processing.py` 模块 docstring | "唯一无法复刻的是每段一条消息……因此换行连接成一条" | 0.10.0 起已用 Hook 组合 + `ctx.send.text` 真·分段发送 |
+
+## [0.14.0] - 跟风/补发表情包同步进 bot 上下文 + 表情包含义「描述不一致」修复
+
+本轮合并两处改动（上一次只写进 0.13.18 正文、未单独提版本号，现一并归到 0.14.0）。
+
+### 一、跟风 / 回复后表情包发出的表情，现在会进入 bot 的对话上下文
+
+**排查**（对照宿主源码）：宿主 ``send.emoji`` 能力有两个关键参数 ——
+
+| 参数 | 宿主默认 | 作用 |
+|---|---|---|
+| ``storage_message`` | **True** | 发送成功后**写入消息库** |
+| ``sync_to_maisaka_history`` | **False** | 是否把这条消息**同步进 bot 的对话历史（上下文）** |
+
+- **入库是好的**：宿主 ``_build_binary_component_from_base64`` 会给 emoji 组件算
+  ``binary_hash = sha256(bytes)``，与 ``Images.image_hash`` **同口径** → 含义库按 hash 能正常补录 ✓
+- **但**插件调用时**没传** ``sync_to_maisaka_history`` → 取默认 ``False`` →
+  这条表情消息**不进 bot 的对话上下文** ✗
+  → bot 自己发过的表情在上下文里完全不存在，含义库也**没有可注入的对象**，
+  "跟风 / 回复后表情包"这两个功能因此是**单向**的（发了，但 bot 自己"不记得"）。
+
+**修法**：``_send_emoji()`` 显式对齐宿主自己的 ``send_emoji`` 工具
+（``src/emoji_system/maisaka_tool.py``）那套参数：
+
+```python
+await self.ctx.send.emoji(
+    emoji_base64, session_id,
+    sync_to_maisaka_history=True,        # ← 0.14.0 新增
+    maisaka_source_kind="guided_reply",  # ← 与宿主 send_emoji 工具一致
+)
+```
+
+（本插件的**分段补发**走 ``ctx.send.text``，那个参数一直传着；只有 emoji 这条漏了。）
+
+**但只补这一步还不够** —— 宿主渲染**发送侧**的 emoji 组件用的是 ``component.content``
+（``maisaka/context/message_adapter.py``），而发送时构造的组件只带 ``binary_hash``、
+**不带描述**，所以上下文里只有**无标签的 ``[表情包]``**。注入的"按描述路"因此走不通，
+**只能靠"按 hash"**。为此本轮再补两处：
+
+1. **出站观察者**（``send_service.after_send``）观测到出站消息带 emoji 时，按**内部
+   ``message_id``** 记一份 ``msg_id → [(hash, 描述)]`` 映射 —— 上下文里的 ``[msg_id:…]``
+   正好能与它对上，**"按 hash 注入"因此成立**（出站侧以前从不记录，这是第二层缺陷）；
+2. **发送前登记含义库**：``_fetch_emoji_base64`` 连**宿主给的描述**一起返回
+   （``emoji.get_by_description`` / ``get_random`` 的载荷里本来就有 ``description``，
+   以前被丢掉了）；``_send_emoji`` 用本地算的 hash（``sha256_of_base64``，与宿主
+   ``_build_binary_component_from_base64`` 同口径）把描述**刷新进含义库**（旧描述转别名），
+   库里没有这张图时**带描述入队补录**。
+
+**排查用到的完整链路**（供复核）：宿主 ``capabilities/core.py:_cap_send_emoji`` →
+``send_service.emoji_to_stream_with_message`` → ``_send_to_target_with_message`` →
+``if sent_message is not None and sync_to_maisaka_history: _sync_sent_message_to_maisaka_history(...)``
+→ ``heartflow_manager`` 的 ``runtime.append_sent_message_to_chat_history(...)``。
+
+### 二、修「描述不一致导致表情包永久无法注入」
+
+**现象**（`plugin.log`，2026-09-24 01:17–02:35）：注入侧 **45 次**"查不到含义"，
+而同期只新收录了 **8** 条；两个标签（`调皮,幽默,害羞,滑稽,开心` 10 次、
+`震惊,惊恐,崩溃,破防,尖叫` 8 次）**从来没被补录过**，而补录扫描却报
+"本轮 3 个表情包**都已有含义** / 已在队列 / 已放弃"。
+
+**根因**：含义库按 `image_hash` 主键、只存**一条**描述；当宿主那份描述与库里不一致时
+（最常见：含义是在宿主还没出描述时按 hash 算出来的，库里 `description=''`；也可能是宿主
+重新生成过描述）——
+
+- **注入侧**：按 hash 需要本地 `msg_id → refs` 缓存（容量 512、TTL 1 小时、**重启即清空**），
+  老消息拿不到；退到按描述匹配，而描述**不完全相等** → 双双未命中；
+- **补录扫描**：只判 `hash in known_hashes()`（**只看 hash**）→ 认为"已有含义"直接跳过
+  → **永远不会用新描述重新收录**。
+
+两者叠加 → 这些表情包**永久无法注入**，日志表现为"缺失 ≫ 补录"。
+
+**修法**：
+
+1. 含义库新增 **`emoji_meaning_aliases`（描述 → hash）** 表：旧描述转存为别名，**不丢**；
+2. 新增 **`EmojiMeaningStore.refresh_description()`**：描述不一致时**就地更新**
+   （旧的非空描述转存为别名），**不重新调 VLM**（含义讲的是图，与描述无关）；
+3. `content_for_description()` 命中不了时**回退查别名** → **新旧标签都能解析**；
+4. `upsert()` 覆盖描述时同样把旧描述转存为别名；
+5. **补录扫描改为按「(hash, 描述) 对」判定**（不再只看 hash），发现不一致就地刷新；
+6. 三个描述入口（入站载荷 / 注册钩子 / 补录扫描）统一走 `refresh_description`；
+7. **修日志**：扫描改为分类计数（新入队 / 描述已刷新 / 已有含义 / 已在队列 / 已放弃 / **无 hash**），
+   不再用那句把"描述对不上"报成"已有含义"的含糊文案；
+8. `_enqueue_emoji_meaning()` 改为返回**是否真的入队** —— 原先"无 hash / 超长 / 已在队列"
+   也会被计成"已入队"，日志虚高。
+
+**验证**：新增 `test_description_mismatch_repair`（20 条断言）完整复现该场景：
+描述为空 → 检出不一致 → 刷新后按新描述可查 → 旧描述作别名仍可查 → upsert 覆盖时同样转存别名。
+
+- **`.gitignore`**：补上 `/提交模板.md` —— 该文件是本地提交辅助文档、**不应随插件发布**
+  （它自己写着「已用 .gitignore 排除」，但 main 分支此前漏了这行，发布时会连带上传）；
+  现已与 dev 分支的 `.gitignore` 完全一致。
+- 核对 `提交模板.md` 的自查清单：`version = 0.13.18` 与 `SUPPORTED_CONFIG_VERSION` 一致、
+  「已声明全部 11 项 capabilities」与 manifest 一致、发布目录要求含 `docs/` —— 均已对齐。
+
+**验证**：新增 `test_description_mismatch_repair`（20 条断言）完整复现该场景：
+描述为空 → 检出不一致 → 刷新后按新描述可查 → 旧描述作别名仍可查 → upsert 覆盖时同样转存别名。
+
+### 三、本轮验证
+
+| 项目 | 结果 |
+|---|---|
+| 回归 `test_bpp_0130_regression.py` | **188 项断言全过**（连跑 3 次一致） |
+| 含义库专项 `test_main_0140.py` | **214 项断言全过** |
+| 宿主 `ManifestValidator` | `0.14.0` 零 error 零 warning |
+
+新增测试：`test_emoji_send_syncs_history`（6 条，锁定 `sync_to_maisaka_history=True` /
+`maisaka_source_kind="guided_reply"` / 不关 `storage_message` / 异常只记日志）、
+`test_sent_emoji_registered`（11 条，锁定"新 hash 带描述入队 / 已有含义不重复入队 /
+描述变了刷新且旧描述成别名 / **出站消息记进 `msg_id → refs` 映射**、注入侧可按 hash 命中 /
+纯文本出站不写映射"）。
 
 ## [0.13.18] - 评审修复：版本口径统一 / 文档与实现对齐 / 不再为配置文件添加注释
 
@@ -123,11 +375,6 @@ WebUI 的字段提示（插件通过 `get_webui_config_schema` 补 `hint`）、R
 - **README**：修正 `[plugin]` 字段表里 `config_version` 的过时默认值（原写 `'0.12.1'`）；
   明确写出"插件不写任何配置文件"与"说明文案三处同源"；安装小节补一行指向本文件（版本历史）。
 - **CHANGELOG**：新增 **「版本索引」**（把 36 条历史压成一张可跳转的速查表）。
-- **`.gitignore`**：补上 `/提交模板.md` —— 该文件是本地提交辅助文档、**不应随插件发布**
-  （它自己写着「已用 .gitignore 排除」，但 main 分支此前漏了这行，发布时会连带上传）；
-  现已与 dev 分支的 `.gitignore` 完全一致。
-- 核对 `提交模板.md` 的自查清单：`version = 0.13.18` 与 `SUPPORTED_CONFIG_VERSION` 一致、
-  「已声明全部 11 项 capabilities」与 manifest 一致、发布目录要求含 `docs/` —— 均已对齐。
 
 ## [0.13.17] - bot 自身表情包走"按 hash" + 字面 @别人 的空格规范化
 
