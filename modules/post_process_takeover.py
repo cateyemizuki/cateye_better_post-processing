@@ -258,13 +258,22 @@ _PENDING_FOLLOW_UP_TTL_SECONDS = 120.0
 _FOLLOW_UP_SEND_MAX_ATTEMPTS = 2
 # planner / 入站消息等待补发的 Hook 超时（内部等待时长由配置决定，这里留出余量）。
 #
-# 为什么要显式给 65s：`maisaka.planner.before_request` 的 Hook 规格默认超时只有 6000ms，
+# 为什么要显式设：`maisaka.planner.before_request` 的 Hook 规格默认超时只有 6000ms，
 # 会在等待窗口中间把处理器掐掉（error_policy=SKIP → 静默不再等待）。处理器自带的
 # timeout_ms 优先于规格默认值（宿主 HookDispatcher._resolve_timeout_ms），因此这里必须
-# 设成比 `[response_splitter] wait_timeout_seconds`（默认 30s）更大的值，并留出补发收尾余量；
-# 它大于系统级 `plugin_runtime.hook_blocking_timeout_sec`（默认 60s）是**有意**的，
-# 不要"顺手"改成 60s 以下。
-_FOLLOW_UP_WAIT_HOOK_TIMEOUT_MS = 65_000
+# 设成比 `[response_splitter] wait_timeout_seconds`（默认 30s）更大的值，并留出补发收尾余量。
+#
+# 0.14.3 起取 58s（评审意见）：**不高于**系统级 `plugin_runtime.hook_blocking_timeout_sec`
+# 的默认值 60s——钩子上限超过宿主全局阻塞超时的默认口径，极端情况下入站处理会被拖过
+# 平台自己认的 60s。与此配套，`_wait_for_stream_follow_ups` 把内部等待钳到
+# 「本上限 − `_FOLLOW_UP_WAIT_HEADROOM_SECONDS`」：即使用户把 wait_timeout_seconds 调得
+# 很大，"超时放行"也永远由自己的等待逻辑干净地结束（带日志），而不是被宿主在 Hook
+# 超时处掐断（SKIP 静默放行 + 一条超时告警）。想等更久的用户调大 wait_timeout_seconds
+# 即可（钳制点之前的部分都生效）。
+_FOLLOW_UP_WAIT_HOOK_TIMEOUT_MS = 58_000
+# 内部等待相对钩子超时预留的收尾余量（秒）：覆盖处理器自身的日志等开销，
+# 保证等待 + 收尾整体落在钩子超时之内。
+_FOLLOW_UP_WAIT_HEADROOM_SECONDS = 3.0
 
 
 class PostProcessTakeoverMixin:
@@ -711,13 +720,23 @@ class PostProcessTakeoverMixin:
 
 
     async def _wait_for_stream_follow_ups(self, session_id: str) -> int:
-        """等待该会话的补发任务结束（带超时），返回等待过的任务数。"""
+        """等待该会话的补发任务结束（带超时），返回等待过的任务数。
+
+        等待时长被钳在「Hook 超时 − 收尾余量」（0.14.3）：两个等待 Hook 的 `timeout_ms`
+        上限是 58s，用户把 `wait_timeout_seconds` 调得再大，实际等待也不会越过钳制点——
+        保证 blocking 处理器**永远**由自己的等待超时放行（这里返回后照常打日志），
+        而不是被宿主在 Hook 超时处掐断（SKIP 静默放行 + 超时告警）。
+        """
         if not session_id:
             return 0
         tasks = [task for task in self._stream_follow_up_tasks.get(session_id, set()) if not task.done()]
         if not tasks:
             return 0
         timeout = max(float(self.config.response_splitter.wait_timeout_seconds), 0.0)
+        timeout = min(
+            timeout,
+            _FOLLOW_UP_WAIT_HOOK_TIMEOUT_MS / 1000.0 - _FOLLOW_UP_WAIT_HEADROOM_SECONDS,
+        )
         if timeout <= 0:
             return 0
         try:

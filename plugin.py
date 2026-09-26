@@ -76,7 +76,8 @@
 
    **过滤假 @**（``[plugin] filter_fake_at``，默认开）：LLM 会在正文里手写 ``@某人``——
    那只是普通文本（宿主与适配器都**不会**把它转成真实 at 段，QQ 里不提醒任何人；模型是照抄
-   宿主渲染进上下文的「@昵称」文本）。出站前把**消息开头**的 ``@某人 + 空格`` 整段删掉，
+   宿主渲染进上下文的「@昵称」文本）。出站前把**消息开头**的 ``@某人 + 后面的空白`` 整段删掉
+   （0.14.3 起按相邻文本段拼成的逻辑串匹配，并一并清掉 ``@`` 段之前残留的纯空白文本段），
    这样抽到 @ 回复时注入的**真实 at** 才是消息里唯一的一个 @。
    **0.14.2 起只删「本轮回复目标」那个名字**：@ 的是别人时保留原文，否则删掉之后再注入
    回复目标的真实 at，等于把话 @ 给了另一个人（详见 ``_fake_at_mention_is_target``）。
@@ -206,7 +207,7 @@ from .modules.post_process_takeover import (
 from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
 
-SUPPORTED_CONFIG_VERSION = "0.14.2"
+SUPPORTED_CONFIG_VERSION = "0.14.3"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -318,11 +319,14 @@ _ROUND_SENT_ID_MAX_ENTRIES = 20
 # 文本规则归属判定里"首条分段等待窗"的兜底秒数（宿主配置为 0 时使用）。
 _REPLY_FLOW_ARM_FALLBACK_SECONDS = 20.0
 
-# 「假 @」：LLM 手写在正文里的 "@某人"——`@` + 昵称字符 + **至少一个水平空白**。
+# 「假 @」：LLM 手写在正文里的 "@某人"——`@` + 昵称字符 + **至少一个空白**。
 # 昵称字符集与 post_processing._AT_MENTION_PATTERN 保持一致（汉字/字母数字/下划线/连字符/间隔号）；
-# 空白只认水平空白（半角、全角、Tab、NBSP），**不含换行**——换行后面跟着的通常已经是下一句了。
+# 空白认水平空白（半角、全角、Tab、NBSP）**与换行**（0.14.3 起）——LLM 爱把 `@某人` 单独放一行，
+# 旧口径只认水平空白时那种 @ 永远过滤不掉，之后接管一注入真实 at 就又是两个 @（0.14.3 排查 L3）。
+# \x0b/\x0c 一并纳入，免得"同是空白却有的认有的不认"。
 _FAKE_AT_PATTERN = re.compile(
-    r"@[0-9A-Za-z_\-\u00b7\u3400-\u4dbf\u4e00-\u9fff\uff10-\uff19\uff21-\uff3a\uff41-\uff5a]{1,32}[ \t\u3000\u00a0]+"
+    r"@[0-9A-Za-z_\-\u00b7\u3400-\u4dbf\u4e00-\u9fff\uff10-\uff19\uff21-\uff3a\uff41-\uff5a]{1,32}"
+    r"[ \t\u3000\u00a0\x0b\x0c\r\n]+"
 )
 
 
@@ -371,16 +375,17 @@ class PluginSectionConfig(PluginConfigBase):
         description=(
             "过滤假 @：LLM 会在正文里手写「@某人」，那只是普通文本——宿主与适配器都**不会**"
             "把它转成真实 at 段，QQ 里不会提醒任何人。开启后插件在出站前把**消息开头**的"
-            "「@某人 + 空格」整段删掉，这样「引用回复接管」抽到 @ 时注入的**真实 @** 才是消息里"
-            "唯一的一个。只认「开头」且「名字后面跟空格」两条；删完只剩空白时不动（免得发出空消息）。"
-            "与两个接管同口径受「丰富回复门控」约束"
+            "「@某人 + 后面的空白」整段删掉，这样「引用回复接管」抽到 @ 时注入的**真实 @** 才是"
+            "消息里唯一的一个。只认「开头」且「名字后面跟空白」两条（空格、Tab、换行都算）；"
+            "删完只剩空白时不动（免得发出空消息）。与两个接管同口径受「丰富回复门控」约束"
         ),
         json_schema_extra={
             "label": "过滤假 @",
-            "x-toml-comment": "删掉正文开头的「@某人 + 空格」（LLM 手写的纯文本 @，不提醒人）。",
+            "x-toml-comment": "删掉正文开头的「@某人 + 后面的空白」（LLM 手写的纯文本 @，不提醒人）。",
             **_ui_i18n(
                 "Filter fake @",
-                "Strip a leading text-only \"@name \" written by the LLM (not a real mention).",
+                "Strip a leading text-only \"@name\" plus its trailing whitespace written by the LLM "
+                "(not a real mention).",
             ),
         },
     )
@@ -1308,12 +1313,17 @@ class ResponseSplitterSectionConfig(PluginConfigBase):
     wait_timeout_seconds: int = Field(
         default=30,
         description=(
-            "planner 请求与新入站消息等待本轮补发完成的秒数（超时即放行，不阻塞宿主；0 = 不等待）"
+            "planner 请求与新入站消息等待本轮补发完成的秒数（超时即放行，不阻塞宿主；0 = 不等待）。"
+            "补发（打字模拟）经常等不完时再手动调大本项。实际等待最长 55 秒：两个等待 Hook 的"
+            "上限刻意定在 58 秒（不高于宿主 60 秒全局阻塞超时，0.14.3 起），调得再大也只生效到钳制点"
         ),
         json_schema_extra={
             "label": "补发等待超时",
-            "x-toml-comment": "planner / 新消息等待本轮分段发完的秒数，超时放行。0 = 不等待。",
-            **_ui_i18n("Follow-up wait timeout", "Planner/inbound wait budget in seconds."),
+            "x-toml-comment": (
+                "planner / 新消息等待本轮分段发完的秒数，超时放行。0 = 不等待。"
+                "实际最长 55 秒（等待 Hook 上限 58 秒，不高于宿主全局 60 秒）。"
+            ),
+            **_ui_i18n("Follow-up wait timeout", "Planner/inbound wait budget in seconds (clamped to 55s)."),
         },
     )
 
@@ -2359,10 +2369,19 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         只认同时满足两条的（用户明确的口径）：
 
         1. 出现在**消息正文最前面**（首个非空文本组件的开头；开头已是真实 at 组件时不管）；
-        2. ``@名字`` 后面**跟着空格**（半角/全角空格、Tab、NBSP 都算，不含换行）。
+        2. ``@名字`` 后面**跟着空白**（半角/全角空格、Tab、NBSP、换行都算——0.14.3 起把换行
+           也认了：LLM 爱把 ``@某人`` 单独放一行，旧口径只认水平空白时那种 @ 永远过滤不掉）。
 
         两条一起才动手，是为了不误伤 ``a@b.com``、``@某人，``（名字后直接跟标点）这类写法。
         删掉的是 ``@ + 名字 + 后面那段空白``；**删完只剩空白时不删**（免得把消息发成空的）。
+
+        **0.14.3 起按"逻辑串"匹配组件**（0.13.12 那次空格坑的同源修复）：宿主/别的插件会把
+        正文拆成多个组件，旧实现有两个漏网点——① ``@`` 段**前面**的纯空白文本段原样留着
+        （渲染时 join 再补一个空格 = 目视前导双空格，排查报告 L1 主因）；② ``@名字`` 与它
+        后面的空白**分属两个组件**时正则只见单段、永远匹配不上（排查报告 L2）。现在把
+        「首个非空文本段 + 其后连续文本段」拼成一个逻辑串来匹配，命中后把消费掉的字符按段
+        分摊删掉，并**一并清掉它之前的纯空白文本段**（与 quote_takeover 注入路径的
+        ``_strip_body_leading_whitespace`` 同一口径：正文前导空白一律抹掉）。
 
         作用范围与文本规则一致：只处理**bot 本轮回复自己发出的消息**（含多段发送由插件补发的
         分段），其它插件用 ``ctx.send.*`` 直接发出的文本一律不动。
@@ -2392,6 +2411,11 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
         components = message.get("raw_message")
         if not isinstance(components, list):
             return False
+        # 定位「首个非空文本组件」，并记住它**之前**的纯空白文本段（0.14.3，L1）：
+        # 这些段是宿主/别的插件拆出来的，旧实现 continue 跳过、删完 @ 原样留着，
+        # 渲染时 join 再补一个空格 = 目视前导空格。
+        leading_blank_indexes: List[int] = []
+        head_index: Optional[int] = None
         for index, component in enumerate(components):
             if not isinstance(component, dict):
                 continue
@@ -2401,36 +2425,64 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
                 return False
             if component_type != "text":
                 continue
-            data = str(component.get("data") or "")
-            if not data.strip():
+            if not str(component.get("data") or "").strip():
+                if str(component.get("data") or ""):
+                    leading_blank_indexes.append(index)
                 continue
-            match = _FAKE_AT_PATTERN.match(data.lstrip())
-            if match is None:
-                return False
-            stripped = data.lstrip()[match.end():]
-            if not stripped.strip():
-                self.ctx.logger.debug(
-                    "过滤假 @：删掉后正文为空，保留原样（会话 %s）", session_id or "?"
-                )
-                return False
-            if not await self._fake_at_mention_is_target(match.group(0), session_id, reply_message_id):
-                return False
-            new_components = list(components)
-            new_components[index] = {**component, "data": stripped}
-            message["raw_message"] = new_components
-            processed = message.get("processed_plain_text")
-            if isinstance(processed, str) and processed:
-                processed_match = _FAKE_AT_PATTERN.match(processed.lstrip())
-                if processed_match is not None:
-                    message["processed_plain_text"] = processed.lstrip()[processed_match.end():]
-            self.ctx.logger.info(
-                "已过滤正文开头的假 @：%r → %r（会话 %s）",
-                match.group(0),
-                stripped[:40],
-                session_id or "?",
+            head_index = index
+            break
+        if head_index is None:
+            return False
+        # 把「首个非空文本段 + 其后**连续**的文本段」拼成一个逻辑串来匹配（0.14.3，L2）：
+        # "@名字" 与后面的空白分属两个组件时，只看单段的正则永远匹配不上。
+        # 遇到非文本组件即停——@ 名字和空白不该隔着引用/图片拼接。
+        run: List[Tuple[int, str]] = []
+        for index in range(head_index, len(components)):
+            run_component = components[index]
+            if not (isinstance(run_component, dict) and str(run_component.get("type") or "") == "text"):
+                break
+            run.append((index, str(run_component.get("data") or "")))
+        logical = "".join(data for _, data in run)
+        head = logical.lstrip()
+        match = _FAKE_AT_PATTERN.match(head)
+        if match is None:
+            return False
+        remainder = head[match.end():]
+        if not remainder.strip():
+            self.ctx.logger.debug(
+                "过滤假 @：删掉后正文为空，保留原样（会话 %s）", session_id or "?"
             )
-            return True
-        return False
+            return False
+        if not await self._fake_at_mention_is_target(match.group(0), session_id, reply_message_id):
+            return False
+        new_components = list(components)
+        # 清掉 @ 段之前的纯空白文本段（L1）——与 quote_takeover 注入路径同口径：
+        # 注入真实 at 前它也会把首个非空文本段之前的空白段清成空串。
+        for blank_index in leading_blank_indexes:
+            new_components[blank_index] = {**components[blank_index], "data": ""}
+        # 消费掉的字符（前导空白 + @名字 + 后面的空白）按段分摊删掉；边界段留下的
+        # 恰好是正文（正则的空白类是贪婪的，正文第一个字符必然不是空白）。
+        consumed = (len(logical) - len(head)) + match.end()
+        for index, data in run:
+            if consumed <= 0:
+                break
+            take = min(consumed, len(data))
+            consumed -= take
+            new_components[index] = {**components[index], "data": data[take:]}
+        message["raw_message"] = new_components
+        processed = message.get("processed_plain_text")
+        if isinstance(processed, str) and processed:
+            processed_head = processed.lstrip()
+            processed_match = _FAKE_AT_PATTERN.match(processed_head)
+            if processed_match is not None:
+                message["processed_plain_text"] = processed_head[processed_match.end():]
+        self.ctx.logger.info(
+            "已过滤正文开头的假 @：%r → %r（会话 %s）",
+            match.group(0),
+            remainder[:40],
+            session_id or "?",
+        )
+        return True
 
     async def _fake_at_mention_is_target(
         self, mention: str, session_id: str, reply_message_id: str
