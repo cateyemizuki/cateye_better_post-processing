@@ -35,7 +35,7 @@ import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from maibot_sdk import HookHandler
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
@@ -377,6 +377,16 @@ class PostProcessTakeoverMixin:
         """该镜像项是否被用户显式填过（用于日志里标"插件值 / 宿主值"）。"""
         return not self._is_follow_host(self._mirror_raw(section, field))
 
+    def _custom_fallback_prompts(self) -> List[str]:
+        """用户自定义的异常兜底提示词列表（``[response_splitter] fallback_prompts``）。
+
+        去掉空白项、保持配置顺序；空列表（默认）= 只用宿主自带的兜底提示词。
+        """
+        raw = getattr(self.config.response_splitter, "fallback_prompts", None)
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(item).strip() for item in raw if str(item).strip()]
+
     def _get_processor(self) -> PostProcessor:
         """构建（或复用）后处理复刻器；宿主配置或插件配置变化时都会作废重建。
 
@@ -392,6 +402,10 @@ class PostProcessTakeoverMixin:
                     sources[param] = "插件值"
             for param, cache_key in _HOST_ONLY_PROCESSOR_PARAMS:
                 params[param] = self._host_config_value(cache_key)
+            # 自定义异常兜底提示词（1.0.0）：非空时接管路径的兜底改从这份列表随机抽取，
+            # 模板里的 {bot_name}/{user_name} 占位符在事件循环侧替换（见
+            # handle_before_post_process 的 _format_fallback_placeholders）。
+            params["custom_fallback_prompts"] = self._custom_fallback_prompts()
             self._processor = PostProcessor(**params)
             self._processor_param_sources = sources
             self._log_effective_params(params, sources)
@@ -517,6 +531,56 @@ class PostProcessTakeoverMixin:
             except (TypeError, ValueError):
                 speed = 1.0
         return max(0.0, self._typing_seconds_for(recalled_text, speed))
+
+    async def _format_fallback_placeholders(
+        self, segments: List[ProcessedResponseSegment], reply_message_id: str
+    ) -> List[ProcessedResponseSegment]:
+        """替换自定义兜底提示词里的 ``{bot_name}`` / ``{user_name}`` 占位符（1.0.0）。
+
+        只在兜底早退路径（``last_stats["early"]=True``：回复过长 / 句子太多）被调用；
+        段文本里没有占位符时原样返回（宿主自带兜底提示词与「呃呃」都不含占位符）。
+
+        * ``{bot_name}`` = 「兜底回复的自称」的生效值（插件镜像 → 宿主 ``bot.nickname`` → 代码兜底）；
+        * ``{user_name}`` = **要回复的那条消息的发送者名称**（群名片优先、昵称兜底），
+          经 ``_lookup_reply_target`` 带 TTL 缓存查询——与引用回复接管共用同一份缓存，
+          通常不产生额外 RPC；查不到（不是回复 / 消息被清理）时替换为空串。
+
+        占位替换需要异步查询，而分段计算跑在工作线程里（``asyncio.to_thread``），
+        因此模板在 ``PostProcessor`` 里原样抽出、替换放在事件循环侧的这里做。
+        """
+        if not any(
+            "{bot_name}" in segment.text or "{user_name}" in segment.text for segment in segments
+        ):
+            return segments
+        bot_name = str(
+            self._resolve_mirror("response_splitter", "fallback_nickname", "bot_nickname", "text") or ""
+        )
+        user_name = ""
+        if reply_message_id and any("{user_name}" in segment.text for segment in segments):
+            try:
+                target = await self._lookup_reply_target(reply_message_id)
+            except Exception as exc:
+                target = None
+                self.ctx.logger.debug("兜底占位符 user_name 查询失败（按空处理）: %s", exc)
+            if target is not None:
+                user_name = str(target[2] or "").strip() or str(target[1] or "").strip()
+        formatted: List[ProcessedResponseSegment] = []
+        for segment in segments:
+            text = segment.text
+            if "{bot_name}" in text or "{user_name}" in text:
+                text = text.replace("{bot_name}", bot_name).replace("{user_name}", user_name)
+                segment = ProcessedResponseSegment(
+                    text=text,
+                    quote_previous=segment.quote_previous,
+                    separator=segment.separator,
+                )
+            formatted.append(segment)
+        self.ctx.logger.info(
+            "异常兜底提示词命中：已从自定义列表随机抽取并完成占位替换（bot_name=%r user_name=%r）",
+            bot_name,
+            user_name,
+        )
+        return formatted
 
 
     async def _warmup_processor(self) -> None:
@@ -1122,6 +1186,17 @@ class PostProcessTakeoverMixin:
             len(segments),
             ("、整词替换跳过=%d(累计)" % combo_skips) if combo_skips else "",
         )
+
+        # 自定义异常兜底提示词的占位替换（1.0.0）：仅兜底早退路径（过长/句子太多，
+        # stats early=True）抽出的模板可能带 {bot_name}/{user_name}，正常回复正文不动。
+        # 替换失败原样发送（模板里的占位符字面可见，好过丢掉整条兜底）。
+        if stats.get("early") and segments:
+            try:
+                segments = await self._format_fallback_placeholders(
+                    segments, str(modified.get("reply_message_id") or "").strip()
+                )
+            except Exception as exc:
+                self.ctx.logger.warning("异常兜底提示词占位替换失败，按原文发送: %s", exc)
 
         session_id = str(modified.get("session_id") or "").strip()
         max_segments = max(int(self.config.response_splitter.max_segments), 0)

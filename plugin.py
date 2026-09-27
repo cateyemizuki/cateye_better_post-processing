@@ -4,10 +4,11 @@
 
 | 文件 | 职责 |
 |---|---|
-| ``plugin.py`` | 配置模型、生命周期、共享基础设施（回复轮记录、文本规则、表情包功能），组合下面两个 mixin |
+| ``plugin.py`` | 配置模型、生命周期、共享基础设施（回复轮记录、文本规则、表情包功能），组合下面三个 mixin |
 | ``modules/requirements.py`` | 各模块的宿主前置条件与可用性判定 |
-| ``modules/post_process_takeover.py`` | 后处理接管（错别字 + 分段 + 多段发送） |
+| ``modules/post_process_takeover.py`` | 后处理接管（错别字 + 分段 + 多段发送 + 异常兜底提示词占位替换） |
 | ``modules/quote_takeover.py`` | 引用回复接管（直接/引用/@/引用＋@ 权重抽取） |
+| ``modules/status_command.py`` | ``/bpp`` 状态命令（合并转发 + 一图流）与 ``/bpp fallback`` 兜底测试 |
 | ``post_processing.py`` | 宿主后处理算法的逐行复刻（纯逻辑，可离线单测） |
 
 **模块前置条件**：两个接管模块都要求宿主**关闭对应能力**才会工作，且都额外要求关闭
@@ -42,6 +43,9 @@
    撤回前按 ``recall_delay_seconds`` 先等一会儿（留空 = 按被撤回那条的打字时长自动）。
    与宿主**有意不同**的两处：整词同音替换的组合数上限、``@昵称`` 不参与错字生成
    （宿主会把它一起改错，配合真实 at 组件就成了"一条消息两个 @"）。
+   **异常兜底提示词**（1.0.0，``[response_splitter] fallback_prompts``）：触发
+   「过长 / 句子太多」兜底时改从自定义列表随机抽一条（支持 ``{bot_name}`` /
+   ``{user_name}`` 占位，事件循环侧替换）；留空（默认）= 只用宿主自带的兜底提示词。
    分段/错别字/打字速度参数默认读宿主自身配置（``response_splitter.*``、``chinese_typo.*``、
    ``response_post_process.typing_speed``、``bot.nickname``）；插件里也有**同名镜像节**，
    留空 = 跟随宿主，填了值 = 以插件为准（见 ``[response_splitter]`` 等节）。
@@ -57,7 +61,7 @@
    目标消息过旧有三条规则（超时优先，其次条数）：目标发出超过 ``stale_age_seconds`` 秒后
    **强制直接回复**——既**不引用**也**不 @**（就是权重池里的"直接回复"，
    不是"以引用的方式发出去"）；目标之后已出现的消息数**未达到**
-   ``force_direct_threshold_messages``（强制直发阈值，默认关闭）时也强制直接回复；
+   ``force_direct_threshold_messages``（强制直发阈值，默认群聊 2 条 / 私聊 3 条）时也强制直接回复；
    目标之后已出现 ≥ ``stale_threshold_messages`` 条消息时
    视为"对话已推进"——抽取池剔除"直接回复"，并把 @回复 权重调为
    ``stale_at_weight``（留空则取原 @权重 的一半），避免裸回复指代不明。
@@ -66,8 +70,8 @@
    **同一消息只引用一次**（``quote_once_per_target``，群聊/私聊各自独立开关与记录）：
    一条目标消息一旦被引用过（本插件抽到引用/引用＋@，或在
    ``send_service.after_send`` 观测到它以 ``set_reply=True`` 发出——宿主自带的、
-   其它插件注入的都算），之后**任何**对该消息的回复都不再引用，只可能直接回复或
-   （群聊）@；抽到"直接回复"不消耗这次机会，下一轮 planner 再次回复同一条消息时
+   其它插件注入的都算），之后**任何**对该消息的回复都不再引用，只可能直接回复（该判定
+   发生在回复方式抽取之前，@ 也不会再抽取）；抽到"直接回复"不消耗这次机会，下一轮 planner 再次回复同一条消息时
    仍有机会抽到引用。该规则优先于全部过旧规则（含 ``stale_age_seconds`` 的
    "目标超时后强制直接回复"），因此对"bot 回复自己刚发过的消息"这类超出时间窗的目标
    同样生效。记录按 session 存放（群聊/私聊天然分开），单会话上限
@@ -165,6 +169,11 @@
 ``count_unstored``），冷却期内本插件不会主动发送表情包（回复后表情包与表情包跟风
 共用同一冷却）。唯一例外是 CLI 控制台平台的本地渲染路径不经 send_service，不会
 计入冷却（仅影响本地调试）。
+
+另提供 ``/bpp`` 状态命令（``modules/status_command.py``，1.0.0，不受宿主开关约束）：
+用**合并转发**发送各模块当前状态（插件侧开关 + 宿主前置条件综合判定），内容先经
+``render.html2png`` 渲染成**一图流**、渲染失败退回文字；``/bpp fallback`` 引用一条
+消息可实测异常兜底提示词的抽取与占位替换效果（见上）。
 """
 
 from __future__ import annotations
@@ -177,7 +186,7 @@ import time
 from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Deque, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Deque, Dict, List, Literal, Optional, Tuple, Union
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ErrorPolicy, HookMode, HookOrder
@@ -205,9 +214,10 @@ from .modules.post_process_takeover import (
     PostProcessTakeoverMixin,
 )
 from .modules.quote_takeover import QuoteTakeoverMixin
+from .modules.status_command import StatusCommandMixin
 from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
 
-SUPPORTED_CONFIG_VERSION = "0.14.3"
+SUPPORTED_CONFIG_VERSION = "1.1.0"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -707,7 +717,7 @@ class QuoteReplySectionConfig(PluginConfigBase):
         default=True,
         description=(
             "同一条目标消息一旦被引用过（本插件抽取到引用/引用＋@，或被观测到以引用方式发出），"
-            "之后对该消息的任何回复都不再引用（只可能直接回复或 @）；抽到直接回复不算，"
+            "之后对该消息的任何回复都不再引用（只可能直接回复，@ 也不再抽取）；抽到直接回复不算，"
             "下一轮仍有机会抽到引用。该规则优先于「目标超时后强制直接回复」判定"
         ),
         json_schema_extra={
@@ -1149,8 +1159,8 @@ class ChineseTypoWeightsSectionConfig(PluginConfigBase):
         ge=0.0,
         le=1.0,
         description=(
-            "最后纠正概率：抽到纠正后，把它推迟到本轮全部分段发完之后执行的概率（0~1）。"
-            "1 = 每次都推迟（默认）；0 = 从不推迟（等同关闭「允许最后纠正」）。"
+            "最后纠正概率：抽到纠正后，把它推迟到本轮全部分段发完之后执行的概率（0~1，默认 0.2）。"
+            "1 = 每次都推迟；0 = 从不推迟（等同关闭「允许最后纠正」）。"
             "仅「允许最后纠正」开启时参与"
         ),
         json_schema_extra={
@@ -1278,6 +1288,34 @@ class ResponseSplitterSectionConfig(PluginConfigBase):
             "label": "兜底回复的自称",
             "x-toml-comment": "复刻兜底默认回复用的自称（宿主 bot.nickname）。留空 = 跟随宿主。",
             **_ui_i18n("Fallback nickname", "Empty = follow host bot.nickname."),
+        },
+    )
+    fallback_prompts: List[str] = Field(
+        default_factory=list,
+        description=(
+            "异常兜底提示词：回复触发「过长 / 句子太多」兜底时，从这份列表里**随机抽一条**发送，"
+            "顶替宿主自带的兜底提示词（「<昵称>不知道哦」那一组）。支持两个占位符："
+            "{bot_name} = bot 昵称（上面的「兜底回复的自称」生效值）、"
+            "{user_name} = 要回复的那条消息的发送者名称（群名片优先，查不到时替换为空）。"
+            "留空（默认）= 只使用宿主自带的兜底提示词。仅后处理接管生效时起作用"
+            "（宿主自己做后处理时兜底文本由宿主决定，插件无从介入）；"
+            "可用「/bpp fallback」引用一条消息实测抽取与占位效果"
+        ),
+        json_schema_extra={
+            "label": "异常兜底提示词",
+            "x-toml-comment": (
+                "兜底触发时随机抽一条发送；支持 {bot_name}/{user_name} 占位；"
+                "留空 = 只用宿主自带的兜底提示词。"
+            ),
+            "rows": 4,
+            **_ui_i18n(
+                "Fallback prompts",
+                "Custom fallback messages: when a reply hits the too-long/too-many-sentences guard, "
+                "one of these is picked at random instead of the host's built-in fallback replies. "
+                "Placeholders {bot_name} and {user_name} (sender of the message being replied to) "
+                "are substituted. Empty (default) = keep the host's built-in prompts. "
+                "Only applies while the post-process takeover is active; test with '/bpp fallback'.",
+            ),
         },
     )
     yield_to_other_plugins: bool = Field(
@@ -1832,13 +1870,14 @@ class BetterPostProcessingConfig(PluginConfigBase):
     emoji_cooldown: EmojiCooldownSectionConfig = Field(default_factory=EmojiCooldownSectionConfig)
 
 
-class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, MaiBotPlugin):
+class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostProcessTakeoverMixin, MaiBotPlugin):
     """回复后处理接管、回复方式抽取、表情包互动与出站文本规则增强插件。
 
     两个"接管"模块（引用回复接管 / 后处理接管）的实现分别在
     ``modules/quote_takeover.py`` 与 ``modules/post_process_takeover.py``，以 mixin
-    形式组合进来（SDK 用 ``dir(instance)`` 收集组件，继承的 HookHandler 同样会被注册）；
+    形式组合进来（SDK 用 ``dir(instance)`` 收集组件，继承的 HookHandler 一样会被注册）；
     各自的前置条件（需要宿主关闭哪些能力）由 ``modules/requirements.py`` 统一判定。
+    ``/bpp`` 状态命令与兜底测试命令在 ``modules/status_command.py``（同为 mixin）。
     本类保留共享基础设施：回复轮记录、文本规则、表情包相关功能。
     """
 
@@ -3255,7 +3294,7 @@ class BetterPostProcessingPlugin(QuoteTakeoverMixin, PostProcessTakeoverMixin, M
             components = message.get("raw_message")
             if isinstance(components, list):
                 text = "".join(
-                    str(component.get("text") or "")
+                    str(component.get("data") or "")
                     for component in components
                     if isinstance(component, dict) and str(component.get("type") or "") == "text"
                 ).strip()

@@ -3,7 +3,9 @@
 本模块对 MaiBot 内置的 ``src/chat/utils/utils.py`` 的
 ``process_llm_response_segments`` 以及 ``src/chat/utils/typo_generator.py`` 的
 ``ChineseTypoGenerator`` 做逐行复刻，使插件能在框架“回复后处理总开关”关闭时，
-以与 MaiBot 完全一致的后处理逻辑接管该功能。
+以与 MaiBot 完全一致的后处理逻辑接管该功能。**1.1.0 起**，分段复刻已同步
+MaiBot **1.3.0** 的回复分割修复：分句保留每句的尾随分隔符，多段被压缩合并为
+一条消息时补回句间分隔符（``ProcessedResponseSegment.separator``）。
 
 来源与许可（重要）
 ------------------
@@ -29,7 +31,7 @@
 （首段走宿主原生发送链，其余分段由插件补发并按宿主打字速度模拟打字），
 本文件只负责产出与宿主一致的分段/纠正计划。
 
-与宿主**有意不同**的两处（都在下面显式标注，方便比对上游改动）：
+与宿主**有意不同**的三处（都在下面显式标注，方便比对上游改动）：
 
 1. 整词同音替换的组合数硬上限（``_MAX_HOMOPHONE_COMBINATIONS``）：宿主无条件穷举，
    长词会指数爆炸把线程占死；
@@ -37,6 +39,10 @@
    ``@昵称`` 里的昵称**不参与错字生成**。宿主会把昵称一起改错（实测：正文里的
    ``@凯特艾`` 被改成 ``@凯特爱``），配合 ``quote_takeover`` 注入的真实 at 组件，
    群里就变成“@凯特艾 @凯特爱”——像 bot 同时 @ 了两个人（0.11.3 线上事故）。
+3. **自定义异常兜底提示词**（``custom_fallback_prompts``，1.0.0 起）：接管路径
+   （``plan``）的「过长 / 句子太多」兜底触发时，改从用户配置的列表里随机抽取
+   （支持 ``{bot_name}`` / ``{user_name}`` 占位，由调用方替换）；列表为空（默认）
+   仍用宿主自带的兜底提示词。宿主复刻路径（``process``）恒用宿主列表，差分基线不变。
 """
 
 from __future__ import annotations
@@ -176,6 +182,28 @@ class ProcessedResponseSegment:
 
     text: str
     quote_previous: bool = False
+    # 原始文本中紧跟本段的分隔符；多条消息被压缩合并为一条时，用它恢复句间的停顿
+    # （同步 MaiBot 1.3.0 的回复分割修复）。
+    separator: str = ""
+
+
+def build_default_fallback_replies(bot_nickname: str) -> List[str]:
+    """宿主自带的兜底提示词列表（``utils.py`` 里 ``default_replies`` 的逐字复刻）。
+
+    回复触发「过长 / 句子太多」兜底时，宿主从中随机抽一条顶替原回复。
+    单独抽成函数供两处共用：``PostProcessor._get_random_default_reply``（接管路径）
+    与 ``/bpp fallback`` 兜底测试命令（``modules/status_command.py``）。
+    """
+    nickname = (bot_nickname or "麦麦").strip()
+    return [
+        f"{nickname}不知道哦",
+        f"{nickname}不知道",
+        "不知道哦",
+        "不知道",
+        "不晓得",
+        "懒得说",
+        "()",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -536,8 +564,12 @@ def get_western_ratio(paragraph: str) -> float:
     return western_count / len(alnum_chars)
 
 
-def split_into_sentences_w_remove_punctuation(text: str) -> List[str]:
-    """将文本分割成句子，并根据概率合并（复刻原逻辑）。"""
+def _split_into_sentence_segments(text: str) -> List[Tuple[str, str]]:
+    """将文本分割成 (句子, 尾随分隔符) 元组，并根据概率合并（复刻原逻辑）。
+
+    尾随分隔符是原始文本中紧跟该句的分隔符（最后一句为空字符串），供后续把多句
+    压缩回一条消息时恢复句间停顿（同步 MaiBot 1.3.0 的回复分割修复）。
+    """
     import re
 
     # 预处理：处理多余的换行符
@@ -547,7 +579,9 @@ def split_into_sentences_w_remove_punctuation(text: str) -> List[str]:
 
     len_text = len(text)
     if len_text < 3:
-        return list(text) if random.random() < 0.01 else [text]
+        if random.random() < 0.01:
+            return [(char, "") for char in text]
+        return [(text, "")]
 
     quote_chars = {'"', "'", "“", "”", "‘", "’", "「", "」", "『", "』"}
     inside_quote = [False] * len_text
@@ -618,7 +652,7 @@ def split_into_sentences_w_remove_punctuation(text: str) -> List[str]:
 
     segments = [(content, sep) for content, sep in segments if content or sep]
     if not segments:
-        return [text] if text else []
+        return [(text, "")] if text else []
 
     if len_text < 12:
         split_strength = 0.2
@@ -648,14 +682,23 @@ def split_into_sentences_w_remove_punctuation(text: str) -> List[str]:
             merged_segments.append((current_content, current_sep))
             idx += 1
 
-    final_sentences = [content for content, _ in merged_segments if content]
-    final_sentences = [s for s in final_sentences if s.strip()]
-    final_sentences = [
-        normalized
-        for sentence in final_sentences
-        if (normalized := re.sub(r"[^\S\r\n]*[\r\n]+[^\S\r\n]*", " ", sentence).strip())
+    # 提取最终的句子内容（保留尾随分隔符，供压缩拼接时恢复停顿）
+    sentence_segments = [(content, sep) for content, sep in merged_segments if content]
+    # 清理可能引入的空字符串和仅包含空白的字符串
+    sentence_segments = [
+        (sentence, sep) for sentence, sep in sentence_segments if sentence.strip()
     ]
-    return final_sentences
+    sentence_segments = [
+        (normalized_sentence, sep)
+        for sentence, sep in sentence_segments
+        if (normalized_sentence := re.sub(r"[^\S\r\n]*[\r\n]+[^\S\r\n]*", " ", sentence).strip())
+    ]
+    return sentence_segments
+
+
+def split_into_sentences_w_remove_punctuation(text: str) -> List[str]:
+    """将文本分割成句子，并根据概率合并（不保留分隔符信息，仅返回句子内容）。"""
+    return [sentence for sentence, _separator in _split_into_sentence_segments(text)]
 
 
 def _count_cjk(text: str) -> int:
@@ -699,10 +742,18 @@ def _merge_groups(
     for group_index, group_start in enumerate(sorted_starts):
         group_end = sorted_starts[group_index + 1] if group_index + 1 < len(sorted_starts) else segment_count
         group = segments[group_start:group_end]
+        # 组内多段被压缩为一条消息时，补回各段尾随的分隔符，避免多句硬拼接成无标点的一整坨
+        # （同步 MaiBot 1.3.0 的回复分割修复）。
+        merged_text_parts: List[str] = []
+        for position, segment in enumerate(group):
+            merged_text_parts.append(segment.text)
+            if position < len(group) - 1:
+                merged_text_parts.append(segment.separator)
         merged_segments.append(
             ProcessedResponseSegment(
-                text="".join(segment.text for segment in group),
+                text="".join(merged_text_parts),
                 quote_previous=group[0].quote_previous,
+                separator=group[-1].separator,
             )
         )
     return merged_segments, sorted_starts
@@ -759,6 +810,7 @@ class PostProcessor:
         typo_word_replace_rate: float = 0.006,
         bot_nickname: str = "麦麦",
         typo_protect_at_mentions: bool = True,
+        custom_fallback_prompts: Sequence[str] = (),
     ) -> None:
         if DEPENDENCY_ERROR is not None:
             raise RuntimeError(
@@ -784,6 +836,13 @@ class PostProcessor:
         self.bot_nickname = (bot_nickname or "麦麦").strip()
         # **与宿主不同的一处**：``@昵称`` 不参与错字生成（见 ``_protect_at_mentions``）。
         self.typo_protect_at_mentions = bool(typo_protect_at_mentions)
+        # 用户自定义的异常兜底提示词（``[response_splitter] fallback_prompts``）：非空时
+        # **接管路径**（``plan``）的兜底改从这份列表里随机抽取（占位符 ``{bot_name}`` /
+        # ``{user_name}`` 由调用方在事件循环侧替换——替换需要异步查目标发送者，线程里做不了）。
+        # 宿主复刻路径（``process``）恒用宿主自带列表，保持逐行一致。
+        self.custom_fallback_prompts: Tuple[str, ...] = tuple(
+            str(item).strip() for item in (custom_fallback_prompts or ()) if str(item).strip()
+        )
 
         self._typo_generator: Optional[ChineseTypoGenerator] = None
         # 最近一次 ``process`` / ``plan`` 的统计（插件用来打诊断日志：
@@ -808,17 +867,17 @@ class PostProcessor:
             )
         return self._typo_generator
 
-    def _get_random_default_reply(self) -> str:
-        default_replies = [
-            f"{self.bot_nickname}不知道哦",
-            f"{self.bot_nickname}不知道",
-            "不知道哦",
-            "不知道",
-            "不晓得",
-            "懒得说",
-            "()",
-        ]
-        return random.choice(default_replies)
+    def _get_random_default_reply(self, *, allow_custom: bool = True) -> str:
+        """兜底触发时随机抽一条兜底提示词。
+
+        ``allow_custom=True``（接管路径 ``plan`` 用）且用户配置了自定义兜底提示词时，
+        从自定义列表里抽（原样返回，``{bot_name}`` / ``{user_name}`` 占位符由调用方替换）；
+        否则用宿主自带的兜底提示词（``build_default_fallback_replies``）。
+        宿主复刻路径（``process``）传 ``allow_custom=False``，行为与宿主逐字一致。
+        """
+        if allow_custom and self.custom_fallback_prompts:
+            return random.choice(self.custom_fallback_prompts)
+        return random.choice(build_default_fallback_replies(self.bot_nickname))
 
     def process(
         self,
@@ -834,8 +893,10 @@ class PostProcessor:
 
         **勿改这里的语句顺序与随机数调用顺序**：它是逐行复刻，RNG 序也必须一致
         （差分测试 `test_better_post_processing_*` 会比对同种子下的输出）。
+        兜底回复恒用**宿主自带**的兜底提示词（``allow_custom=False``）——用户自定义的
+        兜底提示词只作用于接管路径（``plan``），保证本方法的差分基线不漂移。
         """
-        cleaned_text, kaomoji_mapping, early = self._prepare_text(text)
+        cleaned_text, kaomoji_mapping, early = self._prepare_text(text, allow_custom_fallback=False)
         if early is not None:
             self.last_stats = {
                 "early": True,
@@ -852,7 +913,7 @@ class PostProcessor:
         segments: List[ProcessedResponseSegment] = []
         typo_sentences = 0
         suggestions = 0
-        for sentence in split_sentences:
+        for sentence, sentence_separator in split_sentences:
             if self.typo_enable and enable_chinese_typo:
                 typoed_text, typo_corrections = typo_generator.create_typo_sentence(sentence)
                 if typoed_text != sentence:
@@ -865,14 +926,20 @@ class PostProcessor:
                             self.typo_enable_correction_quote
                             and random.random() < self.typo_correction_quote_probability
                         )
-                        segments.append(ProcessedResponseSegment(typoed_text))
+                        segments.append(
+                            ProcessedResponseSegment(typoed_text, separator=sentence_separator)
+                        )
                         segments.append(ProcessedResponseSegment(typo_corrections, quote_previous=quote_previous))
                     else:
-                        segments.append(ProcessedResponseSegment(sentence))
+                        segments.append(
+                            ProcessedResponseSegment(sentence, separator=sentence_separator)
+                        )
                 else:
-                    segments.append(ProcessedResponseSegment(typoed_text))
+                    segments.append(
+                        ProcessedResponseSegment(typoed_text, separator=sentence_separator)
+                    )
             else:
-                segments.append(ProcessedResponseSegment(sentence))
+                segments.append(ProcessedResponseSegment(sentence, separator=sentence_separator))
 
         finalized = self._finalize(segments, cleaned_text, kaomoji_mapping)
         if finalized is None:
@@ -884,7 +951,7 @@ class PostProcessor:
                 "segments": 1,
                 "overflow": True,
             }
-            return [ProcessedResponseSegment(self._get_random_default_reply())]
+            return [ProcessedResponseSegment(self._get_random_default_reply(allow_custom=False))]
         self.last_stats = {
             "early": False,
             "sentences": len(split_sentences),
@@ -946,9 +1013,9 @@ class PostProcessor:
         deferred: List[CorrectionDecision] = []
         typo_sentences = 0
         suggestions = 0
-        for sentence in split_sentences:
+        for sentence, sentence_separator in split_sentences:
             if not (self.typo_enable and enable_chinese_typo):
-                segments.append(ProcessedResponseSegment(sentence))
+                segments.append(ProcessedResponseSegment(sentence, separator=sentence_separator))
                 continue
             # force_suggestion=True：跳过宿主"50% 才给纠正建议"的门控，见方法 docstring。
             typoed_text, suggestion = typo_generator.create_typo_sentence(
@@ -961,13 +1028,15 @@ class PostProcessor:
             index = len(segments)
             if not suggestion or typoed_text == sentence:
                 # 没抽到纠正建议、或整句其实没被改动：错字句照发，不产生纠正动作。
-                segments.append(ProcessedResponseSegment(typoed_text))
+                segments.append(
+                    ProcessedResponseSegment(typoed_text, separator=sentence_separator)
+                )
                 continue
             if visible_probability < 1.0 and random.random() >= visible_probability:
                 # 宿主的另一半分支：整句替换成正确句（错字不出现）。
-                segments.append(ProcessedResponseSegment(sentence))
+                segments.append(ProcessedResponseSegment(sentence, separator=sentence_separator))
                 continue
-            segments.append(ProcessedResponseSegment(typoed_text))
+            segments.append(ProcessedResponseSegment(typoed_text, separator=sentence_separator))
             if max_correction_cjk > 0 and _count_cjk(sentence) > max_correction_cjk:
                 # 超限：错字可见但不纠正（也不消耗纠正方式抽取）。
                 continue
@@ -1057,9 +1126,13 @@ class PostProcessor:
     # ------------------------------------------------------------------
 
     def _prepare_text(
-        self, text: str
+        self, text: str, *, allow_custom_fallback: bool = True
     ) -> Tuple[str, Dict[str, str], Optional[List[ProcessedResponseSegment]]]:
-        """颜文字保护 → 括号内容剔除 → 两道守卫；命中守卫时返回早退结果。"""
+        """颜文字保护 → 括号内容剔除 → 两道守卫；命中守卫时返回早退结果。
+
+        ``allow_custom_fallback``：过长守卫触发兜底时是否允许用**用户自定义**的兜底提示词
+        （接管路径 ``plan`` 为 True；宿主复刻路径 ``process`` 为 False，保持逐字一致）。
+        """
         import re
 
         # 保护颜文字
@@ -1077,15 +1150,19 @@ class PostProcessor:
 
         max_length = self.splitter_max_length * 2
         if get_western_ratio(cleaned_text) < 0.1 and len(cleaned_text) > max_length:
-            return cleaned_text, kaomoji_mapping, [ProcessedResponseSegment(self._get_random_default_reply())]
+            return cleaned_text, kaomoji_mapping, [
+                ProcessedResponseSegment(
+                    self._get_random_default_reply(allow_custom=allow_custom_fallback)
+                )
+            ]
 
         return cleaned_text, kaomoji_mapping, None
 
-    def _split_sentences(self, cleaned_text: str, enable_splitter: bool) -> List[str]:
-        """按宿主配置决定是否分段。"""
+    def _split_sentences(self, cleaned_text: str, enable_splitter: bool) -> List[Tuple[str, str]]:
+        """按宿主配置决定是否分段；返回 ``(句子, 尾随分隔符)`` 元组列表。"""
         if self.splitter_enable and enable_splitter:
-            return split_into_sentences_w_remove_punctuation(cleaned_text)
-        return [cleaned_text]
+            return _split_into_sentence_segments(cleaned_text)
+        return [(cleaned_text, "")]
 
     def _finalize(
         self,
@@ -1114,6 +1191,7 @@ class PostProcessor:
                 ProcessedResponseSegment(
                     text=recovered_text,
                     quote_previous=segment.quote_previous,
+                    separator=segment.separator,
                 )
                 for segment, recovered_text in zip(merged, recovered_sentences, strict=True)
             ]

@@ -52,8 +52,8 @@
 [模块状态｜启动] 回复后表情包：可用（不受宿主开关约束）
 ```
 
-**其余功能（回复后表情包 / 表情包跟风 / 聊天流表情冷却 / 文本替换规则 / 表情包含义库）
-不需要关闭宿主任何功能**，宿主开关任意状态都照常工作。
+**其余功能（回复后表情包 / 表情包跟风 / 聊天流表情冷却 / 文本替换规则 / 表情包含义库 /
+`/bpp` 状态命令）不需要关闭宿主任何功能**，宿主开关任意状态都照常工作。
 
 > 想「开着丰富回复也强行接管」时，把插件配置 `[plugin] rich_reply_gate` 关掉（默认开）——
 > 代价见 [模块与前置条件（重要）](#模块与前置条件重要)。
@@ -64,13 +64,15 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 
 | 功能 | 默认 | 说明 |
 |---|---|---|
-| 后处理接管 | 开 | **需宿主关闭** `response_post_process.enable_response_post_process` **与** `experimental.enable_rich_reply`：以与 MaiBot 一致的原逻辑接管错别字注入 + 分段 + 颜文字保护 + 长度/句数守卫（参数沿用宿主 `response_splitter.*` / `chinese_typo.*` / `typing_speed`）；**各分段作为独立消息依次发送**（首段走宿主原生链路，其余由插件补发并模拟打字）；**错字纠正方式恒由权重池决定**（直接发送 / 引用纠正 / 撤回重发 / 不纠正，可延迟到最后；撤回前有「撤回反应时间」），`@昵称` 不会被错字污染、也不会重复 @ |
+| 后处理接管 | 开 | **需宿主关闭** `response_post_process.enable_response_post_process` **与** `experimental.enable_rich_reply`：以与 MaiBot 一致的原逻辑接管错别字注入 + 分段 + 颜文字保护 + 长度/句数守卫（参数沿用宿主 `response_splitter.*` / `chinese_typo.*` / `typing_speed`；分段复刻已同步 MaiBot 1.3.0 的分段合并修复）；**各分段作为独立消息依次发送**（首段走宿主原生链路，其余由插件补发并模拟打字）；**错字纠正方式恒由权重池决定**（直接发送 / 引用纠正 / 撤回重发 / 不纠正，可延迟到最后；撤回前有「撤回反应时间」），`@昵称` 不会被错字污染、也不会重复 @ |
 | 引用回复接管 | 开 | **需宿主关闭** `chat.reply_style.enable_reply_quote` **与** `experimental.enable_rich_reply`：为指向目标消息的回复**按权重**抽取发送方式：直接回复 / 引用回复 / @回复 / 引用＋@回复；**群聊与私聊权重、过旧规则、"同一消息只引用一次"记录各自独立**（私聊恒不 @） |
 | 同一消息只引用一次 | 开 | 一条目标消息被引用过之后，之后对该消息的任何回复都不再引用（群聊/私聊分开记录）；抽到直接回复不消耗机会 |
 | 回复后表情包 | 开 | planner 激活回复后，若整轮回复没有携带表情包，按概率补发一张（指定情绪标签或随机）；planner 本轮已计划发表情/贴表情、或本轮回复实际没发出时不补发 |
 | 表情包跟风 | 开 | 群友连续发送 `threshold` 条表情包后，按配置方式跟发一张（与最后一个同情绪 / 指定情绪 / 纯随机）；不计入 bot 自身消息与插件注入的合成记录 |
 | 文本替换规则 | 空 | 对 bot 发出的纯文本做词替换或整条覆盖，可配多条；默认只作用于 planner 拉起的回复流程，不碰其它插件直接发出的文本 |
-| 表情包含义库 | 关闭 | 为表情包补录视觉模型生成的"准确内容"，并在发给模型的请求里把 `[表情包: 标签]` 改写成标签 + 内容描述（默认只改 replyer 请求） |
+| 表情包含义库 | 开 | 为表情包补录视觉模型生成的"准确内容"，并在发给模型的请求里把 `[表情包: 标签]` 改写成标签 + 内容描述（默认改 replyer 与 planner 请求） |
+| 异常兜底提示词 | 空 | 后处理接管触发「过长 / 句子太多」兜底时，从自定义列表**随机抽一条**发送（支持 `{bot_name}` / `{user_name}` 占位）；留空 = 只用宿主自带的兜底提示词 |
+| /bpp 状态命令 | 恒可用 | **仅 operator 可用**（宿主 `plugin.permission` 名单 + 本地控制台，非 operator 由宿主拦截）。`/bpp` 用**合并转发**发送各模块当前状态（**一图流**渲染，渲染失败退回文字）；`/bpp fallback` 引用一条消息实测兜底提示词（插件总开关关闭时拦截） |
 
 <!-- TOC -->
 
@@ -96,6 +98,9 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
   - [[text_rules] 文本替换规则](#text_rules-文本替换规则)
   - [[emoji_meaning] 表情包含义库](#emoji_meaning-表情包含义库)
   - [WebUI 显示与翻译（0.6.1；提示文本 0.11.1）](#webui-显示与翻译061提示文本-0111)
+- [/bpp 状态命令与异常兜底提示词（1.0.0）](#bpp-状态命令与异常兜底提示词100)
+  - [/bpp：模块状态一图流（合并转发）](#bpp模块状态一图流合并转发)
+  - [/bpp fallback：实测异常兜底提示词](#bpp-fallback实测异常兜底提示词)
 - [与框架的分工](#与框架的分工)
 - [与其它插件共存](#与其它插件共存)
   - [与「智能分段插件」(saberlights/smart_segmentation_plugin)](#与智能分段插件saberlightssmart_segmentation_plugin)
@@ -116,15 +121,17 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 > 本插件使用的 Hook 与能力（`send_service.before_send` / `send_service.after_build_message` /
 > `send_service.after_send`、`maisaka.reply.before_post_process`、
 > `maisaka.planner.before_request`、`maisaka.planner.after_response`、
-> `maisaka.replyer.before_request`、`chat.receive.before_process`、`chat.receive.after_process`、
-> `emoji.register.after_build_description`、`message.get_by_id`、`message.get_by_time_in_chat`、
-> `emoji.*`、`database.query`、`llm.generate`、`send.emoji`、`send.text`、
-> `api.call`）在 MaiBot 1.2.3 / maibot_sdk 2.8.0 上验证。manifest 声明的最低宿主版本为 1.2.3。
+> `maisaka.replyer.before_model_request`、`chat.receive.before_process`、`chat.receive.after_process`、
+> `emoji.register.after_build_description`、`emoji.maisaka.before_select`、`message.get_by_id`、`message.get_by_time_in_chat`、
+> `emoji.*`、`config.get`、`database.query`、`llm.generate`、`send.emoji`、`send.text`、
+> `send.forward`、`send.image`、`render.html2png`、`api.call`）在 MaiBot 1.2.3 / 1.3.0
+> 与 maibot_sdk 2.8.0 / 2.8.2 上验证。manifest 声明的最低宿主版本为 1.2.3。
 >
 > 多段发送（`[response_splitter]` 的 `takeover`）需要 `send.text` 能力，
-> 「撤回重发」纠错分支需要 `api.call` 能力，**改动过 manifest 需完整重启 MaiBot**。
+> 「撤回重发」纠错分支需要 `api.call` 能力，`/bpp` 状态命令需要 `send.forward`（合并转发）、
+> `render.html2png`（一图流）与 `send.image`（转发降级直发），**改动过 manifest 需完整重启 MaiBot**。
 
-**版本变更**见 [`CHANGELOG.md`](CHANGELOG.md)（含每个版本的背景、根因与验证方式）。
+**版本变更**见 [`CHANGELOG.md`](CHANGELOG.md)（1.0.0 起记录功能变更，更早版本按次级版本号合并回溯）。
 
 ## 模块与前置条件（重要）
 
@@ -177,7 +184,7 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 | 5 | `[quote_reply_private_weights]` | 私聊引用回复的**权重** |
 | 6 | `[chinese_typo]` | 错别字：注入参数 + 纠正行为 |
 | 7 | `[chinese_typo_weights]` | 错字**纠正方式权重** |
-| 8 | `[response_splitter]` | 分段：分割参数 + 打字速度 + 接管机制 |
+| 8 | `[response_splitter]` | 分段：分割参数 + 打字速度 + 接管机制 + 异常兜底提示词 |
 | 9 | `[emoji_meaning]` | 表情包含义库（排在"分段"与"回复后表情包"之间） |
 | 10 | 其它功能 | `[emoji_after_reply]` / `[emoji_follow]` / `[text_rules]` / `[emoji_cooldown]` |
 
@@ -190,28 +197,6 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
    的值；填了值就以插件为准。**首次生成 `config.toml` 时插件会读宿主 `config/bot_config.toml` 的现值
    填进去**，所以默认看到的就是宿主当前值（想重新跟随宿主就把它清空）。每项都带一句行尾中文注释，
    同一句文案也会作为 WebUI 的**提示文本**显示（见下方「WebUI 显示与翻译」）。
-
-   #### 镜像字段的四级取值链路（重要）
-
-   "跟随宿主"不是一句空话 —— 它有一整条降级链，**前一级拿不到才退下一级**：
-
-   | 级别 | 情形 | 用哪个值 |
-   |---|---|---|
-   | ① | 插件配置里**填了具体值** | 用插件填的（用户显式覆盖，最优先） |
-   | ② | 插件配置**留空**（`""` / 「跟随宿主」） | 用宿主**运行时**配置快照（`ctx.config.get`） |
-   | ③ | 宿主快照**读不到**（能力异常 / 精简快照） | 退到 `modules/post_process_takeover.py` 的 `_POST_PROCESS_CONFIG_KEYS` **第 3 列** |
-   | ④ | 第 3 列即**最终代码层兜底** | 取自**发布者实机在用的 `config.toml`** |
-
-   也就是说：**插件配置默认留空 → 留空即跟随宿主 → 跟随宿主失败才用代码兜底**。
-   第 3 列刻意用"发布者实机验证过的一套参数"而不是宿主官方默认值，这样在宿主配置读不到时
-   得到的是**可用且符合预期**的行为。插件填了非法值（如数字框里写了 `abc`）同样按 ②→③ 降级。
-
-   | 兜底项 | 值 |
-   |---|---|
-   | `response_splitter.enable` / `max_length` / `max_sentence_num` / `max_split_num` | `true` / `512` / `8` / **`4`** |
-   | `response_splitter.enable_kaomoji_protection` / `enable_overflow_return_all` | `false` / **`true`** |
-   | `chinese_typo.enable` / `error_rate` / `min_freq` / `tone_error_rate` / `word_replace_rate` | `true` / `0.01` / `9` / `0.1` / `0.006` |
-   | `bot.nickname`（→ `fallback_nickname`） / `response_post_process.typing_speed` | **`普瑞赛斯`** / `1.0` |
 
    #### 镜像字段的四级取值链路（重要）
 
@@ -279,7 +264,7 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 | `[emoji_meaning]` | `max_meaning_length` | `20~1000` | 单条含义最大长度 |
 | `[emoji_meaning]` | `rewrite_scope` | — | 标签替换范围（`replyer` / `planner`，默认两者都开） |
 
-> 共 33 项有范围约束（配置面共 79 项）；其余项是布尔 / 三态开关 / 文本 / 列表，不受数值范围限制。
+> 共 33 项有范围约束（配置面共 81 项）；其余项是布尔 / 三态开关 / 文本 / 列表，不受数值范围限制。
 > 例外：`[chinese_typo] recall_delay_seconds`（撤回反应时间）不设范围校验——留空 = 按打字速度自动，
 > 填数字（支持小数点）就用它，负数按 `0` 处理。
 
@@ -349,7 +334,7 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 #### 同一消息只引用一次（`quote_once_per_target`，群聊/私聊各自独立）
 
 一条目标消息被引用过（本插件抽到引用/引用＋@，或被观测到以引用方式发出）之后，之后对该消息的任何
-回复都不再引用它（只可能直接回复或 @）。抽到"直接回复"**不消耗**这次机会。该规则优先于
+回复都不再引用它（**只可能直接回复**——该判定发生在回复方式抽取之前，@ 也不会再抽取）。抽到"直接回复"**不消耗**这次机会。该规则优先于
 「目标超时后强制直接回复」。
 
 #### @ 与正文之间的空格（四条路径 + 平台侧口径，0.13.17 起全统一）
@@ -569,6 +554,7 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 | `enable_overflow_return_all` | `跟随宿主` | 宿主【超限保留全文】：句子太多时直接保留完整回复，不再强行截断 |
 | `typing_speed` | 留空 | 宿主【打字速度】：模拟打字等待时间；`0` 最快，`1` 默认，`2` 更慢。留空 = 交给宿主按它自己的速度等待 |
 | `fallback_nickname` | 留空 | 宿主【bot · 昵称】：只用于复刻「回复过长/句子太多时回退默认回复」的文本（「<昵称>不知道哦」） |
+| `fallback_prompts` | 空 | **异常兜底提示词**（1.0.0）：触发「过长 / 句子太多」兜底时从这份列表**随机抽一条**发送，顶替宿主自带的兜底提示词；支持 `{bot_name}`（上面的自称生效值）与 `{user_name}`（要回复的那条消息的发送者名称，群名片优先，查不到替换为空）占位。留空 = 只用宿主自带；仅后处理接管生效时起作用，`/bpp fallback` 可实测 |
 | `yield_to_other_plugins` | `true` | **让位给其它插件**：别的插件已认领这轮文本后处理（`skip_post_process=True`，例如智能分段插件命中预分段缓存）时把分段让给它；`@/引用`、文本规则、表情包照常。关掉表示本插件无条件优先 |
 | `max_segments` | `0` | 分段条数上限，超过就退化成换行拼接一条（防刷屏）；`0` = 不额外限制，完全沿用宿主【最多分割条数】 |
 | `wait_timeout_seconds` | `30` | planner 请求与新入站消息等待本轮补发完成的秒数（超时放行，不阻塞宿主；`0` = 不等待）。补发（打字模拟）经常等不完时再**手动调大**本项；实际最长 55 秒（等待 Hook 上限 58 秒，见下） |
@@ -583,6 +569,9 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 - **第 2..N 段**：插件按顺序补发（`ctx.send.text(...)`），与宿主分段循环的 `typing=index>0`、
   历史同步口径一致；
 - **更正段**（`quote_previous`）：插件给该条发送注入引用指向上一段；
+- **合并压缩补回句间分隔符**：分段数超过【最多分割条数】、多段被压缩合并为一条消息时，
+  合并处**补回各段尾随的分隔符**，避免多句硬拼接成无标点长文本——**与 MaiBot 1.3.0 的
+  回复分割修复一致**（1.1.0 起同步，接管路径与宿主复刻路径都生效）；
 - **首段发送失败**：整轮放弃，不会出现"只发出尾巴"；
 - **时序守卫**：补发期间 planner 请求与新入站消息会先等待补发完成（超时放行）。
   两个等待处理器（`chat.receive.before_process` 与 `maisaka.planner.before_request`）
@@ -777,9 +766,9 @@ planner 先发表情后回复（15 秒内）时同样不会补发。发送前统
 
 ### `[emoji_meaning]` 表情包含义库
 
-> **默认不开启**：依赖宿主视觉模型任务的输出质量；token 消耗随**实际补录量**增长
+> **默认开启**：依赖宿主视觉模型任务的输出质量；token 消耗随**实际补录量**增长
 > （只走"planner 按需补录"，不会扫全库）。建议先在小范围会话观察
-> `已收录表情包含义` 日志的质量后再长期开启。配置节位于"分段"与"回复后表情包"之间。
+> `已收录表情包含义` 日志的质量，不需要时把 `enabled` 关掉。配置节位于"分段"与"回复后表情包"之间。
 
 宿主里每张表情包都带一个视觉模型生成的**情绪标签描述**（`images.description`），
 replyer 在上下文里看到的表情包就是这个标签（`[表情包: 描述]`）——只有"大致的情绪"，
@@ -816,6 +805,7 @@ replyer 在上下文里看到的表情包就是这个标签（`[表情包: 描�
 | 1 | 入站钩子 `chat.receive.after_process` | `raw_message` 里 `type=="emoji"` 组件的 `hash` 字段；存进会话桶，供 replyer 注入时回读 |
 | 2 | **上下文标签改写 + 内容追加**（0.13.7 起，形态见 0.13.9） | 从 item 文本前缀取 `msg_id="…"` → 查本地映射（入站时按 `message_id` 记下的 `[(hash, 描述)]`，**0 RPC**）→ 按组件顺序与文本里第 i 个标签对应；取不到再按描述回退匹配 |
 | 3 | **planner 按需补录** | 先用**文本**里的 `[表情包…]` 定位时间窗（文本里没有 hash）→ `message.get_by_time_in_chat` 拉回该窗口消息 → 再取组件 `hash` |
+| 4 | **出站观察者**（0.14.0 起） | `send_service.after_send` 载荷里 emoji 组件的 `hash`（按内部 `message_id` 记映射，bot 自己发的表情包也能"按 hash"注入） |
 | 5 | 注册钩子 `emoji.register.after_build_description` | 载荷里 `emoji.file_hash`（宿主注释：即 `Images.image_hash`） |
 | 兜底 | 抽样取图 `emoji.get_random` | 载荷**不含 hash**（只有 `base64/description/emotion`）→ 本地 `sha256_of_base64()` 按同一口径算出 key，才能和队列里的目标 hash 对上 |
 
@@ -1059,6 +1049,66 @@ planner 按需补录**不再重试它**——否则每轮 planner 都会把它�
   所以本插件的 13 个板块 docstring 一律一句话（12~23 字），设计说明与历史沿革写成类上方的
   `#` 注释保留在源码里。
 
+## /bpp 状态命令与异常兜底提示词（1.0.0）
+
+### `/bpp`：模块状态一图流（合并转发）
+
+在聊天里发送 `/bpp`（群聊/私聊均可，不需要引用消息），插件把当前各模块的状态
+**用合并转发发送**（`send.forward` 单节点），并逐级兜底：
+
+> **权限与门控**：两条 `/bpp` 子命令**仅 operator 可触发**——命令声明
+> `permission="operator"`（宿主按 `plugin.permission` 名单与 `command_permissions`
+> 判定，本地控制台天然放行），非 operator 在宿主侧即被拦截、不会消耗渲染/转发资源。
+> 状态查询**不受插件总开关限制**（插件 `[plugin] enabled` 关着也能查，排查
+> "为什么没生效"正需要它）；`/bpp fallback` 会真实发出消息，总开关关闭时会被插件
+> 拦截（见下）。
+
+1. **一图流优先**：状态先渲染成 HTML 卡片（全内联 CSS——宿主 `render.html2png`
+   默认禁止访问外网，外部图片/字体不会加载；动态文本一律转义），经
+   `render.html2png` 转成 PNG，转发节点里放 **image 段**；
+2. **渲染失败退文字**：渲染不可用（能力被拒 / 宿主没有渲染后端 / 超时 / 结果为空）时，
+   转发节点里放 **text 段**（逐行文字版状态）；
+3. **转发失败退直发**：适配器不支持合并转发时 `send.image` 直发状态图；
+   再失败 / 没有图时 `send.text` 发文字版。
+
+每条状态行综合**插件侧开关**（配置里开没开）与**宿主前置条件**（与启动日志
+`[模块状态]` 同一套判定）两个维度，四态展示：
+
+| 状态 | 含义 |
+|---|---|
+| `可用` | 插件开关开着，宿主前置条件也满足（不受制的模块恒可用） |
+| `已关闭` | 插件配置里关掉了 |
+| `静默` | **宿主开关没关**——detail 里写明要关哪个宿主开关。判定优先于「已关闭」：两个接管类模块即使插件开关也关着，宿主前置不满足时仍显示静默 |
+| `异常` | 含义库初始化失败（详见启动日志） |
+
+判定顺序：静默 → 已关闭 → 异常（含义库）→ 可用。
+
+卡片头部展示五项事实：插件版本、总开关、丰富回复门控、宿主丰富回复状态、异常兜底
+提示词摘要（宿主自带 / 自定义 N 条）；含义库收录条数、文本规则条数等明细在对应
+**模块行的说明**里。
+
+### `/bpp fallback`：实测异常兜底提示词
+
+**引用一条消息**后发送 `/bpp fallback`，插件按与真实兜底完全同源的逻辑抽一条兜底
+提示词（`[response_splitter] fallback_prompts` 自定义列表优先，留空退宿主自带的
+「<昵称>不知道哦」那组），替换 `{bot_name}` / `{user_name}` 占位（`user_name` =
+被引用消息的发送者名称，群名片优先），然后**以引用回复的方式**发出。测试消息不写入
+bot 的对话上下文（`sync_to_maisaka_history=False`），不污染记忆；发送与分段补发走
+同一通道（引用注入、文本规则照常生效），所见即真实兜底触发时的效果。未引用消息时
+回一条用法说明；**插件总开关（`[plugin] enabled`）关闭时直接拦截**——这是唯一会
+真实发出消息的 `/bpp` 子命令，插件停用时不应再触发发送（状态查询不受此限）。
+
+> 注意：测试消息是**真实以引用方式发出**的，因此会消耗被引用消息的「同一消息只引用
+> 一次」额度（之后对同一条消息的回复不再引用）——与"观测到任何来源的引用都算"的
+> 正式口径一致，属预期行为。
+
+> **异常兜底提示词的真实触发条件**在后处理接管的「过长 / 句子太多」守卫（见
+> `[response_splitter]`）：整条回复超过【单条最大长度】×2（西文占比 <10% 时）、
+> 或句子数超过【单条最大句数】且未开【超限保留全文】时，整条回复被替换成随机抽取的
+> 一条兜底提示词。因此自定义兜底提示词**仅在后处理接管生效时起作用**——宿主自己做
+> 后处理时兜底文本由宿主决定，插件无从介入。占位符替换发生在事件循环侧（查目标
+> 发送者复用引用回复接管的 TTL 缓存，通常不产生额外 RPC）；替换失败按原文发送。
+
 ## 与框架的分工
 
 - **回复后处理（错别字 + 分段 + 打字 + 更正段引用）**：0.10.0 起**完整复刻**，见
@@ -1101,7 +1151,7 @@ planner 按需补录**不再重试它**——否则每轮 planner 都会把它�
 
 ## 能力声明（capabilities）
 
-manifest 声明 **11** 项能力，与代码里的实际调用一一对应（审核时用 AST 双向对账过：
+manifest 声明 **14** 项能力，与代码里的实际调用一一对应（审核时用 AST 双向对账过：
 `self.ctx.<代理>.<方法>` 收集到的能力集合与 manifest **完全相同**，既没有"声明了没用到"，
 也没有"用了没声明"；`ctx.logger` / `ctx.paths` 不是能力代理，不计入）：
 
@@ -1109,13 +1159,16 @@ manifest 声明 **11** 项能力，与代码里的实际调用一一对应（审
 |---|---|
 | `api.call` | 走适配器公开 API 撤回消息（「撤回重发」纠错分支）。**口径说明**：`api.call` 本身是能触达适配器任意动作的宽口径能力，本插件只调**两个写死的撤回入口**（`adapter.napcat.message.delete_msg` 与兜底的 `adapter.napcat.action.call`，同一个 `delete_msg` 动作的两种适配器形态），且 `message_id` 一律取自**插件自己刚发出的消息**的发送回执——只撤自己刚发出去的消息，不撤用户消息、不调其它任何动作 |
 | `config.get` | 读宿主配置（模块前置条件判定、`留空 = 跟随宿主`） |
-| `message.get_by_id` | 取被回复消息（@ 目标、目标时间戳用于过旧判定） |
+| `message.get_by_id` | 取被回复消息（@ 目标、目标时间戳用于过旧判定、`/bpp fallback` 回查被引用消息的发送者） |
 | `message.get_by_time_in_chat` | 统计"目标之后已有多少条消息" |
 | `emoji.get_by_description` / `emoji.get_random` / `emoji.get_count` | 表情包抽取、含义库抽样与统计 |
 | `database.query` | 读宿主表情库的 **`Images` 表**：按图片 hash 查 `full_path`，含义生成时定位表情包文件（配置读取不走这里——宿主 `[chinese_typo]` 等配置走 `config.get` 与首次生成时的 `bot_config.toml` 直读，0.14.3 文案修正） |
 | `llm.generate` | 表情包含义的视觉模型生成 |
 | `send.emoji` | 补发 / 跟发表情包 |
-| `send.text` | 补发第 2..N 段与错字更正段 |
+| `send.text` | 补发第 2..N 段与错字更正段；`/bpp` 的文字兜底与用法提示 |
+| `send.forward` | `/bpp` 用合并转发发送模块状态（单节点：一图流 image 段，渲染失败退 text 段） |
+| `send.image` | `/bpp` 合并转发失败时直发状态一图流（降级链 转发 → 图片 → 文字） |
+| `render.html2png` | `/bpp` 状态卡片的一图流渲染（全内联样式、不访问外网、动态文本转义） |
 
 > **`api.call` 必须在 manifest 里声明**：宿主 `plugin_runtime/host/authorization.py` 的
 > 免声明白名单**只有** `api.replace_dynamic` 一项，其余能力一律按 manifest 令牌放行。
@@ -1158,15 +1211,16 @@ manifest 声明 **11** 项能力，与代码里的实际调用一一对应（审
 
   | 文件 | 职责 |
   |---|---|
-  | `plugin.py` | 配置模型、生命周期、共享基础设施（回复轮记录、文本规则、表情包功能），组合下面两个 mixin |
+  | `plugin.py` | 配置模型、生命周期、共享基础设施（回复轮记录、文本规则、表情包功能），组合下面三个 mixin |
   | `modules/requirements.py` | 各模块的宿主前置条件与可用性判定（纯逻辑，可离线单测） |
-  | `modules/post_process_takeover.py` | 后处理接管：Hook 1~5 + 多段发送 + 补发缓存 |
+  | `modules/post_process_takeover.py` | 后处理接管：Hook 1~5 + 多段发送 + 补发缓存 + 异常兜底提示词占位替换 |
   | `modules/quote_takeover.py` | 引用回复接管：权重抽取 + 过旧规则 + 同一消息只引用一次 |
-  | `post_processing.py` | 宿主后处理算法逐行复刻（纯逻辑，可离线单测） |
+  | `modules/status_command.py` | `/bpp` 状态命令（合并转发 + 一图流渲染 + 文字兜底）与 `/bpp fallback` 兜底测试（1.0.0） |
+  | `post_processing.py` | 宿主后处理算法逐行复刻（纯逻辑，可离线单测）+ 兜底提示词抽取 |
   | `emoji_meanings.py` / `text_rules.py` | 表情包含义库存储与提示词 / 文本规则解析 |
 
-  两个接管模块以 **mixin** 形式被插件类继承——SDK 用 `dir(instance)` 收集组件，继承来的
-  `@HookHandler` 一样会被注册；共享状态（`self._reply_rounds` 等）通过 `self` 访问。
+  两个接管模块与命令模块以 **mixin** 形式被插件类继承——SDK 用 `dir(instance)` 收集组件，继承来的
+  `@HookHandler` / `@Command` 一样会被注册；共享状态（`self._reply_rounds` 等）通过 `self` 访问。
 
 - 新增/调整"需要宿主关闭某能力"的模块时，只需改 `modules/requirements.py` 的
   `MODULE_REQUIREMENTS`，门控与启动日志会自动跟随。
@@ -1179,10 +1233,11 @@ manifest 声明 **11** 项能力，与代码里的实际调用一一对应（审
 
 - **派生自 MaiBot**（<https://github.com/Mai-with-u/MaiBot>，**GPL-3.0**）：`post_processing.py`
   复刻并**部分逐字复制**了宿主 `src/chat/utils/utils.py`（`process_llm_response_segments`）与
-  `src/chat/utils/typo_generator.py`（`ChineseTypoGenerator`）。这是本插件按 GPL-3.0-or-later
-  发布的原因，详见[作者与许可](#作者与许可)。**与宿主唯一有意不同的一处**：整词同音替换的
-  候选组合数加了一道硬上限（宿主穷举 `itertools.product` 无上限，长词会指数爆炸卡住线程），
-  超限时跳过该词的整词替换，并在日志里记账。
+  `src/chat/utils/typo_generator.py`（`ChineseTypoGenerator`），分段复刻已同步 MaiBot 1.3.0 的
+  回复分割修复。这是本插件按 GPL-3.0-or-later 发布的原因，详见[作者与许可](#作者与许可)。
+  **与宿主有意不同的几处**（README 各功能节有更详细的说明）：整词同音替换的候选组合数加了
+  硬上限（宿主穷举 `itertools.product` 无上限，长词会指数爆炸卡住线程）；`@昵称` 不参与错字
+  生成；异常兜底提示词可自定义。
 - **参考了**[saberlights/smart_segmentation_plugin](https://github.com/saberlights/smart_segmentation_plugin)
   （作者久远，GPL-3.0-or-later）的**多段发送思路**（`send_service.after_build_message` 登记待补发
   → `send_service.after_send` 用 `ctx.send.text(typing=…)` 补发 → `maisaka.planner.before_request` /
