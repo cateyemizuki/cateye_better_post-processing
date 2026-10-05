@@ -301,10 +301,12 @@ class PostProcessTakeoverMixin:
     # ------------------------------------------------------------------
 
     def _post_process_takeover_active(self) -> bool:
-        """框架后处理总开关关闭、且插件接管开关开启时，接管后处理。
+        """插件接管开关开启、且宿主**不在做错别字处理**时，接管后处理。
 
-        宿主前置条件（``response_post_process.enable_response_post_process`` 与
-        ``experimental.enable_rich_reply`` 都关闭）由 ``modules.requirements`` 判定；
+        宿主前置条件（二选一，见 ``modules.requirements``）：① 后处理总开关关闭
+        （``enable_response_post_process = false``，完整接管）；② 总开关开启但宿主错别字
+        关闭（``chinese_typo.enable = false``，错别字接管——接管后置 ``skip_post_process=True``
+        跳过宿主处理，分段与错别字都由本插件复刻执行）。另需「丰富回复」门控满足。
         未满足时本模块**完全静默**：不改写 response、不登记补发、不发任何消息。
         """
         if not self._plugin_enabled():
@@ -312,6 +314,18 @@ class PostProcessTakeoverMixin:
         if not bool(self.config.response_splitter.takeover):
             return False
         return self._module_available("post_process")
+
+    def _typo_takeover_mode(self) -> bool:
+        """是否处于「错别字接管」模式：宿主后处理总开关**开启**、但宿主错别字**关闭**。
+
+        该模式下宿主的原生错别字不会运行，接管的目的就是提供本插件的错字纠正——
+        因此处理器构建时 ``typo_enable`` 的「跟随宿主」视为开启（宿主值恒为 False，
+        照抄会让接管形同虚设）；插件显式选「关闭」仍然生效（见 ``_get_processor``）。
+        """
+        return (
+            self._cfg.get("response_post_process.enable_response_post_process") is True
+            and self._cfg.get("chinese_typo.enable") is False
+        )
 
 
     # ---- 宿主镜像参数：留空 = 跟随宿主 ----
@@ -402,14 +416,33 @@ class PostProcessTakeoverMixin:
                     sources[param] = "插件值"
             for param, cache_key in _HOST_ONLY_PROCESSOR_PARAMS:
                 params[param] = self._host_config_value(cache_key)
+            # 「错别字接管」模式（宿主后处理开启、错别字关闭，1.1.1 起）：宿主的错别字
+            # 不会运行，接管的目的就是提供本插件的错字纠正——因此 ``typo_enable`` 的
+            # 「跟随宿主」在此模式下视为开启（宿主值恒为 False，照抄会让接管形同虚设）；
+            # 插件显式选「开启 / 关闭」时仍以插件值为准。
+            if self._typo_takeover_mode() and not self._mirror_is_explicit("chinese_typo", "enable"):
+                params["typo_enable"] = True
+                sources["typo_enable"] = "错别字接管"
             # 自定义异常兜底提示词（1.0.0）：非空时接管路径的兜底改从这份列表随机抽取，
             # 模板里的 {bot_name}/{user_name} 占位符在事件循环侧替换（见
             # handle_before_post_process 的 _format_fallback_placeholders）。
             params["custom_fallback_prompts"] = self._custom_fallback_prompts()
+            # 错字黑名单（1.1.3）：名单里的字/词不被错字命中。默认空 = 关闭。
+            params["typo_blacklist"] = self._typo_blacklist()
             self._processor = PostProcessor(**params)
             self._processor_param_sources = sources
             self._log_effective_params(params, sources)
         return self._processor
+
+    def _typo_blacklist(self) -> List[str]:
+        """错字黑名单（``[chinese_typo] blacklist``）：去掉空白项、保持配置顺序。
+
+        空列表（默认）= 关闭：生成器两个集合都为空，逐字/整词替换行为与宿主完全一致。
+        """
+        raw = getattr(self.config.chinese_typo, "blacklist", None)
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(item).strip() for item in raw if str(item).strip()]
 
     def _log_effective_params(self, params: Dict[str, Any], sources: Dict[str, str]) -> None:
         """打印一次生效参数（含"插件值 / 宿主值"来源）。
@@ -419,7 +452,7 @@ class PostProcessTakeoverMixin:
         self.ctx.logger.info(
             "后处理接管参数：分段enable=%s(%s) 长度=%s 句数=%s 条数=%s 颜文字=%s 超限全文=%s | "
             "错字enable=%s(%s) error_rate=%s(%s) min_freq=%s(%s) tone=%s(%s) word=%s(%s) "
-            "昵称=%s(%s)",
+            "昵称=%s(%s) 黑名单=%s",
             params.get("splitter_enable"),
             sources.get("splitter_enable", "宿主值"),
             params.get("splitter_max_length"),
@@ -439,6 +472,7 @@ class PostProcessTakeoverMixin:
             sources.get("typo_word_replace_rate", "宿主值"),
             params.get("bot_nickname"),
             sources.get("bot_nickname", "宿主值"),
+            ("关闭" if not params.get("typo_blacklist") else "%d 条" % len(params.get("typo_blacklist") or ())),
         )
         if sources:
             stale = [
@@ -532,6 +566,41 @@ class PostProcessTakeoverMixin:
                 speed = 1.0
         return max(0.0, self._typing_seconds_for(recalled_text, speed))
 
+    def _private_no_recall_active(self) -> bool:
+        """私聊是否禁用撤回（``[chinese_typo] private_no_recall``，1.1.3，默认开启）。
+
+        **为什么要禁**：私聊里 bot 撤回自己刚发的消息时，适配器（如 NapCat）会把这条
+        撤回事件渲染成**"用户撤回了一条消息"**推回宿主——bot 的上下文里于是凭空多出一条
+        "对方撤回了一条消息"，而那条消息其实是 bot 自己发的。bot 无从分辨，很容易被
+        错误引导：追问对方撤回了什么、道歉、把上下文理解偏。
+        而纠错的本质是"bot 自己打错字自己改"，完全没有必要用撤回这种会污染上下文的手段，
+        私聊里用「引用发送」或「直接发送」表达纠正就够了。
+
+        群聊不受影响：群里撤回是正常的群聊行为，也不会被渲染成"用户撤回"。
+
+        开关关闭（``False``）时本判定恒返回 ``False``，私聊也照常撤回（回到旧行为）。
+        """
+        return bool(getattr(self.config.chinese_typo, "private_no_recall", True))
+
+    def _skip_recall_in_session(self, session_id: str) -> bool:
+        """本会话是否**不把撤回放进抽签池**（私聊 + 开关开启时）。
+
+        判定用会话 id 而非出站 message：本方法要在 ``handle_before_post_process`` 里、
+        ``plan()`` **抽签之前**调用，而那时手上只有 ``session_id``（出站 message 尚未构造）。
+        ``_group_sessions``（入站 Hook 记录的群聊会话）里没有该 id ⇒ 视为私聊——
+        与 ``_is_group_message`` 的退路口径一致（会话类型不会变，所以这个记忆是可靠的）。
+
+        **注意语义**：这里不是"抽到撤回再当作撤回失败"，而是**从抽签池里直接剔除 recall**
+        ——抽签结果的概率在剩余方式（direct / quote / none）上重新归一化，压根不会产生
+        任何撤回动作，也不会出现"抽到 recall 却走了兜底"这种观感。
+        """
+        if not self._private_no_recall_active():
+            return False
+        normalized = str(session_id or "").strip()
+        if not normalized:
+            return True  # 会话未知：按私聊处理，宁可少撤回
+        return normalized not in self._group_sessions
+
     async def _format_fallback_placeholders(
         self, segments: List[ProcessedResponseSegment], reply_message_id: str
     ) -> List[ProcessedResponseSegment]:
@@ -608,6 +677,12 @@ class PostProcessTakeoverMixin:
         "最后纠正"**不在池子里**——它是"把抽到的纠正推迟到本轮分段发完之后"，由
         ``_should_defer_correction`` 单独决定（见 ``[chinese_typo_weights]`` 的 last_correction_*）。
 
+        **私聊禁用撤回（1.1.3）**：``self._recall_banned_for_run`` 为真（私聊 + 开关开启，
+        由 ``handle_before_post_process`` 在 ``plan()`` 前置位）时，``recall`` **完全不进
+        候选池**——它的权重被剔除，剩余方式的概率自动重新归一化。这样抽签结果里根本不会
+        出现"撤回"，也就不存在"抽到撤回再兜底"的中间态（语义更干净：私聊只是不提供撤回
+        这个选项，其余方式按原权重比例照常抽）。
+
         **本方法在工作线程里执行，不要碰 ``self.ctx``**：日志在回到事件循环后再统一记录
         （见 ``handle_before_post_process`` 里的"错字纠正方式"日志）。
         """
@@ -619,6 +694,9 @@ class PostProcessTakeoverMixin:
             "recall": max(0, int(getattr(cfg, "weight_correction_recall", 0))),
             "none": max(0, int(getattr(cfg, "weight_correction_none", 0))),
         }
+        if getattr(self, "_recall_banned_for_run", False):
+            # 私聊禁用撤回：直接从池子里剔除 recall（不是"抽到了再降级"）。
+            weights["recall"] = 0
         styles = [name for name, weight in weights.items() if weight > 0]
         if not styles:
             return "none"
@@ -971,6 +1049,10 @@ class PostProcessTakeoverMixin:
         ``first_text``：**首段**（由宿主发出）的正文。撤回反应时间留空时按"被撤回那条的
         打字时长"自动决定，首段的正文只能由调用方传进来（``handle_after_build_message``
         登记的那份）。
+
+        **私聊不会出现 ``recall`` 动作**：私聊禁用撤回是在 ``_choose_correction_mode``
+        **抽签阶段**就把 recall 从权重池里剔除（见 ``_skip_recall_in_session``），
+        因此本序列里根本不会构建出撤回项——无需在此处再做任何"降级"判断。
         """
         previous_id = previous_message_id
         previous_text = first_text
@@ -1096,8 +1178,8 @@ class PostProcessTakeoverMixin:
         "maisaka.reply.before_post_process",
         name="post_process_takeover",
         description=(
-            "blocking：框架【回复后处理总开关】关闭时，以与 MaiBot 完全一致的原逻辑接管"
-            "错别字注入与分段，并把结果写回 response"
+            "blocking：宿主不在做错别字处理时（后处理总开关关闭，或总开关开启但宿主错别字"
+            "关闭），以与 MaiBot 完全一致的原逻辑接管错别字注入与分段，并把结果写回 response"
         ),
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
@@ -1134,6 +1216,12 @@ class PostProcessTakeoverMixin:
         enable_splitter = bool(modified.get("enable_splitter", True))
         enable_typo = bool(modified.get("enable_chinese_typo", True))
         processor = self._get_processor()
+        # 私聊禁用撤回（1.1.3）：在**抽签之前**判定，让 `_choose_correction_mode` 把 recall
+        # 从权重池里剔除。判据用 session_id（此刻出站 message 还没构造，见 `_skip_recall_in_session`）。
+        # 这里必须先置位、并在 finally 里复位，避免残留影响后续轮次。
+        self._recall_banned_for_run = self._skip_recall_in_session(
+            str(modified.get("session_id") or "").strip()
+        )
         try:
             # 0.12.0 起接管**恒走 plan()**：错字纠正方式完全由权重池决定（"宿主原逻辑"分支已随
             # ``correction_mode_enabled`` 开关一起移除；``process()`` 只作为与宿主逐行对齐的
@@ -1155,11 +1243,15 @@ class PostProcessTakeoverMixin:
         except Exception as exc:
             self.ctx.logger.warning("后处理接管执行失败，回退为框架默认: %s", exc)
             return {"action": "continue", "modified_kwargs": modified}
+        finally:
+            # 抽签已完成，立刻复位，避免残留标记影响后续轮次 / 其它会话。
+            self._recall_banned_for_run = False
 
         # 每轮一行诊断：宿主开关 / 复刻参数 / 本轮错字统计。**"改了错字概率却没反应"只能看这行**：
         # 「错字总开关=False」= 宿主总开关或本插件参数关着；「真出现错字=0」= 错字压根没生成
-        # （error_rate 太小 / min_freq 太高 / 词频表异常）；「真出现错字>0 但判定纠正=0」= 权重池
-        # 抽到"不纠正"（正常）；「回复里有错字但真出现错字=0」= 宿主那半句 0.5 门控把整句换成了正确句。
+        # （error_rate 太小 / min_freq 太高 / 词频表异常 / 全被黑名单挡掉）；
+        # 「真出现错字>0 但判定纠正=0」= 撞了超限闸门，或权重池抽到"不纠正"（看后面两个计数区分）；
+        # 「生成错字>0 但真出现错字=0」= 宿主那半句 0.5 门控把整句换成了正确句。
         stats = dict(getattr(processor, "last_stats", {}) or {})
         # 整词同音替换因组合数超上限而跳过的**累计**次数（见 post_processing._MAX_HOMOPHONE_COMBINATIONS）：
         # 宿主原逻辑在长词上会卡死，本插件加了硬上限，非 0 就说明确实撞上了那个规模。
@@ -1167,6 +1259,28 @@ class PostProcessTakeoverMixin:
             combo_skips = int(getattr(processor._get_typo_generator(), "_word_combo_skips", 0) or 0)
         except Exception:  # 生成器还没建起来（本轮没走错字）→ 视为 0
             combo_skips = 0
+        # 因命中错字黑名单而跳过的**累计**次数（字 + 词，1.1.3 新增）。
+        try:
+            blacklist_skips = int(getattr(processor._get_typo_generator(), "_blacklist_skips", 0) or 0)
+        except Exception:
+            blacklist_skips = 0
+        # 「撞 correction_max_cjk 而未纠正」的句子数（1.1.3 新增）。旧实现在这条分支静默
+        # continue，日志上「撞超限」与「权重池抽到 none」完全无法区分——排查最费时间的地方。
+        overlong_skips = int(stats.get("correction_skipped_overlong") or 0)
+        # 「生成器认为改动了、但被可见性门控换回正确句」的句子数（1.1.3 新增）：
+        # = 生成数 − 可见数，非 0 说明日志里的"没看到错字"是 0.5 门控造成的，不是生成失败。
+        visible_typos = int(stats.get("typo_sentences") or 0)
+        generated_typos = int(stats.get("typo_generated") or 0)
+        gate_hidden = max(0, generated_typos - visible_typos)
+        extra_parts = []
+        if overlong_skips:
+            extra_parts.append("超限未纠正=%d 句" % overlong_skips)
+        if gate_hidden:
+            extra_parts.append("可见性门控隐藏=%d 句" % gate_hidden)
+        if combo_skips:
+            extra_parts.append("整词替换跳过=%d(累计)" % combo_skips)
+        if blacklist_skips:
+            extra_parts.append("黑名单跳过=%d(累计)" % blacklist_skips)
         self.ctx.logger.info(
             "后处理接管统计：宿主开关[分段=%s 错字=%s] 生效参数[错字总开关=%s error_rate=%s(源%s) "
             "min_freq=%s tone=%s word_replace=%s 分段=%s 最多条数=%s] → 真出现错字=%s 句、"
@@ -1184,7 +1298,7 @@ class PostProcessTakeoverMixin:
             stats.get("typo_sentences"),
             stats.get("corrections"),
             len(segments),
-            ("、整词替换跳过=%d(累计)" % combo_skips) if combo_skips else "",
+            ("、" + "、".join(extra_parts)) if extra_parts else "",
         )
 
         # 自定义异常兜底提示词的占位替换（1.0.0）：仅兜底早退路径（过长/句子太多，

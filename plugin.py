@@ -95,11 +95,11 @@
    Ciallo 消息）一律不动；宿主已设置 ``set_reply`` 的发送也不重复处理。轮记录在
    "回复后表情包"判定完成后仍然保留（只标记 ``emoji_done``），否则 4 秒静默后
    分段才发出的回复会因记录消失而退化为逐条抽取。
-   @ 注入形态由 ``[plugin] at_trailing_space`` 决定（**按宿主版本选**）：
-   ``false``（MaiBot 1.2.5 起的默认）→ ``[at, 正文]``，宿主渲染时 ``" ".join`` 自己补一个空格；
-   ``true``（1.2.5 以前应开启）→ ``[at, " ", 正文]``，补一个显式空格组件（宿主那时不插，
-   不补的话 QQ 里 ``@昵称`` 会与正文粘连）。两种口径下正文自带的前导空白都会先被抹掉，
-   已带前导 at 时不重复 @。详见 README「@ 与正文之间的空格」。
+   @ 注入形态由 ``[plugin] at_trailing_space`` 决定（默认开）：
+   ``true`` → ``[at, " ", 正文]``，补一个显式空格组件（宿主自己补的空格只对宿主
+   attach_at 的 @ 生效，插件注入的 @ 不补就会与正文粘连）；
+   ``false`` → ``[at, 正文]``，不补空格。两种口径下正文自带的前导空白都会先被抹掉，
+   已带前导 at 时不重复 @。详见 docs/CONFIG.md「@ 与正文之间的空格」。
    同一轮回复只抽取一次（首段生效），后续分段保持原样——与宿主分段语义一致
    （分段循环里仅首段携带对目标消息的引用意图，错别字更正段由宿主原生引用）。
 3. 回复后表情包（``[emoji_after_reply]``）：以 ``maisaka.reply.before_post_process``
@@ -213,11 +213,12 @@ from .modules.post_process_takeover import (
     read_host_config_values,
     PostProcessTakeoverMixin,
 )
+from .modules.empty_reply_fallback import EmptyReplyFallbackMixin
 from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.status_command import StatusCommandMixin
 from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
 
-SUPPORTED_CONFIG_VERSION = "1.1.0"
+SUPPORTED_CONFIG_VERSION = "1.1.3"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -255,8 +256,13 @@ _MEANING_SCAN_WINDOW_PAD_SECONDS = 2.0
 # 入站载荷自带 base64 的缓存条数（够生成循环一两轮用；用不上就按 hash 读宿主图片文件）。
 _MEANING_INLINE_BYTES_MAX = 8
 
-# 过期含义淘汰的最小间隔（秒）：淘汰是整表 DELETE，没必要每轮都跑。
+# 过期含义淘汰的最小间隔（秒）：淘汰分批删除，没必要每轮都跑。
 _MEANING_PURGE_MIN_INTERVAL_SECONDS = 3600.0
+
+# 表情包 hash 的合法形态：宿主全链路的图片身份是 sha256 十六进制串（``Images.image_hash``
+# 口径一致）。按 hash 拼图片路径 / 查库前先校验——防御纵深：即使有三重兜底（后缀固定、
+# 根目录包含校验、8MB 上限），也不让伪造的"hash"借道去读宿主根目录内任意带图片后缀的文件。
+_IMAGE_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 
 # 入站消息 → 表情包引用 的本地映射：reply 路径按 ``message_id`` 直接定位（0 RPC）。
 # **纯缓存**：宿主消息库里本来就有 ``message_id`` + 组件 ``hash``，丢了由 ``message.get_by_id``
@@ -400,29 +406,14 @@ class PluginSectionConfig(PluginConfigBase):
         },
     )
     at_trailing_space: bool = Field(
-        default=False,
-        description=(
-            "注入真实 @ 时是否**额外补一个空格组件**。"
-            "**按宿主版本选**（官方文档 v1.2.5 附录 B-5「富回复每个 @ 组件后增加空格」）："
-            "**MaiBot 1.2.5 起应关闭**（宿主富回复自己会在每个 @ 组件后插一个空格组件，"
-            "`builtin_tool/context.py` 的 `at_prefix_components.extend([at_component, TextComponent(\" \")])`，"
-            "插件再补就是两个）；**1.2.5 以前（不含 1.2.5）应开启**"
-            "（那时宿主是 `at_components + …`、**不插空格**，插件不补的话 @ 与正文会贴在一起）。"
-            "注意：宿主渲染出站纯文本时用 `\" \".join` 拼接组件，所以开启后纯文本里会出现三个空格"
-            "（并跟着 `processed_plain_text` 进消息库、上下文与记忆抽取）——"
-            "这是「平台侧不粘连」与「纯文本好看」之间的取舍，1.2.5+ 的宿主两者都不需要插件操心"
-        ),
+        default=True,
+        description="注入 @ 时是否额外补一个空格组件。",
         json_schema_extra={
-            "label": "@ 后补空格组件（1.2.5 起关闭 / 1.2.5 以前开启）",
-            "x-toml-comment": (
-                "注入 @ 时是否额外补一个空格组件。MaiBot 1.2.5 起应关闭（宿主自己会补）；"
-                "1.2.5 以前（不含 1.2.5）应开启（宿主不补，会与正文粘连）。"
-            ),
+            "label": "@ 后补空格组件",
+            "x-toml-comment": "注入 @ 时是否额外补一个空格组件。",
             **_ui_i18n(
-                "Trailing space after @ (off since MaiBot 1.2.5)",
-                "Whether to inject an extra space component after the mention. Turn OFF on MaiBot 1.2.5+ "
-                "(the host already inserts one after every @ component); turn ON for older hosts "
-                "(before 1.2.5) which insert none and would otherwise glue the mention to the text.",
+                "Trailing space after @",
+                "Whether to inject an extra space component after the mention.",
             ),
         },
     )
@@ -992,12 +983,16 @@ class ChineseTypoSectionConfig(PluginConfigBase):
         default="跟随宿主",
         description=(
             "宿主【启用错别字】：让麦麦偶尔打错字，更像真人聊天。"
-            "跟随宿主 / 开启 / 关闭（关闭后不会注入任何错字，也就不会有纠正消息）"
+            "跟随宿主 / 开启 / 关闭（关闭后不会注入任何错字，也就不会有纠正消息）。"
+            "宿主后处理开启但错别字关闭时由本插件接管错别字：此时「跟随宿主」视为开启"
+            "（宿主值恒为关），显式选「关闭」才会不注入"
         ),
         json_schema_extra={
             "label": "启用错别字",
-            "x-toml-comment": "让麦麦偶尔打错字，更像真人聊天。「跟随宿主」= 用宿主的值。",
-            **_ui_i18n("Enable Chinese typo", "Follow host / on / off."),
+            "x-toml-comment": "让麦麦偶尔打错字，更像真人聊天。「跟随宿主」= 用宿主的值；"
+                              "宿主后处理开启而错别字关闭（错别字由本插件接管）时，「跟随宿主」视为开启。",
+            **_ui_i18n("Enable Chinese typo", "Follow host / on / off. In typo-takeover mode "
+                                              "(host post-process on, host typo off) follow-host means on."),
         },
     )
     error_rate: _HostFloat = Field(
@@ -1064,6 +1059,31 @@ class ChineseTypoSectionConfig(PluginConfigBase):
             **_ui_i18n("Recall fallback", "quote (default) / direct / none."),
         },
     )
+    private_no_recall: bool = Field(
+        default=True,
+        description=(
+            "私聊禁用撤回（**默认开启**）：私聊里**根本不抽「撤回重发」**——recall 在**抽签阶段**"
+            "就从权重池里剔除，剩余方式（direct / quote / none）按原权重比例重新归一化抽取，"
+            "所以私聊里不会产生任何撤回动作（不是「抽到撤回再降级」）。"
+            "原因：私聊中 bot 撤回自己的消息时，适配器会把这条撤回**显示成「是用户撤回了消息」**，"
+            "于是 bot 的上下文里会出现一条「对方撤回了一条消息」——它会误以为是用户撤回了什么，"
+            "从而被错误引导（追问、道歉、「你撤回了什么」之类），而实际上只是 bot 自己纠正错字。"
+            "群聊不受影响（群里撤回就是 bot 自己撤回，语义正确）。关闭本项 = 私聊也照常抽撤回"
+        ),
+        json_schema_extra={
+            "label": "私聊禁用撤回",
+            "x-toml-comment": (
+                "私聊里不把「撤回重发」放进抽签池（私聊撤回会被适配器显示成「用户撤回」，可能误导 bot）。"
+                "默认开启，群聊不受影响。"
+            ),
+            **_ui_i18n(
+                "No recall in private chats",
+                "Recall is removed from the pick pool entirely in private chats (never drawn), because "
+                "adapters may render the bot's own recall as the USER recalling a message, which "
+                "misleads the bot. On (default); group chats unaffected.",
+            ),
+        },
+    )
     recall_delay_seconds: _OptionalFloat = Field(
         default="",
         description=(
@@ -1078,6 +1098,29 @@ class ChineseTypoSectionConfig(PluginConfigBase):
             **_ui_i18n(
                 "Recall delay (s)",
                 "Empty = derived from typing speed; 0 = recall immediately.",
+            ),
+        },
+    )
+    blacklist: List[str] = Field(
+        default_factory=list,
+        description=(
+            "错字黑名单：名单里的**字或词**不会被错别字命中，保持原样。"
+            "每条填一个字（如「爱」）或一个词（如「麦麦」）——"
+            "填字：该字不会被改成错字，别的字也不会被错改成它；"
+            "填词：整词不被替换，且词内每个字也一并受保护。"
+            "**留空（默认）= 关闭**。错字总开关关闭时本项无效。"
+            "用来避免把人名、专有名词、关键字打错"
+        ),
+        json_schema_extra={
+            "label": "错字黑名单",
+            "x-toml-comment": (
+                "名单里的字/词不会被错字命中（原样保留）。每行一条，填字或词。留空 = 关闭。"
+            ),
+            "rows": 4,
+            **_ui_i18n(
+                "Typo blacklist",
+                "Characters/words that must never be hit by typo generation. "
+                "One entry per line (a single char or a multi-char word). Empty (default) = off.",
             ),
         },
     )
@@ -1366,12 +1409,53 @@ class ResponseSplitterSectionConfig(PluginConfigBase):
     )
 
 
+class EmptyReplyFallbackSectionConfig(PluginConfigBase):
+    """为空回复补一条兜底消息（默认关闭）。"""
+
+    __ui_label__ = "空回复兜底"
+    __ui_icon__ = "reply"
+    __ui_order__ = 8
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "Empty Reply Fallback",
+            "description": (
+                "When replyer produced no visible text at all (model returned empty content), "
+                "send one fallback message instead of staying silent."
+            ),
+        },
+    }
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "空回复兜底：replyer **一条正文都没生成**时（模型返回空内容，或后处理前 Hook 把正文清空），"
+            "插件补一条兜底消息，避免「bot 已读不回」。"
+            "文本复用上面【异常兜底提示词】那一组（同一份列表、同样的 {bot_name}/{user_name} 占位符；"
+            "列表为空时用宿主自带的兜底提示词），「兜底回复的自称」也取上面的值。"
+            "只在正文与 output_items 都取不到文本、且没有工具调用时才介入"
+            "（模型先调工具再发正文属正常流程，不会被当成失败）。"
+            "默认关闭 = 与宿主行为完全一致（不补）"
+        ),
+        json_schema_extra={
+            "label": "启用空回复兜底",
+            "x-toml-comment": (
+                "replyer 没生成任何正文时补一条兜底消息（复用【异常兜底提示词】）。"
+                "默认关闭 = 与宿主一致。"
+            ),
+            **_ui_i18n(
+                "Enable empty reply fallback",
+                "Send one fallback message when replyer produced no visible text at all. Off = host behavior.",
+            ),
+        },
+    )
+
+
 class EmojiAfterReplySectionConfig(PluginConfigBase):
     """整轮回复没带表情包时按概率补发一张。"""
 
     __ui_label__ = "回复后表情包"
     __ui_icon__ = "mood"
-    __ui_order__ = 9
+    __ui_order__ = 10
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Emoji After Reply",
@@ -1499,7 +1583,7 @@ class EmojiFollowSectionConfig(PluginConfigBase):
 
     __ui_label__ = "表情包跟风"
     __ui_icon__ = "emoji_emotions"
-    __ui_order__ = 10
+    __ui_order__ = 11
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Emoji Follow",
@@ -1598,7 +1682,7 @@ class EmojiCooldownSectionConfig(PluginConfigBase):
 
     __ui_label__ = "表情包冷却"
     __ui_icon__ = "timer"
-    __ui_order__ = 12
+    __ui_order__ = 13
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Emoji Cooldown",
@@ -1641,7 +1725,7 @@ class TextRulesSectionConfig(PluginConfigBase):
 
     __ui_label__ = "文本替换规则"
     __ui_icon__ = "find_replace"
-    __ui_order__ = 11
+    __ui_order__ = 12
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Text Rules",
@@ -1689,7 +1773,7 @@ class EmojiMeaningSectionConfig(PluginConfigBase):
 
     __ui_label__ = "表情包含义库"
     __ui_icon__ = "image_search"
-    __ui_order__ = 8
+    __ui_order__ = 9
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Emoji Meaning Library",
@@ -1834,7 +1918,8 @@ class BetterPostProcessingConfig(PluginConfigBase):
     2. ``[quote_reply]`` 引用回复 → ``[quote_reply_weights]`` 它的权重 →
        ``[quote_reply_private]`` 引用回复（私聊）→ ``[quote_reply_private_weights]`` 它的权重；
     3. ``[chinese_typo]`` 错别字 → ``[chinese_typo_weights]`` 它的纠正方式权重；
-    4. ``[response_splitter]`` 分段（分割参数 + 打字速度 + 接管机制）；
+    4. ``[response_splitter]`` 分段（分割参数 + 打字速度 + 接管机制）→
+       ``[empty_reply_fallback]`` 空回复兜底（复用前者的兜底提示词）；
     5. ``[emoji_meaning]`` 表情包含义库（排在"分段"与"回复后表情包"之间）；
     6. 其它功能节（回复后表情包 / 表情包跟风 / 文本替换规则 / 表情包冷却）。
 
@@ -1861,6 +1946,10 @@ class BetterPostProcessingConfig(PluginConfigBase):
     )
     # ---- 分段 ----
     response_splitter: ResponseSplitterSectionConfig = Field(default_factory=ResponseSplitterSectionConfig)
+    # ---- 空回复兜底（默认关闭；复用 [response_splitter] 的兜底提示词）----
+    empty_reply_fallback: EmptyReplyFallbackSectionConfig = Field(
+        default_factory=EmptyReplyFallbackSectionConfig
+    )
     # ---- 表情包含义库（放在"分段"与"回复后表情包"之间）----
     emoji_meaning: EmojiMeaningSectionConfig = Field(default_factory=EmojiMeaningSectionConfig)
     # ---- 其它功能 ----
@@ -1870,7 +1959,13 @@ class BetterPostProcessingConfig(PluginConfigBase):
     emoji_cooldown: EmojiCooldownSectionConfig = Field(default_factory=EmojiCooldownSectionConfig)
 
 
-class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostProcessTakeoverMixin, MaiBotPlugin):
+class BetterPostProcessingPlugin(
+    StatusCommandMixin,
+    QuoteTakeoverMixin,
+    PostProcessTakeoverMixin,
+    EmptyReplyFallbackMixin,
+    MaiBotPlugin,
+):
     """回复后处理接管、回复方式抽取、表情包互动与出站文本规则增强插件。
 
     两个"接管"模块（引用回复接管 / 后处理接管）的实现分别在
@@ -1878,6 +1973,7 @@ class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostPro
     形式组合进来（SDK 用 ``dir(instance)`` 收集组件，继承的 HookHandler 一样会被注册）；
     各自的前置条件（需要宿主关闭哪些能力）由 ``modules/requirements.py`` 统一判定。
     ``/bpp`` 状态命令与兜底测试命令在 ``modules/status_command.py``（同为 mixin）。
+    ``modules/empty_reply_fallback.py`` 负责"replyer 一条正文都没生成"时的兜底补发。
     本类保留共享基础设施：回复轮记录、文本规则、表情包相关功能。
     """
 
@@ -1949,6 +2045,7 @@ class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostPro
         # 后台任务集合（on_unload 时统一取消）。
         self._tasks: set[asyncio.Task] = set()
         self._init_post_process_takeover()
+        self._init_empty_reply_fallback()
 
     # ------------------------------------------------------------------
     # 配置生成（宿主现值作为默认值 + 给 config.toml 补行尾注释）
@@ -2137,6 +2234,16 @@ class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostPro
         takeover_active = self._post_process_takeover_active()
         # 模块可用性（前置条件：需要宿主关闭哪些能力）：启动时打印一次，配置变更时再打印。
         self._log_module_status(reason="启动")
+        if takeover_active:
+            # 显著说明等待钩子的体验代价（1.1.2）：补发期间两个 BLOCKING 等待钩子会把
+            # 新入站消息 / planner 请求最多拖住约 55 秒（钩子上限 58s − 3s 收尾余量）。
+            self.ctx.logger.info(
+                "后处理接管：分段补发期间，planner 请求与新入站消息会先等待本轮补发完成"
+                "（当前 wait_timeout_seconds=%s；实际等待最长 55 秒——极端情况下新消息处理"
+                "最多延迟约 55 秒。不想等待就把 [response_splitter] wait_timeout_seconds "
+                "设为 0，或调小该值）",
+                self.config.response_splitter.wait_timeout_seconds,
+            )
         if takeover_active:
             # 提前构建一次处理器：依赖缺失（jieba / pypinyin）时在此显式报错，
             # 而不是等到第一条回复才在 Hook 里静默降级。
@@ -3475,6 +3582,36 @@ class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostPro
             self.ctx.logger.warning("表情包跟风执行失败: %s", exc)
 
     # ------------------------------------------------------------------
+    # Hook 5：replyer 空回复兜底（生成可见回复失败时补一条兜底消息）
+    # ------------------------------------------------------------------
+
+    @HookHandler(
+        "maisaka.replyer.after_response",
+        name="empty_reply_fallback",
+        description=(
+            "blocking：replyer 生成的正文为空（模型返回空内容 / 后处理前 Hook 清空）且无工具调用时，"
+            "把 response 改写成一条兜底提示词（默认关闭；文本复用 [response_splitter] 的异常兜底提示词）"
+        ),
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_replyer_after_response_fallback_hook(self, **kwargs: Any) -> Dict[str, Any]:
+        """空回复兜底的 Hook 入口（实现见 ``modules/empty_reply_fallback.py``）。
+
+        为什么挂这里：宿主 ``src/maisaka/builtin_tool/reply.py`` 在生成可见回复失败时
+        直接 ``return build_failure_result(...)``（第 420 行），**根本不会调用**
+        ``maisaka.reply.before_post_process``（第 434 行在前面的 return 之后），
+        所以后处理接管看不到这一轮。唯一能补兜底的点是宿主
+        ``maisaka_generator_base.py:1317-1337``：这里回传的 ``response`` 会被采纳并写回
+        ``generation_result``，宿主随后照常发送 —— 于是一条兜底消息就能发出去。
+
+        BLOCKING/**LATE**：其它插件若也挂这个 Hook（NORMAL）先跑，它们改写出的非空正文
+        会被本处理器识别为"已有正文"而放行，不做二次覆盖。
+        """
+        return await self.handle_replyer_after_response_fallback(**kwargs)
+
+    # ------------------------------------------------------------------
     # 表情包获取与发送
     # ------------------------------------------------------------------
 
@@ -4073,7 +4210,7 @@ class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostPro
                 self._prune_stale_state(time.monotonic())
                 if self.config.emoji_meaning.enabled and self._meaning_store is not None:
                     self._flush_meaning_usage()
-                    self._purge_expired_meanings()
+                    await self._purge_expired_meanings()
                     await self._process_meaning_batch()
             except asyncio.CancelledError:
                 return
@@ -4095,8 +4232,12 @@ class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostPro
         except Exception as exc:
             self.ctx.logger.debug("回写表情包含义使用时间失败: %s", exc)
 
-    def _purge_expired_meanings(self) -> None:
-        """按 ``meaning_ttl_days`` 淘汰长期没用过的含义（0 = 不淘汰）；每小时最多跑一次。"""
+    async def _purge_expired_meanings(self) -> None:
+        """按 ``meaning_ttl_days`` 淘汰长期没用过的含义（0 = 不淘汰）；每小时最多跑一次。
+
+        分批删除（每批 500 条，批间 ``await asyncio.sleep(0)`` 让出事件循环）：
+        含义库很大时整表 DELETE 会瞬时阻塞循环（1.1.2 起改为分批）。
+        """
         ttl_days = int(self.config.emoji_meaning.meaning_ttl_days or 0)
         if ttl_days <= 0 or self._meaning_store is None:
             return
@@ -4104,15 +4245,21 @@ class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostPro
         if now - self._meaning_purge_at < _MEANING_PURGE_MIN_INTERVAL_SECONDS:
             return
         self._meaning_purge_at = now
+        removed_total = 0
         try:
-            removed = self._meaning_store.purge_expired(ttl_days, time.time())
+            while True:
+                removed = self._meaning_store.purge_expired_batch(ttl_days, time.time())
+                removed_total += removed
+                if removed < 500:
+                    break
+                await asyncio.sleep(0)
         except Exception as exc:
             self.ctx.logger.warning("淘汰过期表情包含义失败: %s", exc)
             return
-        if removed:
+        if removed_total:
             self.ctx.logger.info(
                 "已淘汰 %d 条 %d 天未使用的表情包含义（剩余 %d 条）",
-                removed,
+                removed_total,
                 ttl_days,
                 self._meaning_store.count(),
             )
@@ -4332,9 +4479,15 @@ class BetterPostProcessingPlugin(StatusCommandMixin, QuoteTakeoverMixin, PostPro
         顺序：① ``data/images/<hash>.<ext>`` 约定路径；② ``Images`` 表按 ``image_hash`` 查
         ``full_path`` 再读（跳过 ``no_file_flag``）。两者都要求路径落在宿主根目录内——
         部署成 Docker / 远程（宿主文件不在本机）时自然失败，交由 ``emoji.get_random`` 抽样兜底。
+
+        hash 取自入站消息 emoji 组件等外部来源，拼路径前先校验为 64 位十六进制
+        （与 ``Images.image_hash`` 的 sha256 口径一致，合法 hash 零误伤）；不合法直接拒绝。
         """
         normalized_hash = str(image_hash or "").strip()
         if not normalized_hash:
+            return None
+        if not _IMAGE_HASH_PATTERN.fullmatch(normalized_hash):
+            self.ctx.logger.debug("拒绝非 64 位十六进制的表情包 hash: %s", normalized_hash[:12])
             return None
         for root in self._resolve_host_roots():
             images_dir = root / "data" / "images"

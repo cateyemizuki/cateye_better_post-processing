@@ -4,3 +4,33 @@ __pycache__/
 .venv/
 # 本地提交辅助文档（不随插件仓库发布）
 /提交模板.md
+# 运行期调试日志（宿主/插件在插件目录下产生）
+/logs/
+
+# ---- 追加自 MaiBot插件开发文档v1.3.0/.gitignore 模板（sync 2026-10-05）----
+UPLOAD_AGENT.md
+ISSUE_SUBMISSION.md
+/config_back/
+/data/
+*.log
+.maibot-release.json
+.update_backups/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+test_*.py
+*_test.py
+smoke_test*.py
+/tests/
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp

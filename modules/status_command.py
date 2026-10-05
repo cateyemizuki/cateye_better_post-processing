@@ -39,7 +39,8 @@ from maibot_sdk import Command
 
 from ..post_processing import build_default_fallback_replies
 
-# 一图流的渲染参数：固定宽度、整页截取（高度随内容增长）、2x 缩放保证清晰度。
+# 一图流的渲染参数：固定宽度、**按卡片元素截取**（高度贴合内容，见 _render_status_image）、
+# 2x 缩放保证清晰度。
 # allow_network 保持默认 False（宿主默认禁外网），HTML 里只用内联 CSS、不引用外部资源。
 _RENDER_VIEWPORT_WIDTH = 780
 _RENDER_DEVICE_SCALE_FACTOR = 2.0
@@ -53,6 +54,17 @@ _STATE_AVAILABLE = "可用"
 _STATE_DISABLED = "已关闭"
 _STATE_SILENT = "静默"
 _STATE_ERROR = "异常"
+
+# ``/bpp fallback`` 的 ``{user_name}`` 占位值清理：它来自被引用消息的发送者昵称/群名片
+# （**他人可控文本**），替换后会由 bot 真实发出——长度截断 + 剔除不可打印字符
+# （控制字符 / ANSI 序列不进聊天窗口与宿主日志），与未知子命令回显的加固同口径。
+_PLACEHOLDER_NAME_MAX_CHARS = 24
+
+
+def _sanitize_placeholder_name(name: str) -> str:
+    """占位符用的第三方可控文本清理：剔除非可打印字符后截断到上限长度。"""
+    cleaned = "".join(ch for ch in str(name or "") if ch.isprintable())
+    return cleaned.strip()[:_PLACEHOLDER_NAME_MAX_CHARS]
 
 
 class StatusCommandMixin:
@@ -154,6 +166,11 @@ class StatusCommandMixin:
         statuses = self._iter_statuses()
         for status in statuses:
             key = str(getattr(status, "key", ""))
+            if key == "post_process":
+                # 1.1.1 起后处理接管的两个子模块（分段 / 错别字）不完全绑定、可独立开关，
+                # 状态行拆成两条分别展示（含未接管原因），不再合并成一条"后处理接管"。
+                rows.extend(self._post_process_status_rows(status))
+                continue
             label = str(getattr(status, "label", key))
             restricted = bool(getattr(status, "restricted", False))
             available = bool(getattr(status, "available", False))
@@ -178,6 +195,107 @@ class StatusCommandMixin:
                     detail = switch_detail or "不受宿主开关约束"
             rows.append({"label": label, "state": state, "detail": detail})
         return rows
+
+    def _post_process_status_rows(self, status: Any) -> List[Dict[str, str]]:
+        """后处理接管拆成的两条状态行：**分段接管** / **错别字接管**。
+
+        两条行各自回答"该职责是否由本插件从宿主手中接管"，判定与**描述文本**都互相
+        独立（各行把职责、原因、开关来源一次说全，不引用共享的门控文案）：
+
+        * **错别字接管**：两种接管路径下都归本插件——完整接管（宿主总开关关闭）按
+          ``[chinese_typo] enable`` 镜像判定；错别字接管模式（宿主总开关开启、宿主错别字
+          关闭）下「跟随宿主」视为开启（宿主值恒为关，照抄会让接管形同虚设），与
+          ``_get_processor`` 对 ``typo_enable`` 的实际取值同口径，显示不骗人。
+        * **分段接管**：只有**完整接管**（宿主总开关关闭、宿主分段功能已停用）才由本插件
+          替代宿主分段，按 ``[response_splitter] enable`` 镜像判定；**错别字接管模式下
+          分段职责仍归宿主**——本插件跳过宿主处理是为了承载错字纠正，分段按宿主参数
+          复刻执行、分段配置不被接管，因此该行显示静默并注明，而非"可用"。
+        """
+        restricted = bool(getattr(status, "restricted", False))
+        available = bool(getattr(status, "available", False))
+        unmet = "；".join(getattr(status, "unmet", ()) or ())
+        if restricted and not available:
+            # 宿主正在做错别字处理（或其他前置未满足）：两个职责都接不过来，各行写各的原因。
+            seg_detail = "宿主后处理开启，分段由宿主执行；如需本插件接管分段，请关闭宿主「启用回复后处理」"
+            if unmet:
+                seg_detail = f"{seg_detail}（前置：{unmet}）"
+            typo_detail = (
+                f"宿主在自行处理错别字，本插件不介入（{unmet or '宿主前置条件未满足'}）；"
+                "如需接管，请关闭宿主「启用回复后处理」或「启用错别字」"
+            )
+            return [
+                {"label": "分段接管", "state": _STATE_SILENT, "detail": seg_detail},
+                {"label": "错别字接管", "state": _STATE_SILENT, "detail": typo_detail},
+            ]
+        if not bool(self.config.response_splitter.takeover):
+            prompts = self._custom_fallback_prompts()
+            extra = f"；自定义兜底提示词 {len(prompts)} 条" if prompts else ""
+            return [
+                {
+                    "label": "分段接管",
+                    "state": _STATE_DISABLED,
+                    "detail": "插件接管开关已关闭（[response_splitter] takeover），分段保持宿主行为",
+                },
+                {
+                    "label": "错别字接管",
+                    "state": _STATE_DISABLED,
+                    "detail": (
+                        "插件接管开关已关闭，错别字保持宿主行为；"
+                        f"接管开启后纠正方式恒由权重池决定{extra}"
+                    ),
+                },
+            ]
+        typo_only_mode = self._typo_takeover_mode()
+        # 错别字接管行：两种接管路径都由本插件接管错别字，按错字镜像判定生效开关。
+        typo_explicit = self._mirror_is_explicit("chinese_typo", "enable")
+        if typo_only_mode and not typo_explicit:
+            typo_on = True
+            typo_source = "错别字接管模式，「跟随宿主」视为开"
+        else:
+            typo_on = bool(
+                self._resolve_mirror("chinese_typo", "enable", "chinese_typo.enable", "switch")
+            )
+            typo_source = "插件值" if typo_explicit else "跟随宿主"
+        # 分段接管行：只有完整接管（宿主总开关关闭）才真正替代宿主的分段职责；
+        # 错别字接管模式下分段归宿主，本插件仅复刻执行（见行文案），不算接管。
+        if typo_only_mode:
+            seg_row = {
+                "label": "分段接管",
+                "state": _STATE_SILENT,
+                "detail": (
+                    "错别字接管模式：分段职责仍归宿主（本插件按宿主参数复刻执行、"
+                    "仅为承载错字纠正，分段配置不受接管影响）"
+                ),
+            }
+            typo_detail = (
+                "错别字接管：宿主「启用错别字」已关闭，错别字由本插件接管"
+                f"（纠正方式恒由权重池决定）；错字开关={'开' if typo_on else '关'}（{typo_source}）"
+            )
+        else:
+            seg_explicit = self._mirror_is_explicit("response_splitter", "enable")
+            seg_on = bool(
+                self._resolve_mirror("response_splitter", "enable", "response_splitter.enable", "switch")
+            )
+            seg_row = {
+                "label": "分段接管",
+                "state": _STATE_AVAILABLE if seg_on else _STATE_DISABLED,
+                "detail": (
+                    "完整接管：宿主「启用回复后处理」已关闭，分段由本插件替代宿主执行；"
+                    f"分段开关={'开' if seg_on else '关'}（{'插件值' if seg_explicit else '跟随宿主'}）"
+                ),
+            }
+            typo_detail = (
+                "完整接管：错别字由本插件接管（纠正方式恒由权重池决定）；"
+                f"错字开关={'开' if typo_on else '关'}（{typo_source}）"
+            )
+        return [
+            seg_row,
+            {
+                "label": "错别字接管",
+                "state": _STATE_AVAILABLE if typo_on else _STATE_DISABLED,
+                "detail": typo_detail,
+            },
+        ]
 
     def _iter_statuses(self) -> List[Any]:
         """全部模块的宿主前置条件判定结果（复用启动日志同一套逻辑）。"""
@@ -219,6 +337,12 @@ class StatusCommandMixin:
             # 文本规则没有独立开关：按"有没有生效规则"判定——一条都没有（或全部因
             # 格式错误被忽略）= 已关闭；有生效规则 = 可用（detail 里始终带条数明细）。
             return total > 0, detail
+        if key == "empty_reply_fallback":
+            enabled = bool(getattr(cfg.empty_reply_fallback, "enabled", False))
+            # 兜底文本与「异常兜底提示词」共用一份列表，这里点明，方便排查"补出来的是什么"。
+            prompts = self._custom_fallback_prompts()
+            source = f"自定义 {len(prompts)} 条" if prompts else "宿主自带兜底"
+            return enabled, f"兜底文本={source}"
         return None, ""
 
     def _collect_header_facts(self) -> List[Tuple[str, str]]:
@@ -398,7 +522,10 @@ class StatusCommandMixin:
         try:
             result = await self.ctx.render.html2png(
                 html_text,
-                full_page=True,
+                # 按卡片元素截取（高度贴合内容），而不是整页截图：整页（full_page）
+                # 截图的高度不会低于视口高度——内容不足一屏时（状态行少时约 700px，
+                # 视口 800px）图片底部会多出一段空白。视口仍给 780 宽定宽 + 兜底高度。
+                selector=".card",
                 viewport={"width": _RENDER_VIEWPORT_WIDTH, "height": 800},
                 device_scale_factor=_RENDER_DEVICE_SCALE_FACTOR,
             )
@@ -425,7 +552,8 @@ class StatusCommandMixin:
 
         流程与真实兜底完全同源：从 ``[response_splitter] fallback_prompts`` 的当前配置
         随机抽一条（留空 = 宿主自带的兜底提示词组），替换 ``{bot_name}`` / ``{user_name}``
-        占位（user_name = 被引用消息的发送者名称，群名片优先），然后**引用那条消息**发出。
+        占位（user_name = 被引用消息的发送者名称，群名片优先；他人可控文本，替换前做
+        长度截断与控制字符清理），然后**引用那条消息**发出。
         测试消息不写 Maisaka 上下文（``sync_to_maisaka_history=False``），避免污染 bot 记忆；
         发送走 ``_send_follow_up_text``（与分段补发同一条通道：文本规则、引用注入照常生效，
         所见即真实兜底触发时的效果）。
@@ -454,6 +582,9 @@ class StatusCommandMixin:
             return
         if not sender_name:
             sender_name = await self._resolve_sender_name(target_id)
+        # {user_name} 是被引用消息发送者的昵称/群名片（他人可控）：替换与日志回显前
+        # 统一做长度截断 + 控制字符清理。
+        sender_name = _sanitize_placeholder_name(sender_name)
 
         # 「兜底回复的自称」生效值只解析一次：既是宿主自带兜底提示词的 <昵称> 前缀，
         # 也是 {bot_name} 占位符的替换值（两处原本各调一次 _resolve_mirror）。

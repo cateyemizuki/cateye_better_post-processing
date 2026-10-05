@@ -276,6 +276,7 @@ class ChineseTypoGenerator:
         max_freq_diff: int = 200,
         project_root: Optional[Path] = None,
         protect_at_mentions: bool = True,
+        typo_blacklist: Optional[Sequence[str]] = None,
     ) -> None:
         self.error_rate = error_rate
         self.min_freq = min_freq
@@ -285,12 +286,45 @@ class ChineseTypoGenerator:
         # **与宿主不同的一处**：``True``（默认）时 ``@昵称`` 不参与错字生成，见
         # ``_protect_at_mentions``。宿主没有这道保护，会把昵称一起改错。
         self.protect_at_mentions = bool(protect_at_mentions)
+        # 错字黑名单（**与宿主不同的一处**，1.1.3 新增）：名单里的"字或词"不会被错字命中。
+        # 拆成两个集合：
+        #   * ``blacklist_chars``：单个汉字——该字**自身不被改成错字**（逐字路径），
+        #     也不允许别的字被**错改成**它（避免凭空出现禁用字）；
+        #   * ``blacklist_words``：多字词——**整词同音替换**时跳过该词（原词受保护），
+        #     且该词出现在正文里时其内部每个字也按"字"规则逐字保护。
+        # 解析规则：去空白、去重；长度 == 1 视为字，长度 >= 2 视为词。
+        raw_blacklist = [str(item).strip() for item in (typo_blacklist or ()) if str(item).strip()]
+        self.blacklist_chars: set = {item for item in raw_blacklist if len(item) == 1}
+        self.blacklist_words: set = {item for item in raw_blacklist if len(item) >= 2}
 
         self.pinyin_dict = _load_pinyin_dict()
         self.char_frequency = _load_char_frequency(project_root)
         # 因组合数超上限而跳过整词替换的**累计**次数（见 ``_MAX_HOMOPHONE_COMBINATIONS``）：
         # 只在这里记账，插件把它打进「后处理接管统计」日志。
         self._word_combo_skips = 0
+        # 因命中黑名单而跳过的**累计**次数（字 + 词），同样打进诊断日志。
+        self._blacklist_skips = 0
+
+    def _is_blacklisted_char(self, char: str) -> bool:
+        """该字是否命中黑名单（禁用字 / 禁用词里的字）。"""
+        if not self.blacklist_chars and not self.blacklist_words:
+            return False
+        if char in self.blacklist_chars:
+            return True
+        # 多字词黑名单：正文里该词覆盖到的每个字都受保护。
+        return any(char in word for word in self.blacklist_words)
+
+    def _is_blacklisted_word(self, word: str) -> bool:
+        """该词是否命中黑名单（原词本身在禁用词表里，或其任一字在禁用字表里）。"""
+        if not self.blacklist_chars and not self.blacklist_words:
+            return False
+        if word in self.blacklist_words:
+            return True
+        return any(char in self.blacklist_chars for char in word)
+
+    def _char_allowed_as_typo(self, typo_char: str) -> bool:
+        """错改后的字本身是否被禁（避免凭空产生黑名单里的字）。"""
+        return not self._is_blacklisted_char(typo_char)
 
     def _get_pinyin(self, sentence: str) -> List[Tuple[str, str]]:
         """将中文句子拆成单个汉字并获取其拼音。"""
@@ -445,6 +479,14 @@ class ChineseTypoGenerator:
                 current_pos += len(word)
                 continue
 
+            # 黑名单（1.1.3）：名单里的"词"整体跳过——原词保留，不做整词替换、不逐字改。
+            # 关闭时（默认）两个集合都空，`_is_blacklisted_word` 恒 False，RNG 序不受影响。
+            if self._is_blacklisted_word(word):
+                result.append(word)
+                current_pos += len(word)
+                self._blacklist_skips += 1
+                continue
+
             word_pinyin = self._get_word_pinyin(word)
 
             if len(word) > 1 and random.random() < self.word_replace_rate:
@@ -466,17 +508,25 @@ class ChineseTypoGenerator:
                         typo_freq = self.char_frequency.get(typo_char, 0)
                         orig_freq = self.char_frequency.get(char, 0)
                         replace_prob = self._calculate_replacement_probability(orig_freq, typo_freq)
-                        if random.random() < replace_prob:
+                        # 黑名单：错改后的字被禁 → 视为本次不改（原字保留）。
+                        if random.random() < replace_prob and self._char_allowed_as_typo(typo_char):
                             result.append(typo_char)
                             char_typos.append((typo_char, char))
                             current_pos += 1
                             continue
+                        if not self._char_allowed_as_typo(typo_char):
+                            self._blacklist_skips += 1
                 result.append(char)
                 current_pos += 1
             else:
                 word_result: List[str] = []
                 for char, py in zip(word, word_pinyin, strict=False):
                     word_error_rate = self.error_rate * (0.7 ** (len(word) - 1))
+                    # 黑名单：单字（或词内某个字）被禁 → 该字原样保留。
+                    if self._is_blacklisted_char(char):
+                        word_result.append(char)
+                        self._blacklist_skips += 1
+                        continue
                     if random.random() < word_error_rate:
                         similar_chars = self._get_similar_frequency_chars(char, py)
                         if similar_chars:
@@ -484,7 +534,7 @@ class ChineseTypoGenerator:
                             typo_freq = self.char_frequency.get(typo_char, 0)
                             orig_freq = self.char_frequency.get(char, 0)
                             replace_prob = self._calculate_replacement_probability(orig_freq, typo_freq)
-                            if random.random() < replace_prob:
+                            if random.random() < replace_prob and self._char_allowed_as_typo(typo_char):
                                 word_result.append(typo_char)
                                 char_typos.append((typo_char, char))
                                 continue
@@ -810,6 +860,7 @@ class PostProcessor:
         typo_word_replace_rate: float = 0.006,
         bot_nickname: str = "麦麦",
         typo_protect_at_mentions: bool = True,
+        typo_blacklist: Sequence[str] = (),
         custom_fallback_prompts: Sequence[str] = (),
     ) -> None:
         if DEPENDENCY_ERROR is not None:
@@ -836,6 +887,11 @@ class PostProcessor:
         self.bot_nickname = (bot_nickname or "麦麦").strip()
         # **与宿主不同的一处**：``@昵称`` 不参与错字生成（见 ``_protect_at_mentions``）。
         self.typo_protect_at_mentions = bool(typo_protect_at_mentions)
+        # 错字黑名单（**与宿主不同的一处**，1.1.3 新增）：名单里的"字或词"不会被错字命中。
+        # 默认空 = 关闭（不改变与宿主一致的行为）。
+        self.typo_blacklist: Tuple[str, ...] = tuple(
+            str(item).strip() for item in (typo_blacklist or ()) if str(item).strip()
+        )
         # 用户自定义的异常兜底提示词（``[response_splitter] fallback_prompts``）：非空时
         # **接管路径**（``plan``）的兜底改从这份列表里随机抽取（占位符 ``{bot_name}`` /
         # ``{user_name}`` 由调用方在事件循环侧替换——替换需要异步查目标发送者，线程里做不了）。
@@ -864,6 +920,7 @@ class PostProcessor:
                 word_replace_rate=self.typo_word_replace_rate,
                 project_root=self.project_root,
                 protect_at_mentions=self.typo_protect_at_mentions,
+                typo_blacklist=self.typo_blacklist,
             )
         return self._typo_generator
 
@@ -1011,8 +1068,17 @@ class PostProcessor:
         segments: List[ProcessedResponseSegment] = []
         corrections: Dict[int, CorrectionDecision] = {}
         deferred: List[CorrectionDecision] = []
+        # ``typo_sentences``：**用户真正看到错字**的句子数——只在错字句真被写进 segments
+        # 之后才自增（1.1.3 修）。旧实现把自增放在 visible_probability 门控**之前**，
+        # 于是"整句被换回正确句、用户看不到错字"也被记成 `真出现错字=1`，日志有假阳性。
         typo_sentences = 0
+        # ``typo_generated``：生成器**认为**改动了句子的数量（可见性门控之前），
+        # 保留它用于区分"压根没生成错字"与"生成了但被可见性门控换回正确句"。
+        typo_generated = 0
         suggestions = 0
+        # 被 correction_max_cjk 挡下、错字可见但不纠正的句子数（1.1.3 新增）。
+        # 旧实现这条分支静默 continue，导致「撞超限」与「抽到 none」在日志上无法区分。
+        correction_skipped_overlong = 0
         for sentence, sentence_separator in split_sentences:
             if not (self.typo_enable and enable_chinese_typo):
                 segments.append(ProcessedResponseSegment(sentence, separator=sentence_separator))
@@ -1022,7 +1088,7 @@ class PostProcessor:
                 sentence, force_suggestion=True
             )
             if typoed_text != sentence:
-                typo_sentences += 1
+                typo_generated += 1
             if suggestion:
                 suggestions += 1
             index = len(segments)
@@ -1037,8 +1103,12 @@ class PostProcessor:
                 segments.append(ProcessedResponseSegment(sentence, separator=sentence_separator))
                 continue
             segments.append(ProcessedResponseSegment(typoed_text, separator=sentence_separator))
+            # 到这里错字**确实会出现在消息里**，才记"真出现错字"（1.1.3 修）。
+            typo_sentences += 1
             if max_correction_cjk > 0 and _count_cjk(sentence) > max_correction_cjk:
-                # 超限：错字可见但不纠正（也不消耗纠正方式抽取）。
+                # 超限：错字可见但不纠正（也不消耗纠正方式抽取）。记账供诊断日志区分
+                # 「撞超限」与「抽到 none」（1.1.3 新增）。
+                correction_skipped_overlong += 1
                 continue
             mode = str(choose_mode(index, suggestion) or "none") if choose_mode else "none"
             if mode not in {"direct", "quote", "recall"}:
@@ -1060,6 +1130,8 @@ class PostProcessor:
                 "early": True,
                 "sentences": len(split_sentences),
                 "typo_sentences": typo_sentences,
+                "typo_generated": typo_generated,
+                "correction_skipped_overlong": correction_skipped_overlong,
                 "suggestions": suggestions,
                 "segments": 1,
                 "overflow": True,
@@ -1078,6 +1150,8 @@ class PostProcessor:
                 "early": False,
                 "sentences": len(split_sentences),
                 "typo_sentences": typo_sentences,
+                "typo_generated": typo_generated,
+                "correction_skipped_overlong": correction_skipped_overlong,
                 "suggestions": suggestions,
                 "segments": len(merged),
                 "overflow": True,
@@ -1115,6 +1189,8 @@ class PostProcessor:
             "early": False,
             "sentences": len(split_sentences),
             "typo_sentences": typo_sentences,
+            "typo_generated": typo_generated,
+            "correction_skipped_overlong": correction_skipped_overlong,
             "suggestions": suggestions,
             "segments": len(merged),
             "corrections": len(remapped) + len(remapped_deferred),

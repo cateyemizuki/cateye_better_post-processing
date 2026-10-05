@@ -3,6 +3,7 @@
 - ``requirements``：模块前置条件（需要宿主关闭哪些能力才可用）与可用性判定；
 - ``post_process_takeover``：回复后处理接管（错别字 + 分段 + 多段发送 + 异常兜底提示词）；
 - ``quote_takeover``：引用回复接管（直接 / 引用 / @ / 引用＋@ 的权重抽取）；
+- ``empty_reply_fallback``：空回复兜底（replyer 一条正文都没生成时补一条兜底消息，默认关闭）；
 - ``status_command``：``/bpp`` 状态命令（合并转发 + 一图流，渲染失败退回文字）与
   ``/bpp fallback`` 兜底测试。
 

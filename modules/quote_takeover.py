@@ -114,12 +114,12 @@ class QuoteTakeoverMixin:
         ``getattr`` 取不到该字段便一路返回 ``False`` —— 于是 WebUI 里把开关打开也**不生效**，
         MaiBot 1.2.3（宿主不插空格）上 @ 与正文始终粘连。
 
-        口径见 README「`at_trailing_space`：按宿主版本选」：
-        MaiBot **1.2.5 起关闭**（宿主富回复自己会在每个 @ 组件后插一个空格组件），
-        **1.2.5 以前（不含 1.2.5）开启**（宿主不插，插件不补会与正文粘连）。
+        口径见 docs/CONFIG.md「@ 与正文之间的空格」：
+        **默认开启**（宿主自己补的空格组件只对宿主 ``attach_at`` 的 @ 生效，
+        本插件注入的 @ 不补空格组件就会与正文粘连）。
         """
         plugin_cfg = getattr(self.config, "plugin", None)
-        return bool(getattr(plugin_cfg, "at_trailing_space", False))
+        return bool(getattr(plugin_cfg, "at_trailing_space", True))
 
     def _quote_weights_config(self, message: Dict[str, Any]) -> Any:
         """按会话类型取引用回复**权重**配置节（``[quote_reply_weights]`` / ``[quote_reply_private_weights]``）。
@@ -208,7 +208,7 @@ class QuoteTakeoverMixin:
         # 之后对该消息的任何回复都不再引用，即使已经超出 stale_age_seconds 的时间限制。
         # 抽到"直接回复"不消耗这次机会：下一轮 planner 再回复同一条消息时仍可能抽到引用。
         quote_cfg = self._quote_section_config(message)
-        # 是否在 @ 后额外补一个空格组件（``[plugin] at_trailing_space``，默认 False）。
+        # 是否在 @ 后额外补一个空格组件（``[plugin] at_trailing_space``，默认 True）。
         # 注意：开关在 ``[plugin]`` 节，**不是** ``quote_cfg``（0.14.1 修复误读）。
         at_with_space = self._at_trailing_space()
         if bool(quote_cfg.quote_once_per_target) and self._quoted_before(session_id, reply_message_id):
@@ -904,15 +904,11 @@ class QuoteTakeoverMixin:
 
         - 注入前**一律**先 ``_strip_body_leading_whitespace`` 抹掉正文自带的前导空白 ——
           这一步无论补不补空格都要做，否则正文自带的空白会和渲染层的空格叠加；
-        - ``with_space=False``（**默认**）：只插 ``at``，**不插空格组件**。
-          宿主 ``send_service._build_processed_plain_text()`` 用 ``" ".join(parts)`` 拼接
-          每个组件、**组件之间自己会补一个空格**，所以 ``[at, 正文]`` 渲染出来正好是
-          ``@昵称 正文``（一个空格）。此时若再插一个空格组件，就会渲染成
-          ``@昵称`` + join空格 + ``' '`` + join空格 + ``正文`` = **三个空格**，
-          而且会跟着 ``processed_plain_text`` 进消息库、上下文与记忆抽取。
-          宿主 1.2.3 自己的 ``attach_at`` 也是 ``[at, 正文]``，口径一致。
-        - ``with_space=True``：保留旧行为（恒定补一个半角空格组件），
-          给"某些客户端 at 段后不自动补空格"导致粘连的环境用。
+        - ``with_space=True``（**配置默认**）：只插 ``at`` 之后再补一个半角空格组件 ——
+          宿主自己补的空格只对宿主 ``attach_at`` 的 @ 生效，本插件注入的 @ 不补就会
+          与正文粘连，所以要自己带一个；
+        - ``with_space=False``：只插 ``at``、不插空格组件（宿主渲染时 ``" ".join``
+          会补一个空格，但平台上可能出现粘连）。
 
         宿主自己已经 @ 过的情况不归这里管（调用方用 ``_has_leading_at`` 先判断）。
         """
