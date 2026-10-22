@@ -892,7 +892,7 @@ class PostProcessor:
         self.typo_blacklist: Tuple[str, ...] = tuple(
             str(item).strip() for item in (typo_blacklist or ()) if str(item).strip()
         )
-        # 用户自定义的异常兜底提示词（``[response_splitter] fallback_prompts``）：非空时
+        # 用户自定义的异常兜底提示词（``[empty_reply_fallback] fallback_prompts``）：非空时
         # **接管路径**（``plan``）的兜底改从这份列表里随机抽取（占位符 ``{bot_name}`` /
         # ``{user_name}`` 由调用方在事件循环侧替换——替换需要异步查目标发送者，线程里做不了）。
         # 宿主复刻路径（``process``）恒用宿主自带列表，保持逐行一致。

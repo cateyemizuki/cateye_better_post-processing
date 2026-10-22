@@ -4,6 +4,102 @@
 > 功能条目；**0.x 时代**的全部更新按次级版本号合并回溯（0.9.0 及更早没有逐条留档，按代码
 > 注释与 README 版本标注整理）。各功能的当前行为以 [`README.md`](README.md) 为准。
 
+## 1.3.2（2026-10-21）
+
+- **planner 上下文按实际缺失分段补齐**：`maisaka.planner.before_request` 会等本轮补发结束，
+  再检查 `items` 中已经存在的 bot 自身消息（平台 `msg_id` 优先、正文兜底）；只把实际发送
+  成功但当前请求确实缺失的分段/纠正消息补成 bot 消息——未分段/已同步的段不会补，三句只缺
+  最后一句就只补最后一句；缺中间段插到下一个已存在段之前、缺尾段插到最后一个已存在段之后，
+  不会追加到人物画像/时间/分析指令等尾部合成项之后。`reply` 工具结果里的全文也不会被当成
+  “消息已存在”。
+- **修复多段补发关联失配**：首段在 `before_send` 被假 @ 过滤/文本规则改写后，补发登记用
+  session+timestamp 稳定键关联，不再丢第 2..N 段；首段发送被 abort/管线异常时，planner
+  最多等 5 秒宽限即收尾（只看本轮补发 task，不受上一轮影响），不再白等满超时。
+- **补齐判定防误判**：有平台 `msg_id` 时不再用正文兜底匹配窗口里更早的同文消息；只发送了
+  前 k 段、后续仍在补发时不会提前移除记录；子代理请求（空工具定义）不等待/注入。
+- 版本与 `config_version` → **1.3.2**。
+
+## 1.3.1（2026-10-20）
+
+- **多段发送：reply 工具结果记录完整回复全文**：`reply` 工具结果里的
+  `combined_reply_text` / `reply_segments` 现在反映本轮**所有分段拼接后的完整回复**，
+  不再只显示第 1 段；实际发送仍保持“第 1 段走宿主原生链路、第 2..N 段由插件补发”，
+  避免 planner 收尾轮因工具结果只有首段而误以为消息没发完、重复调用 `reply`。
+- **平台支持明确**：多段发送 / 引用注入依赖 `send_service.after_build_message` /
+  `send_service.before_send` 等出站 Hook，目前仅支持 QQ 的 NapCat / SnowLuma 适配器；
+  CLI 或其它绕过 `send_service` 的发送路径不生效，非上述适配器建议使用旧版插件。
+- 版本与 `config_version` → **1.3.1**。
+
+## 1.3.0（2026-10-20）
+
+- **回复兜底：兜底文本并入本板块**（`[empty_reply_fallback]`，板块名由「空回复兜底」改为「回复兜底」）：
+  「兜底回复的自称」（`fallback_nickname`）与「异常兜底提示词」（`fallback_prompts`）从
+  `[response_splitter]` 移入本板块；旧配置键自动迁移，兜底行为不变。
+- **自回复拦截：私聊豁免上限**（`[self_reply_guard] private_exempt_limit`，默认 **2**）：
+  同一私聊里**连续**豁免「回复自己」的次数上限，用尽后按自回复拦截处理；**0 = 无上限**（始终豁免）。
+  仅「私聊豁免」开启时生效——关闭时私聊永不豁免。成功回复一条**非自身**消息后计数清零。
+- **自回复拦截：群聊豁免**（`[self_reply_guard] exempt_group_chat`，默认**关闭**；
+  `group_exempt_limit`，默认 **1**）：开启后群聊里也先连续豁免若干次自回复，用尽后再拦截；
+  0 = 无上限。群聊豁免关闭时群里一律拦截。
+- **配置排版**：仅调整板块与字段顺序（文本替换规则 ↔ 表情包冷却、跨聊私聊回忆移到自回复拦截之前、
+  跨聊名单改为「模式在前、名单在后」），不影响任何行为。
+- **致谢**：README 致谢新增自回复拦截的**思路来源**（`maibot-self-reply-guard`）。
+- 版本与 `config_version` → **1.3.0**。
+
+## 1.2.0（2026-10-06）
+
+- **合并「自回复拦截」与「重复回复拦截」**（`[self_reply_guard]` / `[duplicate_reply_guard]`，
+  **默认关闭**；迁自 `cateye_duplicate_reply_guard` v1.1.4）。前者拦住 Planner 对 **bot 自己发出的
+  消息**调用 `reply`（群里"自己回自己"），判定依据是 planner 上下文里渲染为
+  `is_self_message="true"` 的 `msg_id` 与自身出站消息台账（全部零 RPC）；后者拦住**同一条目标消息
+  在去重窗口内被回两次**，"已回复"只在**送达回执**（`after_send` 的 `sent=True`）后才登记，
+  生成成功但发送失败不会误拦后续重试，距上次回复已过延时阈值的"再补一句"按补充说明放行。
+  两者都是**生成前剔除**（从 `output_items` 删除违规 `reply` 调用，零 token）+ **发送前兜底**
+  （`before_send` 上 `abort`，LATE——排在插件自己的出站改写 EARLY 之后）。自回复拦截默认
+  **私聊豁免**（只拦已确认的群聊）；判定用的轮标记 120 秒过期，功能在标记写入后被热更新关闭时
+  发送前会复查并放行。**默认关闭** = 行为与 1.1.3 完全一致。
+- **新增「拦截日志」**（`[intercept_log]`，默认开启）：拦截行为逐条写进插件数据目录下的独立
+  JSON Lines 日志（默认 `intercept.jsonl`，可配文件名 / 单文件上限 / 轮转份数 / 是否回显宿主主日志）；
+  守卫模块关闭时天然无输出，所以不算独立功能开关。
+- **合并「跨聊私聊回忆」**（`[cross_chat_recall]`，**默认关闭**；迁自
+  `cateye_mai_cross-chat_recall` v0.3.1）：扫描群友与 bot 的私聊 → LLM 总结入库
+  （`data/plugins/github.cateye.better-post-processing/cross_chat_recall.db`）→ 把概括注入
+  **群聊** planner / replyer 上下文；另提供 LLM 工具 `recall_private_chat`（**仅群聊可用**，
+  按昵称或 QQ 号解析候选，命中多个时返回「昵称（QQ 号）」名单）与 `/ccr debug test`
+  （强制注入，10 分钟有效）、`/ccr clean`（清空总结库并清粘性标记）两个 operator 命令。
+  工具召回成功后按「粘性召回保留」（默认 5 分钟）继续随 reply 注入。**默认关闭**：不扫描、不注入、
+  不建库，三组 Hook / 两命令 / 工具一律零副作用放行。
+- **配置形态**：四个新板块尾随在主配置末端（`[self_reply_guard]` → `[duplicate_reply_guard]` →
+  `[intercept_log]` → `[cross_chat_recall]`，`__ui_order__` 14~17）。跨聊私聊回忆的旧六节
+  （`[scan]` / `[summarize]` / `[inject]` / `[store]` / `[scope]` / `[tool]`）在合并后**平铺**为
+  单节内 20 个同名字段——经核实 `maibot_sdk` 只把顶层字段识别为配置分组，两级嵌套 section 会退化成
+  JSON 编辑框；旧两级键路径已登记进 `migrate_legacy_config`，手写过的嵌套配置会自动平移
+  （`[scope]` 四名单除外，见下一条）。
+- **跨聊私聊回忆：群 / 用户名单改为"共用一张名单 + 模式开关"**（`[cross_chat_recall]` 的
+  `group_list` / `group_list_mode` / `user_list` / `user_list_mode`，**字段总数不变**）：黑名单模式（默认）
+  = 名单内的群 / 用户不生效、名单留空等于全部生效；白名单模式 = 仅名单内的群 / 用户生效、名单留空等于
+  全部不生效。**旧四名单**（`group_whitelist` / `group_blacklist` / `user_whitelist` / `user_blacklist`）
+  **已删除且不自动迁移**——旧语义与之不同（旧白名单非空=仅这些生效、旧黑名单优先），机械搬运会改变用户
+  配置语义；旧键不再登记进 `migrate_legacy_config`，残留值由配置模型的 `extra="ignore"` 丢弃，生效值回落
+  到默认空名单 + 黑名单模式。粘性召回仍**完全绕过**用户名单（既有不变量），模块关闭时新字段照旧不被读取。
+- **跨聊私聊回忆：总结提示词默认值改为内置提示词全文**（`[cross_chat_recall] prompt`）：生成的默认配置文件里
+  直接写入内置提示词全文，不再是空串；**清空**（或只留空白）仍回退内置提示词，填了自定义文本则用自定义
+  （`{bot_name}` / `{user_nickname}` / `{user_id}` 占位符照常替换）。
+- **数据迁移（一次性、copy 不删）**：`on_load` 时把旧插件的持久化数据复制进本插件数据目录——
+  旧 CCR 的 `cross_chat_recall.db`、旧 guard 的 `intercept.jsonl`（含 `.1/.2/.3` 备份）；
+  目标已存在则跳过，任何异常仅告警不阻断加载。旧插件目录本身不做任何删改。
+- 版本与 `config_version` → **1.2.0**；能力声明**新增** `chat.get_all_streams`、
+  `chat.get_stream_by_user_id`、`message.get_recent`（跨聊私聊回忆运行所需）。
+- **新增 Hook 清单**（模块关闭时不产生任何副作用）：`maisaka.planner.before_request` +2
+  （`self_message_id_scanner`、`ccr_planner_inject`）、`maisaka.planner.after_response` +1
+  （`planner_reply_stripper`）、`maisaka.reply.before_post_process` +1
+  （`guard_reply_round_marker`）、`send_service.before_send` +1（`reply_send_abort`，LATE）、
+  `send_service.after_send` +1（`outbound_id_recorder`）、`maisaka.replyer.before_model_request` +1
+  （`ccr_replyer_inject`）、`chat.receive.after_process` +1（`ccr_push_counter`）。
+  其中 `guard_reply_round_marker` 由原插件声明名 `reply_round_marker` **改名**而来：主插件 1.1.3 已
+  占用该声明名，而宿主组件注册表以 `plugin_id.name` 为键去重、后者静默覆盖，同名会丢掉一个 handler
+  （是合并期主代理裁决的规格偏差项，mode/order 等其余声明参数保持原值）。
+
 ## 1.1.3（2026-10-01）
 
 - **新增「私聊禁用撤回」（`[chinese_typo] private_no_recall`，默认开启）**：私聊里

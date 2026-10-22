@@ -24,10 +24,17 @@
 | 5 | `[quote_reply_private_weights]` | 私聊引用回复的**权重** |
 | 6 | `[chinese_typo]` | 错别字：注入参数 + 纠正行为 |
 | 7 | `[chinese_typo_weights]` | 错字**纠正方式权重** |
-| 8 | `[response_splitter]` | 分段：分割参数 + 打字速度 + 接管机制 + 异常兜底提示词 |
-| 9 | `[empty_reply_fallback]` | 空回复兜底：replyer 一条正文都没生成时补发一条兜底消息（**默认关闭**） |
+| 8 | `[response_splitter]` | 分段：分割参数 + 打字速度 + 接管机制 |
+| 9 | `[empty_reply_fallback]` | 回复兜底：replyer 一条正文都没生成时补发一条兜底消息（**默认关闭**）+ 兜底文本与自称 |
 | 10 | `[emoji_meaning]` | 表情包含义库（排在"分段"与"回复后表情包"之间） |
-| 11 | 其它功能 | `[emoji_after_reply]` / `[emoji_follow]` / `[text_rules]` / `[emoji_cooldown]` |
+| 11 | `[emoji_after_reply]` | 回复后表情包 |
+| 12 | `[emoji_follow]` | 表情包跟风 |
+| 13 | `[emoji_cooldown]` | 表情包冷却（1.3.0 起排在文本替换规则之前） |
+| 14 | `[text_rules]` | 文本替换规则 |
+| 15 | `[cross_chat_recall]` | 跨聊私聊回忆（1.2.0 合并；**默认关闭**；六节平铺，见该节说明） |
+| 16 | `[self_reply_guard]` | 自回复拦截（1.2.0 合并；**默认关闭**） |
+| 17 | `[duplicate_reply_guard]` | 重复回复拦截（1.2.0 合并；**默认关闭**） |
+| 18 | `[intercept_log]` | 拦截独立日志（1.2.0 合并；默认开启） |
 
 ### 三条通用规则
 
@@ -59,7 +66,7 @@
    | `response_splitter.enable` / `max_length` / `max_sentence_num` / `max_split_num` | `true` / `512` / `8` / **`4`** |
    | `response_splitter.enable_kaomoji_protection` / `enable_overflow_return_all` | `false` / **`true`** |
    | `chinese_typo.enable` / `error_rate` / `min_freq` / `tone_error_rate` / `word_replace_rate` | `true` / `0.01` / `9` / `0.1` / `0.006` |
-   | `bot.nickname`（→ `fallback_nickname`） / `response_post_process.typing_speed` | **`普瑞赛斯`** / `1.0` |
+   | `bot.nickname`（→ `[empty_reply_fallback] fallback_nickname`） / `response_post_process.typing_speed` | **`普瑞赛斯`** / `1.0` |
 
 > 唯一**故意不搬**的是宿主 `[response_post_process] enable_response_post_process`：它是本插件的
 > **生效条件**（宿主开着它时宿主自己做后处理，插件必须让位），不是可以随便改的参数。
@@ -105,8 +112,29 @@
 | `[emoji_meaning]` | `max_meaning_length` | `20~1000` | 单条含义最大长度 |
 | `[emoji_meaning]` | `meaning_ttl_days` | `0~` | 含义保留天数（`0` = 不淘汰） |
 | `[emoji_meaning]` | `rewrite_scope` | — | 标签替换范围（`replyer` / `planner`，默认两者都开） |
+| `[self_reply_guard]` | `private_exempt_limit` | `0~` | 私聊连续豁免上限（次，`0` = 无上限） |
+| `[self_reply_guard]` | `group_exempt_limit` | `0~` | 群聊连续豁免次数（`0` = 无上限） |
+| `[self_reply_guard]` | `id_ttl_seconds` | `60~86400` | 自身消息 ID 保留时长（秒） |
+| `[self_reply_guard]` | `max_tracked_ids` | `50~20000` | 单会话记录上限（条） |
+| `[duplicate_reply_guard]` | `dedupe_window_seconds` | `10~3600` | 去重时间窗（秒） |
+| `[duplicate_reply_guard]` | `late_repeat_after_seconds` | `5~3600` | 延时补充阈值（秒） |
+| `[intercept_log]` | `max_file_size_kb` | `16~102400` | 单文件大小上限（KB） |
+| `[intercept_log]` | `backup_count` | `0~20` | 轮转历史份数 |
+| `[intercept_log]` | `echo_level` | — | 回显主日志级别（`debug` / `info` / `warning`） |
+| `[cross_chat_recall]` | `trigger_mode` | — | 扫描触发方式（`planner` / `push` / `reply`） |
+| `[cross_chat_recall]` | `scan_count` | `1~100` | 扫描数 / push 推进阈值（条） |
+| `[cross_chat_recall]` | `min_user_messages` | `1~` | 触发总结的用户消息数阈值 |
+| `[cross_chat_recall]` | `window_hours` | `0.1~` | 总结时间窗口（小时） |
+| `[cross_chat_recall]` | `resummarize_push_count` | `1~` | 重总结推进数 |
+| `[cross_chat_recall]` | `max_tokens` | `0~` | 总结请求 max_tokens（0 = 不限制） |
+| `[cross_chat_recall]` | `planner_user_mode` | — | planner 注入用户选择（`trigger` / `recent_users`） |
+| `[cross_chat_recall]` | `recent_user_count` | `1~50` | planner 最近用户数 |
+| `[cross_chat_recall]` | `reply_user_mode` | — | reply 注入用户选择（`reply_source` / `follow_planner`） |
+| `[cross_chat_recall]` | `summary_ttl_hours` | `0.1~` | 总结保留时长（小时） |
+| `[cross_chat_recall]` | `recall_retention_minutes` | `0.5~1440` | 粘性召回保留（分钟） |
+| `[cross_chat_recall]` | `context_window_messages` | `5~200` | 候选上下文消息数 |
 
-> 共 33 项有范围约束（配置面共 84 项）；其余项是布尔 / 三态开关 / 文本 / 列表，不受数值范围限制。
+> 共 50 项有范围约束（配置面共 128 项）；其余项是布尔 / 三态开关 / 文本 / 列表，不受数值范围限制。
 > 例外：`[chinese_typo] recall_delay_seconds`（撤回反应时间）不设范围校验——留空 = 按打字速度自动，
 > 填数字（支持小数点）就用它，负数按 `0` 处理。
 
@@ -433,8 +461,6 @@
 | `enable_kaomoji_protection` | `跟随宿主` | 宿主【保护颜文字】：尽量避免把颜文字从中间拆开 |
 | `enable_overflow_return_all` | `跟随宿主` | 宿主【超限保留全文】：句子太多时直接保留完整回复，不再强行截断 |
 | `typing_speed` | 留空 | 宿主【打字速度】：模拟打字等待时间；`0` 最快，`1` 默认，`2` 更慢。留空 = 交给宿主按它自己的速度等待 |
-| `fallback_nickname` | 留空 | 宿主【bot · 昵称】：只用于复刻「回复过长/句子太多时回退默认回复」的文本（「<昵称>不知道哦」） |
-| `fallback_prompts` | 空 | **异常兜底提示词**（1.0.0）：触发「过长 / 句子太多」兜底时从这份列表**随机抽一条**发送，顶替宿主自带的兜底提示词；支持 `{bot_name}`（上面的自称生效值）与 `{user_name}`（要回复的那条消息的发送者名称，群名片优先，查不到替换为空）占位。留空 = 只用宿主自带；仅后处理接管生效时起作用，`/bpp fallback` 可实测。**1.1.3 起同一份列表也被 `[empty_reply_fallback]` 复用**（见下节） |
 | `yield_to_other_plugins` | `true` | **让位给其它插件**：别的插件已认领这轮文本后处理（`skip_post_process=True`，例如智能分段插件命中预分段缓存）时把分段让给它；`@/引用`、文本规则、表情包照常。关掉表示本插件无条件优先 |
 | `max_segments` | `0` | 分段条数上限，超过就退化成换行拼接一条（防刷屏）；`0` = 不额外限制，完全沿用宿主【最多分割条数】 |
 | `wait_timeout_seconds` | `30` | planner 请求与新入站消息等待本轮补发完成的秒数（超时放行，不阻塞宿主；`0` = 不等待）。补发（打字模拟）经常等不完时再**手动调大**本项；实际最长 55 秒（等待 Hook 上限 58 秒，见下） |
@@ -446,6 +472,14 @@
 #### 发送形态（复刻宿主分段发送）
 
 - **第 1 段**：仍走宿主原生发送链 → 引用位置、写库、平台行为、Maisaka 历史同步全部原生；
+- **reply 工具结果（1.3.1 起）**：记录本轮回复的**完整全文**（所有分段拼接）；实际发送仍是
+  第 1 段由宿主发送、第 2..N 段由插件补发。这样 planner 不会因为工具结果只看到首段而误以为
+  回复没发完。
+- **planner 上下文补齐（1.3.2 起）**：`maisaka.planner.before_request` 等待本轮补发结束后，
+  按 `items` 中已有的 bot 自身消息（平台 `msg_id` 优先、正文兜底）判断缺失段，只追加实际
+  发送成功但当前请求缺失的分段；未分段/已同步的段不会补，三句只缺最后一句就只补最后一句；
+  缺中间段插到下一个已存在段之前、缺尾段插到最后一个已存在段之后，不会追加到人物画像/时间/
+  分析指令等尾部合成项之后。`reply` 工具结果里的全文不会被当成“消息已存在”。
 - **第 2..N 段**：插件按顺序补发（`ctx.send.text(...)`），与宿主分段循环的 `typing=index>0`、
   历史同步口径一致；
 - **更正段**（`quote_previous`）：插件给该条发送注入引用指向上一段；
@@ -468,10 +502,18 @@
 
 **与宿主原生的差异（纯插件路径固有限制，3 处）**：
 
-1. `reply` 工具结果里的 `reply_segments` / `combined_reply_text` / `track_reply_effect` 只反映第 1 段；
-2. 补发分段不带表情附件（`ctx.send.text` 不支持 `selected_expressions`，宿主原生每段都带）；
-3. 若 planner prompt 在补发完成前就已构建，该轮上下文仍只含首段——插件用"等待 + 历史同步"尽量规避
-   （需要绝对一致时请保持框架开关开启）。
+1. `reply` 工具结果里的 `combined_reply_text` / `reply_segments` 在 1.3.1 起反映**完整回复文本**；
+   实际发送仍是首段 + 补发，`send_results` 只包含宿主首段那次发送的回执，`track_reply_effect`
+   把整轮视为一条全文；
+2. 补发分段不带表情附件（`ctx.send.text` 不支持 `selected_expressions`；该差异只影响富回复路径，
+   插件本身要求关闭宿主「丰富回复能力」）；
+3. 若 planner prompt 在补发完成前就已构建，逐段历史可能尚未全部同步；但 `reply` 工具结果已含全文，
+   且 1.3.2 起 planner 请求前会按实际缺失分段补齐 items（只补缺失），不再出现“工具结果只有首段”
+   的误导。
+
+> **平台支持**：多段发送与引用注入依赖 `send_service.*` 出站 Hook，目前仅支持 QQ 的
+> **NapCat / SnowLuma** 适配器；CLI 或其它绕过 `send_service` 的发送路径不生效。
+> 非上述适配器建议使用旧版插件；也可关闭后处理接管（分段）后仅使用其它功能。
 
 #### 打字速度是怎么复刻的（`typing_speed`）
 
@@ -481,20 +523,24 @@
 `0.3/0.15`；② 整条只有 1 个汉字时宿主提前返回固定的 `0.3×3+0.3 = 1.2s`，既不乘速度系数也不受
 `≤0` 影响。只作用于插件补发的分段（第 1 段由宿主发送链发出，宿主分段循环里首段本就是 `typing=False`）。
 
-### `[empty_reply_fallback]` 空回复兜底
+### `[empty_reply_fallback]` 回复兜底
 
 > **1.1.3 新增，默认关闭。** 关闭时本模块**完全没有副作用**（Hook 直接放行，与没装这个功能一样）。
+> **1.3.0 起**板块名由「空回复兜底」改为「回复兜底」，并收纳兜底文本配置（`fallback_nickname` /
+> `fallback_prompts`，原先在 `[response_splitter]`；旧键自动迁移）。
 
 解决的是"**bot 已读不回**"：replyer **一条正文都没生成**时，宿主直接返回失败、**一条消息都不发**。
 打开本项后插件补一条兜底消息，用户至少能看到一句回应。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `enabled` | `false` | 是否启用空回复兜底。**默认关闭** = 与宿主行为完全一致（不补） |
+| `enabled` | `false` | 是否启用回复兜底。**默认关闭** = 与宿主行为完全一致（不补） |
+| `fallback_nickname` | 留空 | **兜底回复的自称**（宿主【bot · 昵称】）：用于「回复过长/句子太多时回退默认回复」的文本（「<昵称>不知道哦」）与 `{bot_name}` 占位符。留空 = 跟随宿主 |
+| `fallback_prompts` | 空 | **异常兜底提示词**（1.0.0）：触发「过长 / 句子太多」兜底、或回复兜底补发时，从这份列表**随机抽一条**发送，顶替宿主自带的兜底提示词；支持 `{bot_name}`（上面的自称生效值）与 `{user_name}`（要回复的那条消息的发送者名称，群名片优先，查不到替换为空）占位。留空 = 只用宿主自带；「过长 / 句子太多」兜底仅在后处理接管生效时起作用，`/bpp fallback` 可实测 |
 
-**兜底文本从哪来**：复用上面 `[response_splitter]` 的 **`fallback_prompts`** —— 同一份列表、
-同样的 `{bot_name}` / `{user_name}` 占位符语义；列表为空时用**宿主自带的兜底提示词**
-（「<昵称>不知道哦」那一组）。`{bot_name}` 取 `[response_splitter] fallback_nickname` 的生效值。
+**兜底文本从哪来**：本节的 **`fallback_prompts`** 列表，与 `{bot_name}` / `{user_name}` 占位符语义；
+列表为空时用**宿主自带的兜底提示词**（「<昵称>不知道哦」那一组）。`{bot_name}` 取本节
+`fallback_nickname` 的生效值。
 
 #### 什么情况才算"空回复"
 
@@ -954,6 +1000,121 @@ planner 按需补录**不再重试它**——否则每轮 planner 都会把它�
 | `max_meaning_length` | `160` | 单条含义的最大字数。 **取值范围** `20~1000`。 |
 | `meaning_ttl_days` | `30` | 多少天没用过的含义会被淘汰（0 = 不淘汰）。 **取值范围** `0~`。 |
 
+### `[self_reply_guard]` 自回复拦截（1.2.0，**默认关闭**）
+
+> 迁自 cateye_duplicate_reply_guard v1.1.4（旧插件目录原样保留）。解决"Planner 对 **bot 自己发出的消息**调用 `reply`"——
+> 群里表现为自己回自己、刷屏。两道闸：**生成前剔除**（从 `output_items` 里删掉命中的 `reply` 工具调用，零 token 开销）
+> 与**发送前兜底**（真正下发前 `abort`，拦住生成前没覆盖到的路径）。
+
+- 判定依据全部零 RPC：① 每个 planner 请求扫描上下文里渲染为 `is_self_message="true"` 的 `msg_id`（覆盖插件启动前的历史）；
+  ② 观察自身出站消息的平台 ID（`send_service.after_send`，宿主已回填）累积台账。
+- **私聊豁免（默认开）**：宿主明确支持"补充说明你自己发送的消息"（私聊主动续话正是这种场景），所以默认**只拦已确认的群聊**；
+  会话类型来自出站载荷的 `message_info.group_info`（群聊才有），类型未知时按放行处理（宁可不拦也不误杀）。
+- **豁免上限（1.3.0）**：私聊连续豁免默认 **2 次**（`private_exempt_limit`，`0` = 无上限），用尽后按自回复拦截处理；
+  **群聊豁免默认关闭**，开启后群聊连续豁免默认 **1 次**（`group_exempt_limit`，`0` = 无上限）。
+  计数为"连续"语义：只在回复轮标记时消费一次，成功回复一条**非自身**消息后清零。
+- 功能关闭时本模块的每个 Hook **零副作用直接放行**（总开关 `[plugin] enabled` 关闭同理）。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `False` | 是否启用自回复拦截。 **默认关闭** = 与 1.1.3 行为完全一致 |
+| `strip_at_planner` | `True` | 生成前剔除：命中的 `reply` 调用不会进入生成，零 token 开销、无失败反馈。 |
+| `abort_at_send` | `True` | 发送前兜底：可拦住生成前剔除没覆盖到的路径（回复已生成，token 已花）。 |
+| `scan_planner_context` | `True` | 从 planner 上下文解析自身消息 ID（覆盖启动前的历史消息）。 |
+| `track_outbound_ids` | `True` | 记录自身出站消息 ID（精确、零 RPC，也覆盖其它插件以 bot 身份发的消息）。 |
+| `exempt_private_chat` | `True` | 私聊豁免：只拦确认的群聊；关闭后私聊也会拦（永不豁免）。 |
+| `private_exempt_limit` | `2` | 私聊连续豁免上限（次）：用尽后按自回复拦截处理；`0` = 无上限（始终豁免）。仅私聊豁免开启时生效。 **取值范围** `0~`。 |
+| `exempt_group_chat` | `False` | 群聊豁免：开启后群聊里也先连续豁免若干次自回复，用尽后再拦。 |
+| `group_exempt_limit` | `1` | 群聊连续豁免次数：仅群聊豁免开启时生效；`0` = 无上限。 **取值范围** `0~`。 |
+| `id_ttl_seconds` | `3600` | 自身消息 ID 的记录保留时长（秒）。 **取值范围** `60~86400`。 |
+| `max_tracked_ids` | `1000` | 单个会话最多记录多少条自身消息 ID（超出淘汰最旧）。 **取值范围** `50~20000`。 |
+
+### `[duplicate_reply_guard]` 重复回复拦截（1.2.0，**默认关闭**）
+
+> 迁自同一插件。解决"同一条目标消息在同一个内部轮次里被回两次"：同样走**生成前剔除 + 发送前兜底**两道闸，
+> 但"已回复"只在**送达回执**（`send_service.after_send` 的 `sent=True`）之后才登记——
+> 生成成功 ≠ 送达成功，发送失败时 planner 重试同一目标不该被误拦。
+
+- **同批去重**：同一次响应里对同一目标并行调用两次 `reply`，第二条按重复处理。该分支**同样受本节 `enabled` 门控**
+  （功能关闭时整块不生效、零副作用；总复审修正——旧插件此分支不看开关，功能关闭时仍会剔除并写拦截日志）。功能开启时
+  与旧插件逐行等价；`strip_at_planner = false` 时同批去重同样不生效（见下方字段表）。
+- **延时补充放行（默认开，阈值 30 秒）**：距上次回复已达到/超过阈值的"再补一句"按补充说明放行（只放宽、不收紧；
+  阈值大于去重窗口时以去重窗口为准）。自回复拦截不受影响。
+- 轮标记 TTL 120 秒；功能在标记写入后被热更新关闭时，发送前会复查功能开关并**放行 + 清掉陈旧标记**。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `False` | 是否启用重复回复拦截。 **默认关闭** |
+| `strip_at_planner` | `True` | 生成前剔除：重复指向同一目标的 `reply` 调用从 `output_items` 里删掉。 |
+| `abort_at_send` | `True` | 发送前兜底：本轮被判定为重复回复时中止其下发。 |
+| `dedupe_window_seconds` | `180` | 去重时间窗（秒）：同一目标在窗口内只允许回复一次；用户之后发的新消息不受影响。 **取值范围** `10~3600`。 |
+| `allow_late_repeat` | `True` | 延时补充放行：对非自己的目标，距上次回复超过阈值后放行（视为补充说明）。 |
+| `late_repeat_after_seconds` | `30` | 延时补充阈值（秒）：仅在上一项开启时生效。 **取值范围** `5~3600`。 |
+
+### `[intercept_log]` 拦截独立日志（1.2.0，默认开启）
+
+> 迁自同一插件：拦截行为**不复用宿主主日志**，逐条按 JSON Lines 追加到插件数据目录
+> （`data/plugins/github.cateye.better-post-processing/<文件名>`），便于单独 grep / 统计；
+> 文件超限按 `base → .1 → .2 …` 轮转。守卫模块关闭时本日志天然无输出，所以默认维持开启。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `True` | 是否记录拦截行为到独立日志文件（关闭后拦截仍生效，只是不写文件）。 |
+| `file_name` | `'intercept.jsonl'` | 日志文件名（只取文件名部分，路径分隔符会被剥离，日志永远落在插件数据目录内）。 |
+| `max_file_size_kb` | `1024` | 单个日志文件大小上限（KB），超过后轮转。 **取值范围** `16~102400`。 |
+| `backup_count` | `3` | 轮转保留的历史文件份数（0 = 直接截断当前文件）。 **取值范围** `0~20`。 |
+| `echo_to_main_log` | `False` | 是否同时把拦截记录打到宿主主日志。 |
+| `echo_level` | `'info'` | 回显主日志时使用的级别（`debug` / `info` / `warning`）。 |
+
+### `[cross_chat_recall]` 跨聊私聊回忆（1.2.0，**默认关闭**）
+
+> 迁自 cateye_mai_cross-chat_recall v0.3.1。让 bot 在群聊里能想起与某位群友的**私聊**内容：
+> 扫描群内活跃用户与 bot 的私聊 → LLM 总结入库（SQLite：`cross_chat_recall.db`）→ 把概括注入**群聊**
+> planner / replyer 上下文；另提供 LLM 工具 `recall_private_chat` 按需主动召回（召回成功后按粘性时长继续注入 reply）。
+> **扫描与注入只发生在群聊会话**；私聊内容只读不改。
+>
+> **平铺说明（重要）**：旧插件的 `[scan]` / `[summarize]` / `[inject]` / `[store]` / `[scope]` / `[tool]` 六节在合并后
+> 降级为**本节内的 20 个扁平字段**（键名沿用原字段名，下文已按功能分组标注）。原因是经核实 `maibot_sdk` 只把
+> **顶层**字段识别为配置分组，节内再嵌套配置类会退化成 JSON 编辑框（`type=object` / `ui_type=json`）——
+> 两级嵌套 section 不被 SDK/WebUI 支持。旧的两级键路径（`[cross_chat_recall.scan]` 等）已登记进
+> `migrate_legacy_config`，手写过嵌套形态的配置会**自动平移到对应扁平字段**，不会被重置成默认值。
+> **例外**：原 `[scope]` 的四个名单键（`group_whitelist` / `group_blacklist` / `user_whitelist` /
+> `user_blacklist`）**不在迁移登记表内**——它们已被下面的"共用名单 + 模式"取代，语义不同（旧白名单非空=仅这些
+> 生效、旧黑名单优先），机械搬运会改变用户语义，故**旧值不自动迁移**；残留的旧键由配置模型的 `extra="ignore"`
+> 丢弃，生效值回到默认空名单 + 黑名单模式。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `False` | 是否启用跨聊私聊回忆。 **默认关闭**：不扫描、不注入、不建库；`/ccr` 两命令与召回工具也不再响应 |
+| **`trigger_mode`** | `'planner'` | 扫描触发方式：`planner`=每次 planner 请求前扫一轮；`push`=群聊每新进 N 条非 bot 消息扫一轮；`reply`=只在回复某条消息时扫被回复的人。 |
+| **`scan_count`** | `10` | 扫描数：取群聊最近 N 条非 bot 消息汇总其中的用户作为候选（push 模式下同时是计数阈值）。 **取值范围** `1~100`。 |
+| **`min_user_messages`** | `5` | 触发总结的用户消息数阈值（总结窗口内，不含 bot 消息）。 **取值范围** `1~`。 |
+| **`window_hours`** | `24.0` | 总结时间窗口（小时）：更早的私聊消息不参与总结。 **取值范围** `0.1~`。 |
+| **`resummarize_push_count`** | `5` | 重总结推进数：距上次总结新推进这么多条用户消息后进入重总结队列（下次扫描才真正重写）。 **取值范围** `1~`。 |
+| **`model`** | `'replyer'` | 总结模型：任务名（`replyer` / `planner` / `utils`）或具体模型名；留空 = `utils` 任务。 |
+| **`max_tokens`** | `1024` | 总结请求的 max_tokens（0 = 不限制）。 **取值范围** `0~`。 |
+| **`prompt`** | 内置提示词全文 | 总结提示词（system）；**默认值就是内置提示词全文**（生成的 `config.toml` 里直接写入全文），**清空**（或只留空白）= 回退内置提示词。支持 `{bot_name}` / `{user_nickname}` / `{user_id}` 占位符。 |
+| **`inject_planner`** | `True` | 是否把私聊概括注入 planner 上下文（首条 SystemMessageItem 之后）。 |
+| **`inject_reply`** | `True` | 是否把私聊概括注入 reply 上下文（同上）。粘性召回也受本开关控制。 |
+| **`planner_user_mode`** | `'trigger'` | planner 注入用户：`trigger`=触发消息的归属用户；`recent_users`=最近 N 条非 bot 消息里的用户。 |
+| **`recent_user_count`** | `5` | `recent_users` 模式取多少条非 bot 消息里的用户。 **取值范围** `1~50`。 |
+| **`reply_user_mode`** | `'reply_source'` | reply 注入用户：`reply_source`=被回复消息的发送者；`follow_planner`=跟随 planner 的用户。 |
+| **`summary_ttl_hours`** | `24.0` | 总结保留时长（小时）：截止时间超出的总结会被删除且不再注入。 **取值范围** `0.1~`。 |
+| **`group_list_mode`** | `'blacklist'` | 群聊名单模式（`blacklist` / `whitelist`）：决定下面那张名单怎么解释。 |
+| **`group_list`** | `[]` | 群聊名单（群号）：**黑名单模式**下名单内的群不生效、留空 = 全部生效；**白名单模式**下仅名单内的群生效、留空 = 全部不生效。 |
+| **`user_list_mode`** | `'blacklist'` | 用户名单模式（`blacklist` / `whitelist`）。 |
+| **`user_list`** | `[]` | 用户名单（QQ 号）：语义同群聊名单——黑名单模式名单内不扫描/不注入、留空 = 全部生效；白名单模式仅名单内扫描/注入、留空 = 全部不生效。 |
+| **`recall_retention_minutes`** | `5.0` | 粘性召回保留分钟数：工具成功召回后，该用户的概括在这段时间内继续注入 reply；再次召回会刷新。 **取值范围** `0.5~1440`。 |
+| **`context_window_messages`** | `50` | 名称候选上下文消息数：工具只认当前聊流最近这么多条消息里出现过的昵称。 **取值范围** `5~200`。 |
+
+**`/ccr` 命令（operator）**：`/ccr debug test` 给当前聊流的下一次 planner 与 reply 强制注入自己的私聊回忆
+（有效期 10 分钟；暂无总结时先触发一次定向扫描）；`/ccr clean` 清空总结库并清除全部强制注入与粘性标记。
+插件总开关或本模块开关关闭时，两命令直接返回"插件未启用，命令未执行。"且不产生任何副作用。
+
+**召回工具 `recall_private_chat`（随本模块门控）**：仅在**群聊**会话可用；`user_name` 取当前会话上下文里
+出现过的昵称（名称完全相等或与 QQ 号相等优先，未命中则按正则降级、非法正则按字面量匹配）；命中多个用户时
+返回「昵称（QQ 号）」候选名单，可传昵称或 QQ 号重查（不附带私聊内容）。
+
 ### WebUI 显示与翻译（0.6.1；提示文本 0.11.1）
 
 - 所有配置字段都有中文短标签（`label`），不再显示英文变量名；详细说明悬停在
@@ -968,6 +1129,6 @@ planner 按需补录**不再重试它**——否则每轮 planner 都会把它�
   `i18n.en.hint`，未命中时回退到这句中文。
 - **板块标题下的那行说明（0.12.2 起只写一句话）**：它取的是配置类的 `__doc__`，而
   `maibot_sdk` 只做 `strip()`、**不做 dedent**——多行 docstring 会带着源码缩进显示成一坨。
-  所以本插件的 13 个板块 docstring 一律一句话（12~23 字），设计说明与历史沿革写成类上方的
+  所以本插件的 17 个板块 docstring 一律一句话（12~23 字），设计说明与历史沿革写成类上方的
   `#` 注释保留在源码里。
 

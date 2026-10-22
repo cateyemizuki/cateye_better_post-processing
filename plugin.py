@@ -4,11 +4,15 @@
 
 | 文件 | 职责 |
 |---|---|
-| ``plugin.py`` | 配置模型、生命周期、共享基础设施（回复轮记录、文本规则、表情包功能），组合下面三个 mixin |
+| ``plugin.py`` | 配置模型、生命周期、共享基础设施（回复轮记录、文本规则、表情包功能），组合下面六个 mixin |
 | ``modules/requirements.py`` | 各模块的宿主前置条件与可用性判定 |
 | ``modules/post_process_takeover.py`` | 后处理接管（错别字 + 分段 + 多段发送 + 异常兜底提示词占位替换） |
 | ``modules/quote_takeover.py`` | 引用回复接管（直接/引用/@/引用＋@ 权重抽取） |
 | ``modules/status_command.py`` | ``/bpp`` 状态命令（合并转发 + 一图流）与 ``/bpp fallback`` 兜底测试 |
+| ``modules/empty_reply_fallback.py`` | 回复兜底（默认关闭：replyer 一条正文都没生成时补一条；兜底文本配置也在此节） |
+| ``modules/self_reply_guard.py`` | 自回复 / 重复回复拦截（1.2.0 合并，默认关闭；迁自 cateye_duplicate_reply_guard） |
+| ``modules/cross_chat_recall.py`` | 跨聊私聊回忆（1.2.0 合并，默认关闭；迁自 cateye_mai_cross-chat_recall）+ 旧数据迁移 |
+| ``intercept_log.py`` / ``helpers.py`` / ``injector.py`` / ``name_resolver.py`` / ``scanner.py`` / ``store.py`` / ``summarizer.py`` / ``logging_setup.py`` | 1.2.0 随合并迁入的支撑模块（拦截 JSONL 日志、消息解析、注入块、名称解析、扫描、总结库、总结器、CCR 文件日志——后者只随迁不初始化） |
 | ``post_processing.py`` | 宿主后处理算法的逐行复刻（纯逻辑，可离线单测） |
 
 **模块前置条件**：两个接管模块都要求宿主**关闭对应能力**才会工作，且都额外要求关闭
@@ -28,7 +32,7 @@
 ``before_post_process`` 一个 Hook 无法把一条待发消息拆成多条；因此改用 **Hook 组合 +
 ``ctx.send.text``** 复现同一效果（见 ``modules/post_process_takeover.py`` 的模块说明）。
 
-当前提供六个互相独立的功能：
+当前提供九个互相独立的功能（其中 7~9 为 1.2.0 合并进来的三个模块，**默认关闭**）：
 
 1. 后处理接管（``[response_splitter]``）：框架
    ``response_post_process.enable_response_post_process`` 关闭时，在
@@ -43,7 +47,7 @@
    撤回前按 ``recall_delay_seconds`` 先等一会儿（留空 = 按被撤回那条的打字时长自动）。
    与宿主**有意不同**的两处：整词同音替换的组合数上限、``@昵称`` 不参与错字生成
    （宿主会把它一起改错，配合真实 at 组件就成了"一条消息两个 @"）。
-   **异常兜底提示词**（1.0.0，``[response_splitter] fallback_prompts``）：触发
+   **异常兜底提示词**（1.0.0；1.3.0 起位于 ``[empty_reply_fallback] fallback_prompts``）：触发
    「过长 / 句子太多」兜底时改从自定义列表随机抽一条（支持 ``{bot_name}`` /
    ``{user_name}`` 占位，事件循环侧替换）；留空（默认）= 只用宿主自带的兜底提示词。
    分段/错别字/打字速度参数默认读宿主自身配置（``response_splitter.*``、``chinese_typo.*``、
@@ -163,6 +167,19 @@
    取图按 hash：入站载荷内联字节 → 宿主图片文件（根目录包含校验）→
    ``emoji.get_random`` 抽样（本地算 sha256 比对）。
 
+7. 自回复 / 重复回复拦截（``[self_reply_guard]`` / ``[duplicate_reply_guard]``，1.2.0 合并，
+   **默认关闭**）：生成前从 ``output_items`` 剔除命中"回自己"或"窗口内重复回同一目标"的
+   ``reply`` 调用，发送前在 ``send_service.before_send``（LATE）兜底 ``abort``；
+   判定依据（planner 上下文里的 ``is_self_message`` 消息 ID、自身出站台账、送达回执后登记的
+   已回复目标）全部零 RPC。拦截行为可写插件数据目录下的独立 JSONL 日志（``[intercept_log]``）。
+   实现见 ``modules/self_reply_guard.py``。
+8. 跨聊私聊回忆（``[cross_chat_recall]``，1.2.0 合并，**默认关闭**）：扫描群友与 bot 的私聊 →
+   LLM 总结入库 → 把概括注入**群聊** planner / replyer 上下文；LLM 工具
+   ``recall_private_chat`` 按昵称（多候选可传 QQ 号）主动召回，召回成功后按粘性时长继续
+   随 reply 注入；``/ccr debug test``、``/ccr clean`` 两个 operator 命令随之迁入。
+   实现见 ``modules/cross_chat_recall.py``（含旧插件数据的一次性 copy 迁移）。
+9. 拦截独立日志（``[intercept_log]``，1.2.0，默认开启）：仅服务于上面第 7 项，守卫关闭时无输出。
+
 聊天流表情冷却（``[emoji_cooldown]``）：``send_service.after_send``（observe）观察到
 任何来源（planner 的 send_emoji 工具、其它插件、本插件自身）的表情包消息发出后，
 该聊天流进入冷却（默认连 ``storage_message=False`` 未入库的表情也计入，见
@@ -216,9 +233,14 @@ from .modules.post_process_takeover import (
 from .modules.empty_reply_fallback import EmptyReplyFallbackMixin
 from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.status_command import StatusCommandMixin
+# 阶段 3 合并（1.2.0，迁自两个旧插件；旧插件目录原样保留）
+from .modules.self_reply_guard import SelfReplyGuardMixin
+from .modules.cross_chat_recall import CrossChatRecallMixin
 from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
+# 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
+from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.1.3"
+SUPPORTED_CONFIG_VERSION = "1.3.2"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -504,7 +526,7 @@ _MIGRATABLE_LEGACY_PATHS: Dict[str, Tuple[str, str]] = {
     "quote_reply_private.weight_quote": ("quote_reply_private_weights", "weight_quote"),
     # 0.11.0 的宿主镜像节：名字变回/并入功能板块
     "response_post_process.typing_speed": ("response_splitter", "typing_speed"),
-    "bot.nickname": ("response_splitter", "fallback_nickname"),
+    "bot.nickname": ("empty_reply_fallback", "fallback_nickname"),
     "host_override.typing_speed": ("response_splitter", "typing_speed"),
     "host_override.splitter_enable": ("response_splitter", "enable"),
     "host_override.splitter_max_length": ("response_splitter", "max_length"),
@@ -517,10 +539,58 @@ _MIGRATABLE_LEGACY_PATHS: Dict[str, Tuple[str, str]] = {
     "host_override.typo_min_freq": ("chinese_typo", "min_freq"),
     "host_override.typo_tone_error_rate": ("chinese_typo", "tone_error_rate"),
     "host_override.typo_word_replace_rate": ("chinese_typo", "word_replace_rate"),
-    "host_override.bot_nickname": ("response_splitter", "fallback_nickname"),
+    "host_override.bot_nickname": ("empty_reply_fallback", "fallback_nickname"),
+    # 1.3.0 排版：兜底文本从 [response_splitter] 移入 [empty_reply_fallback]（板块改名为「回复兜底」）
+    "response_splitter.fallback_nickname": ("empty_reply_fallback", "fallback_nickname"),
+    "response_splitter.fallback_prompts": ("empty_reply_fallback", "fallback_prompts"),
     # 0.11.0 已经叫这些名字、节也同名：留着这条便于跨版本比对（值本身照搬）
     "response_splitter.enable": ("response_splitter", "enable"),
 }
+
+# ---------------------------------------------------------------------------
+# 阶段 3 合并（1.2.0）：跨聊私聊回忆的**两级旧键路径**迁移（计划书 6.2 的"嵌套风险预案"）
+# ---------------------------------------------------------------------------
+#
+# 旧插件 cateye_mai_cross-chat_recall 的配置是 [scan]/[summarize]/[inject]/[store]/[scope]/[tool]
+# 六节（写作 ``[cross_chat_recall.scan] xxx`` 之类的两级形态）。合并后核实 SDK 不支持两级
+# 嵌套 section（见 ``CrossChatRecallSectionConfig`` 上方注释），于是**平铺**为单节内 20 个
+# 扁平字段（多数沿用原字段名；作用范围四项在 1.2.0 定稿改成"共用名单 + 模式"，见下）；
+# 这里登记"旧两级键 → 新平铺键"，让手写过嵌套形态/从旧形态平移过来的配置不会
+# 被静默重置成默认值（旧键只在本次迁移存在一次，下一版不再有效）。
+# **例外**：原 [scope] 的四个名单键不登记（见下方 "store" 行后的说明）——登记表因此是
+# 16 条字段路径 + 1 条 ``cross_chat_recall.plugin.enabled`` = **17 条**。
+_LEGACY_NESTED_SECTIONS: Dict[str, Tuple[str, ...]] = {
+    "scan": ("trigger_mode", "scan_count"),
+    "summarize": (
+        "min_user_messages",
+        "window_hours",
+        "resummarize_push_count",
+        "model",
+        "max_tokens",
+        "prompt",
+    ),
+    "inject": (
+        "inject_planner",
+        "inject_reply",
+        "planner_user_mode",
+        "recent_user_count",
+        "reply_user_mode",
+    ),
+    "store": ("summary_ttl_hours",),
+    # 1.2.0 定稿：原 [scope] 四名单（group_whitelist / group_blacklist / user_whitelist /
+    # user_blacklist）**不再登记**——它们已被"共用名单 + 模式开关"取代，旧值无法机械映射
+    # （旧白名单非空=仅这些生效、旧黑名单优先，与新黑名单模式的"名单内不生效"语义不同），
+    # 故旧值不自动迁移；配置模型 ``extra="ignore"``，残留的旧键/旧子节会被静默丢弃。
+    "tool": ("recall_retention_minutes", "context_window_messages"),
+}
+# 旧 ``[cross_chat_recall.plugin] enabled`` → 新 ``[cross_chat_recall] enabled``
+# （旧插件自己的总开关语义在合并后由本插件的 [plugin].enabled 承担，这里只搬模块开关值）。
+_MIGRATABLE_LEGACY_NESTED_PATHS: Dict[str, Tuple[str, str]] = {
+    f"cross_chat_recall.{section}.{field}": ("cross_chat_recall", field)
+    for section, fields in _LEGACY_NESTED_SECTIONS.items()
+    for field in fields
+}
+_MIGRATABLE_LEGACY_NESTED_PATHS["cross_chat_recall.plugin.enabled"] = ("cross_chat_recall", "enabled")
 # 彻底删除、迁移时直接丢弃的旧字段（避免它们触发"未知键"警告）。
 _LEGACY_REMOVED_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("post_process", "multi_message"),
@@ -597,6 +667,24 @@ def migrate_legacy_config(config_data: Dict[str, Any]) -> Dict[str, Any]:
         # **旧键覆盖新键**：宿主 Runner 在调用本方法之前已经用"默认值"补全过缺失的新键，
         # 不覆盖的话用户改过的旧值会被默认值悄悄顶掉。旧键只在这一版存在一次，下一版就没有了。
         target[new_field] = value
+
+    # 两级旧键（1.2.0 合并的 [cross_chat_recall.*] 六节 → 单节平铺）：从旧子节里取值、
+    # 搬到平铺字段；子节被搬空即删除。
+    for legacy_path, (new_section, new_field) in _MIGRATABLE_LEGACY_NESTED_PATHS.items():
+        outer, _, rest = legacy_path.partition(".")
+        sub_section, _, sub_field = rest.partition(".")
+        outer_values = migrated.get(outer)
+        if not isinstance(outer_values, dict):
+            continue
+        sub_values = outer_values.get(sub_section)
+        if not isinstance(sub_values, dict) or sub_field not in sub_values:
+            continue
+        value = sub_values.pop(sub_field)
+        if not sub_values:
+            outer_values.pop(sub_section, None)
+        target = migrated.setdefault(new_section, {})
+        if isinstance(target, dict):
+            target[new_field] = value
 
     # 搬空了的旧节直接丢掉（[post_process] / [host_override] / [bot] 等）
     for section in list(migrated):
@@ -1321,46 +1409,6 @@ class ResponseSplitterSectionConfig(PluginConfigBase):
             **_ui_i18n("Typing speed", "Empty = follow host response_post_process.typing_speed."),
         },
     )
-    fallback_nickname: str = Field(
-        default=FOLLOW_HOST,
-        description=(
-            "宿主【bot · 昵称】：麦麦显示和自称时使用的名字。留空 = 跟随宿主。"
-            "插件只用于复刻「整条回复过长 / 句子太多时回退默认回复」的文本（「<昵称>不知道哦」）"
-        ),
-        json_schema_extra={
-            "label": "兜底回复的自称",
-            "x-toml-comment": "复刻兜底默认回复用的自称（宿主 bot.nickname）。留空 = 跟随宿主。",
-            **_ui_i18n("Fallback nickname", "Empty = follow host bot.nickname."),
-        },
-    )
-    fallback_prompts: List[str] = Field(
-        default_factory=list,
-        description=(
-            "异常兜底提示词：回复触发「过长 / 句子太多」兜底时，从这份列表里**随机抽一条**发送，"
-            "顶替宿主自带的兜底提示词（「<昵称>不知道哦」那一组）。支持两个占位符："
-            "{bot_name} = bot 昵称（上面的「兜底回复的自称」生效值）、"
-            "{user_name} = 要回复的那条消息的发送者名称（群名片优先，查不到时替换为空）。"
-            "留空（默认）= 只使用宿主自带的兜底提示词。仅后处理接管生效时起作用"
-            "（宿主自己做后处理时兜底文本由宿主决定，插件无从介入）；"
-            "可用「/bpp fallback」引用一条消息实测抽取与占位效果"
-        ),
-        json_schema_extra={
-            "label": "异常兜底提示词",
-            "x-toml-comment": (
-                "兜底触发时随机抽一条发送；支持 {bot_name}/{user_name} 占位；"
-                "留空 = 只用宿主自带的兜底提示词。"
-            ),
-            "rows": 4,
-            **_ui_i18n(
-                "Fallback prompts",
-                "Custom fallback messages: when a reply hits the too-long/too-many-sentences guard, "
-                "one of these is picked at random instead of the host's built-in fallback replies. "
-                "Placeholders {bot_name} and {user_name} (sender of the message being replied to) "
-                "are substituted. Empty (default) = keep the host's built-in prompts. "
-                "Only applies while the post-process takeover is active; test with '/bpp fallback'.",
-            ),
-        },
-    )
     yield_to_other_plugins: bool = Field(
         default=True,
         description=(
@@ -1410,17 +1458,16 @@ class ResponseSplitterSectionConfig(PluginConfigBase):
 
 
 class EmptyReplyFallbackSectionConfig(PluginConfigBase):
-    """为空回复补一条兜底消息（默认关闭）。"""
+    """回复兜底：空回复补发与兜底文本配置。"""
 
-    __ui_label__ = "空回复兜底"
+    __ui_label__ = "回复兜底"
     __ui_icon__ = "reply"
     __ui_order__ = 8
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
-            "title": "Empty Reply Fallback",
+            "title": "Reply Fallback",
             "description": (
-                "When replyer produced no visible text at all (model returned empty content), "
-                "send one fallback message instead of staying silent."
+                "Fallback text for empty replies and for replies that hit the too-long/too-many-sentences guard."
             ),
         },
     }
@@ -1428,23 +1475,65 @@ class EmptyReplyFallbackSectionConfig(PluginConfigBase):
     enabled: bool = Field(
         default=False,
         description=(
-            "空回复兜底：replyer **一条正文都没生成**时（模型返回空内容，或后处理前 Hook 把正文清空），"
+            "回复兜底：replyer **一条正文都没生成**时（模型返回空内容，或后处理前 Hook 把正文清空），"
             "插件补一条兜底消息，避免「bot 已读不回」。"
-            "文本复用上面【异常兜底提示词】那一组（同一份列表、同样的 {bot_name}/{user_name} 占位符；"
-            "列表为空时用宿主自带的兜底提示词），「兜底回复的自称」也取上面的值。"
+            "文本取本板块的【异常兜底提示词】（列表为空时用宿主自带的兜底提示词），"
+            "自称取【兜底回复的自称】。"
             "只在正文与 output_items 都取不到文本、且没有工具调用时才介入"
             "（模型先调工具再发正文属正常流程，不会被当成失败）。"
             "默认关闭 = 与宿主行为完全一致（不补）"
         ),
         json_schema_extra={
-            "label": "启用空回复兜底",
+            "label": "启用回复兜底",
             "x-toml-comment": (
-                "replyer 没生成任何正文时补一条兜底消息（复用【异常兜底提示词】）。"
+                "replyer 没生成任何正文时补一条兜底消息（用本板块的【异常兜底提示词】）。"
                 "默认关闭 = 与宿主一致。"
             ),
             **_ui_i18n(
-                "Enable empty reply fallback",
+                "Enable reply fallback",
                 "Send one fallback message when replyer produced no visible text at all. Off = host behavior.",
+            ),
+        },
+    )
+    fallback_nickname: str = Field(
+        default=FOLLOW_HOST,
+        description=(
+            "宿主【bot · 昵称】：麦麦显示和自称时使用的名字。留空 = 跟随宿主。"
+            "用于「整条回复过长 / 句子太多时回退默认回复」的文本（「<昵称>不知道哦」）"
+            "与「异常兜底提示词」里的 {bot_name} 占位符"
+        ),
+        json_schema_extra={
+            "label": "兜底回复的自称",
+            "x-toml-comment": "兜底文本里的自称（宿主 bot.nickname）。留空 = 跟随宿主。",
+            **_ui_i18n("Fallback nickname", "Empty = follow host bot.nickname."),
+        },
+    )
+    fallback_prompts: List[str] = Field(
+        default_factory=list,
+        description=(
+            "异常兜底提示词：回复触发「过长 / 句子太多」兜底，或回复兜底补发时，"
+            "从这份列表里**随机抽一条**发送，顶替宿主自带的兜底提示词（「<昵称>不知道哦」那一组）。"
+            "支持两个占位符：{bot_name} = bot 昵称（【兜底回复的自称】生效值）、"
+            "{user_name} = 要回复的那条消息的发送者名称（群名片优先，查不到时替换为空）。"
+            "留空（默认）= 只使用宿主自带的兜底提示词。"
+            "「过长 / 句子太多」兜底仅在后处理接管生效时起作用"
+            "（宿主自己做后处理时兜底文本由宿主决定，插件无从介入）；"
+            "可用「/bpp fallback」引用一条消息实测抽取与占位效果"
+        ),
+        json_schema_extra={
+            "label": "异常兜底提示词",
+            "x-toml-comment": (
+                "兜底触发时随机抽一条发送；支持 {bot_name}/{user_name} 占位；"
+                "留空 = 只用宿主自带的兜底提示词。"
+            ),
+            "rows": 4,
+            **_ui_i18n(
+                "Fallback prompts",
+                "Custom fallback messages: when a reply hits the too-long/too-many-sentences guard or the "
+                "empty-reply fallback fires, one of these is picked at random instead of the host's built-in "
+                "fallback replies. Placeholders {bot_name} and {user_name} (sender of the message being "
+                "replied to) are substituted. Empty (default) = keep the host's built-in prompts. "
+                "Test with '/bpp fallback'.",
             ),
         },
     )
@@ -1682,7 +1771,7 @@ class EmojiCooldownSectionConfig(PluginConfigBase):
 
     __ui_label__ = "表情包冷却"
     __ui_icon__ = "timer"
-    __ui_order__ = 13
+    __ui_order__ = 12
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Emoji Cooldown",
@@ -1720,12 +1809,606 @@ class EmojiCooldownSectionConfig(PluginConfigBase):
     )
 
 
+# ---------------------------------------------------------------------------
+# 阶段 3 合并（1.2.0）：以下四个板块迁自两个旧插件，**默认关闭**、尾随在主配置末端
+# ---------------------------------------------------------------------------
+#
+# 行为实现分别在 ``modules/self_reply_guard.py``（自回复拦截 / 重复回复拦截）与
+# ``modules/cross_chat_recall.py``（跨聊私聊回忆）；两旧插件目录原样保留（不删不移动）。
+# 字段名/默认值/取值范围与旧插件一致，唯一改动是 ``self_reply_guard.enabled`` 与
+# ``duplicate_reply_guard.enabled``、``cross_chat_recall.enabled`` 默认 ``False``
+# （计划书 6.2：合并模块默认关闭，未开启时主插件行为与 1.1.3 完全一致）。
+# 1.3.0 排版：跨聊私聊回忆插到自回复拦截之前（配置顺序 = ``[cross_chat_recall]`` →
+# ``[self_reply_guard]`` → ``[duplicate_reply_guard]`` → ``[intercept_log]``）。
+# 旧插件的 ``[plugin] enabled/config_version`` 节不再搬入——总开关由本插件
+# ``[plugin]`` 承担，配置版本统一走本插件 ``config_version``。
+
+
+# 来源：cateye_duplicate_reply_guard v1.1.4 的 [self_reply_guard]。
+class SelfReplyGuardSectionConfig(PluginConfigBase):
+    """阻止 Planner 对 bot 自己发出的消息调用 reply。
+
+    1.3.0：私聊豁免与群聊豁免都受**连续次数上限**约束（私聊默认 2、群聊默认 1；
+    0 = 无上限），成功回复一条非自身消息后计数清零。
+    """
+
+    __ui_label__ = "自回复拦截"
+    __ui_icon__ = "user-x"
+    __ui_order__ = 15
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "Self-reply guard",
+            "description": "Block the Planner from calling reply on the bot's own messages.",
+        },
+    }
+
+    enabled: bool = Field(
+        default=False,
+        description="是否启用自回复拦截",
+        json_schema_extra={
+            "label": "启用自回复拦截",
+            "hint": "默认关闭；关闭后本功能完全不生效。",
+            **_ui_i18n("Enable self-reply guard", "When off this guard is fully disabled."),
+        },
+    )
+    strip_at_planner: bool = Field(
+        default=True,
+        description="生成前拦截：planner 响应里命中自身消息的 reply 调用直接从 output_items 中剔除（不消耗回复生成 token）",
+        json_schema_extra={
+            "label": "生成前剔除",
+            "hint": "推荐开启。命中的 reply 调用不会被生成，零 token 开销。",
+            **_ui_i18n(
+                "Strip before generation",
+                "Recommended. The offending reply call is removed before generation: no tokens burned, no failure feedback.",
+            ),
+        },
+    )
+    abort_at_send: bool = Field(
+        default=True,
+        description="发送前兜底：真正下发前若目标仍是自身消息则中止本次发送",
+        json_schema_extra={
+            "label": "发送前兜底",
+            "hint": "推荐开启。可拦住生成前剔除没覆盖到的路径。",
+            **_ui_i18n(
+                "Abort before send",
+                "Recommended backstop for paths the planner stage misses; the reply is already generated, so tokens are spent.",
+            ),
+        },
+    )
+    scan_planner_context: bool = Field(
+        default=True,
+        description="从 planner 上下文解析自身消息 ID（覆盖插件启动前的历史消息，模型只能选上下文里出现过的 ID）",
+        json_schema_extra={
+            "label": "扫描上下文获取自身消息 ID",
+            "hint": "每次 planner 请求解析一次上下文，覆盖启动前的历史。",
+            **_ui_i18n(
+                "Scan context for own message IDs",
+                "Parses the planner context on every request so pre-startup history is covered. Off means outbound-ledger only.",
+            ),
+        },
+    )
+    track_outbound_ids: bool = Field(
+        default=True,
+        description="记录自身已发出消息的平台消息 ID（宿主在 after_send 时已回填）",
+        json_schema_extra={
+            "label": "记录自身出站消息 ID",
+            "hint": "精确且零 RPC；可覆盖其它插件以 bot 身份发出的消息。",
+            **_ui_i18n(
+                "Track own outbound message IDs",
+                "Exact and RPC-free; also covers messages sent as the bot by other plugins.",
+            ),
+        },
+    )
+    exempt_private_chat: bool = Field(
+        default=True,
+        description="私聊豁免：私聊（如恋人插件的主动私聊）里不拦“回复自己”，只拦确认的群聊",
+        json_schema_extra={
+            "label": "私聊豁免",
+            "hint": "推荐开启。私聊里主动续话是宿主设计内行为；群里回自己才是刷屏。",
+            **_ui_i18n(
+                "Exempt private chats",
+                "Recommended. The host explicitly supports supplementing your own message, which is exactly the "
+                "private-chat continuation pattern; only confirmed group chats are guarded when this is on.",
+            ),
+        },
+    )
+    private_exempt_limit: int = Field(
+        default=2,
+        ge=0,
+        description=(
+            "私聊豁免上限（次）：同一私聊里**连续**豁免自回复的次数上限，用尽后按自回复拦截处理；"
+            "0 = 无上限（始终豁免）。每次成功回复一条非自身消息后计数清零。"
+            "仅「私聊豁免」开启时生效；「私聊豁免」关闭时私聊永不豁免"
+        ),
+        json_schema_extra={
+            "label": "私聊豁免上限（次）",
+            "hint": "默认 2；0 = 始终豁免。私聊豁免关闭时不生效。",
+            **_ui_i18n(
+                "Private exemption limit",
+                "Max consecutive self-replies exempted per private chat; 0 = unlimited. Only used while private "
+                "exemption is on; resets after a successful reply to a non-self message.",
+            ),
+        },
+    )
+    exempt_group_chat: bool = Field(
+        default=False,
+        description="群聊豁免：群聊里也豁免“回复自己”一定次数（次数见下方「群聊豁免次数」）。默认关闭 = 群里一律拦截",
+        json_schema_extra={
+            "label": "群聊豁免",
+            "hint": "默认关闭。开启后群聊里也会先豁免若干次自回复，用尽后再拦截。",
+            **_ui_i18n(
+                "Exempt group chats",
+                "Off by default. When on, a few self-replies in group chats are exempted before the guard starts blocking.",
+            ),
+        },
+    )
+    group_exempt_limit: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            "群聊豁免次数：同一群聊里**连续**豁免自回复的次数上限，用尽后按自回复拦截处理；"
+            "0 = 无上限（始终豁免）。每次成功回复一条非自身消息后计数清零。"
+            "仅「群聊豁免」开启时生效"
+        ),
+        json_schema_extra={
+            "label": "群聊豁免次数",
+            "hint": "默认 1；0 = 始终豁免。群聊豁免关闭时不生效。",
+            **_ui_i18n(
+                "Group exemption limit",
+                "Max consecutive self-replies exempted per group chat; 0 = unlimited. Only used while group "
+                "exemption is on; resets after a successful reply to a non-self message.",
+            ),
+        },
+    )
+    id_ttl_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="自身消息 ID 的记录保留时长（秒）",
+        json_schema_extra={
+            "label": "自身消息 ID 保留时长（秒）",
+            "hint": "过短会漏判较早的自身消息。",
+            **_ui_i18n("Own message ID TTL (seconds)", "Too short may miss older own messages."),
+        },
+    )
+    max_tracked_ids: int = Field(
+        default=1000,
+        ge=50,
+        le=20000,
+        description="单个会话最多记录多少条自身消息 ID",
+        json_schema_extra={
+            "label": "单会话记录上限",
+            "hint": "超出后淘汰最旧记录。",
+            **_ui_i18n("Max tracked IDs per session", "Oldest entries are evicted beyond this limit."),
+        },
+    )
+
+
+# 来源：cateye_duplicate_reply_guard v1.1.4 的 [duplicate_reply_guard]。
+class DuplicateReplyGuardSectionConfig(PluginConfigBase):
+    """阻止在时间窗内对同一条目标消息重复调用 reply。"""
+
+    __ui_label__ = "重复回复拦截"
+    __ui_icon__ = "copy-slash"
+    __ui_order__ = 16
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "Duplicate-reply guard",
+            "description": "Block repeated reply calls on the same target message within a time window.",
+        },
+    }
+
+    enabled: bool = Field(
+        default=False,
+        description="是否启用重复回复拦截",
+        json_schema_extra={
+            "label": "启用重复回复拦截",
+            "hint": "默认关闭；关闭后本功能完全不生效。",
+            **_ui_i18n("Enable duplicate-reply guard", "When off this guard is fully disabled."),
+        },
+    )
+    strip_at_planner: bool = Field(
+        default=True,
+        description="生成前拦截：planner 响应里重复指向同一目标的 reply 调用直接从 output_items 中剔除",
+        json_schema_extra={
+            "label": "生成前剔除",
+            "hint": "推荐开启。消除“同一条被回两次”的主手段，零 token 开销。",
+            **_ui_i18n("Strip before generation", "Recommended primary fix for double replies; no tokens burned."),
+        },
+    )
+    abort_at_send: bool = Field(
+        default=True,
+        description="发送前兜底：本轮被判定为重复回复时中止其下发",
+        json_schema_extra={
+            "label": "发送前兜底",
+            "hint": "建议开启；关掉“生成前剔除”时可能出现重复生成。",
+            **_ui_i18n(
+                "Abort before send",
+                "Keep on, but if strip-before-generation is off, repeated generation may occur (see README risks).",
+            ),
+        },
+    )
+    dedupe_window_seconds: int = Field(
+        default=180,
+        ge=10,
+        le=3600,
+        description="去重时间窗：同一条目标消息在该窗口内只允许回复一次（秒）",
+        json_schema_extra={
+            "label": "去重时间窗（秒）",
+            "hint": "窗口内同一目标只回一次；用户之后发的新消息目标是新消息。",
+            **_ui_i18n(
+                "Dedupe window (seconds)",
+                "One reply per target inside the window. A new user message has a new ID and is unaffected.",
+            ),
+        },
+    )
+    allow_late_repeat: bool = Field(
+        default=True,
+        description="延时补充放行：对非自己的目标消息，距上次回复超过阈值后放行本次回复（视为补充说明）",
+        json_schema_extra={
+            "label": "允许延时补充",
+            "hint": "推荐开启。只拦短时间内的重复，隔一会儿的“再补一句”放行。",
+            **_ui_i18n(
+                "Allow late supplement",
+                "Recommended. Only rapid repeats are blocked; a later follow-up is allowed, matching the host's "
+                "supplement design. When off, nothing is allowed inside the dedupe window.",
+            ),
+        },
+    )
+    late_repeat_after_seconds: int = Field(
+        default=30,
+        ge=5,
+        le=3600,
+        description="延时补充阈值（秒）：距上次回复达到或超过该时长后，允许对同一非自身目标再次回复",
+        json_schema_extra={
+            "label": "延时补充阈值（秒）",
+            "hint": "仅“允许延时补充”开启时生效；大于去重窗口时以去重窗口为准。",
+            **_ui_i18n(
+                "Late supplement threshold (seconds)",
+                "Only used when late supplement is on. Inside the dedupe window but past this many seconds since the "
+                "last reply -> this one is allowed as a supplement. Values above the dedupe window are clamped by the "
+                "window itself; this option never tightens blocking.",
+            ),
+        },
+    )
+
+
+# 来源：cateye_duplicate_reply_guard v1.1.4 的 [intercept_log]；默认维持 True
+# （守卫模块关闭时它天然无输出，不算独立功能开关——计划书 6.2）。
+class InterceptLogSectionConfig(PluginConfigBase):
+    """拦截行为写入插件 data_dir 下的独立日志文件。"""
+
+    __ui_label__ = "拦截日志"
+    __ui_icon__ = "file-text"
+    __ui_order__ = 17
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "Intercept log",
+            "description": "Interception events go to a dedicated file under the plugin data_dir, separate from the host log.",
+        },
+    }
+
+    enabled: bool = Field(
+        default=True,
+        description="是否记录拦截行为到独立日志文件",
+        json_schema_extra={
+            "label": "启用独立日志",
+            "hint": "关闭后拦截仍生效，只是不再写独立文件。",
+            **_ui_i18n("Enable dedicated log", "When off, interception still works but nothing is written to the file."),
+        },
+    )
+    file_name: str = Field(
+        default="intercept.jsonl",
+        description="日志文件名（位于 data/plugins/<插件ID>/ 下）",
+        json_schema_extra={
+            "label": "日志文件名",
+            "hint": "JSON Lines 格式，一行一条拦截记录。",
+            **_ui_i18n("Log file name", "JSON Lines format, one interception record per line."),
+        },
+    )
+    max_file_size_kb: int = Field(
+        default=1024,
+        ge=16,
+        le=102400,
+        description="单个日志文件大小上限（KB），超过后轮转",
+        json_schema_extra={
+            "label": "单文件大小上限（KB）",
+            "hint": "超过后轮转为 .1、.2 …。",
+            **_ui_i18n("Max file size (KB)", "Rotates to .1, .2 ... once exceeded."),
+        },
+    )
+    backup_count: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description="轮转保留的历史文件份数（0 = 直接截断）",
+        json_schema_extra={
+            "label": "历史文件份数",
+            "hint": "0 表示不保留历史，直接截断当前文件。",
+            **_ui_i18n("Backup files", "0 truncates the current file instead of keeping history."),
+        },
+    )
+    echo_to_main_log: bool = Field(
+        default=False,
+        description="是否同时把拦截记录打到宿主主日志",
+        json_schema_extra={
+            "label": "同时输出到主日志",
+            "hint": "默认关闭；开启便于在主日志里直接看到拦截。",
+            **_ui_i18n("Echo to main log", "Off by default; enable to see interceptions in the host log."),
+        },
+    )
+    echo_level: Literal["debug", "info", "warning"] = Field(
+        default="info",
+        description="输出到主日志时使用的级别",
+        json_schema_extra={
+            "label": "主日志级别",
+            "hint": "仅在开启「同时输出到主日志」时生效。",
+            **_ui_i18n("Echo level", "Only used when echo-to-main-log is on."),
+        },
+    )
+
+
+# 来源：cateye_mai_cross-chat_recall v0.3.1。**平铺选型**（计划书 6.2 的"嵌套风险预案"）：
+# 旧插件的 [scan]/[summarize]/[inject]/[store]/[scope]/[tool] 六节在合并后**降级为
+# 单节内的 20 个扁平字段**（键名沿用原字段名）——经核实 maibot_sdk 的
+# ``generate_plugin_config_schema`` 只把**顶层**字段识别为配置分组
+# （``maibot_sdk/config.py:209-220`` 仅在顶层判断 ``is_plugin_config_class``），
+# ``_build_section_schema``（同文件 :274-280）对节内字段一律走 ``_build_field_schema``，
+# 节内嵌套的 PluginConfigBase 会退化成 ``type="object" / ui_type="json"``
+# （``_map_field_type`` :536-537 + ``_default_ui_type`` :565-566），
+# 与文档 v1.3.0 §5.6 "dict 字段渲染为 JSON 编辑器…可能显示 [object Object]" 的坑一致，
+# 即**两级嵌套 section 不被 SDK/WebUI 支持**，故取平铺。
+# 旧键路径已登记进 ``migrate_legacy_config``（见 ``_LEGACY_NESTED_SECTIONS``；
+# 1.2.0 定稿起原 [scope] 四名单不再登记——见 ``_LEGACY_NESTED_SECTIONS`` 内的说明）。
+# 1.2.0 定稿：作用范围改为「共用一张名单 + 模式开关」（group_list/user_list + 各自 mode），
+# 总结提示词 ``prompt`` 默认值直接是内置提示词全文（见 summarizer.DEFAULT_SUMMARY_PROMPT）。
+class CrossChatRecallSectionConfig(PluginConfigBase):
+    """跨聊私聊回忆：扫描群友私聊、LLM 总结、注入群聊上下文，并支持主动召回工具。"""
+
+    __ui_label__ = "跨聊私聊回忆"
+    __ui_icon__ = "message-circle"
+    __ui_order__ = 14
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "Cross-chat private recall",
+            "description": "Scan group members' private chats, summarize them, inject into group context, and recall on demand.",
+        },
+    }
+
+    enabled: bool = Field(
+        default=False,
+        description="是否启用跨聊私聊回忆",
+        json_schema_extra={
+            "label": "启用跨聊私聊回忆",
+            "hint": "默认关闭；关闭后不扫描、不注入，命令与工具也不再响应。",
+            **_ui_i18n("Enable cross-chat recall", "When off, no scanning/injection happens and commands/tools stop responding."),
+        },
+    )
+    # ---- 扫描（原 [scan]）----
+    trigger_mode: Literal["planner", "push", "reply"] = Field(
+        default="planner",
+        description="扫描触发方式（三选一）：planner=planner 触发时扫描；push=群聊新消息推进计数达标时扫描；reply=触发回复时只扫描被回复的目标用户",
+        json_schema_extra={
+            "label": "扫描触发方式",
+            "hint": "planner=每次请求前扫一轮；push=每新进 N 条消息扫一轮；reply=只扫被回复的人。",
+            **_ui_i18n("Scan trigger", "planner / push / reply"),
+        },
+    )
+    scan_count: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="扫描数：取群聊最近 N 条非 bot 消息汇总其中的用户 id 作为候选（push 模式下同时是推进计数阈值）；消息不足 N 条时回退为全部可用消息",
+        json_schema_extra={
+            "label": "扫描数",
+            "hint": "决定扫哪些用户：最近 N 条非 bot 群消息里出现过的用户；push 模式下也是触发阈值。",
+            **_ui_i18n("Scan count", "Recent non-bot messages per scan; push threshold"),
+        },
+    )
+    # ---- 总结（原 [summarize]）----
+    min_user_messages: int = Field(
+        default=5,
+        ge=1,
+        description="私聊触发总结的条件：总结时间窗口内来自用户的消息数达到该值（不含 bot 消息）",
+        json_schema_extra={
+            "label": "用户消息数阈值",
+            "hint": "24 小时窗口内对方发的消息达到这么多条才会总结。",
+            **_ui_i18n("Min user messages", "User messages required in window"),
+        },
+    )
+    window_hours: float = Field(
+        default=24.0,
+        ge=0.1,
+        description="总结时间窗口（小时）：超出窗口的私聊消息一律不触发总结，也不会进入 LLM 总结请求体",
+        json_schema_extra={
+            "label": "时间窗口（小时）",
+            "hint": "只总结最近这段时间的私聊；更早的消息不参与总结。",
+            **_ui_i18n("Window (hours)", "Only summarize chats within this window"),
+        },
+    )
+    resummarize_push_count: int = Field(
+        default=5,
+        ge=1,
+        description="允许被重新总结的判断：距上次总结新推进（不含 bot 消息）多少条用户消息后进入重总结队列；进入队列后不立刻总结，再次被扫描到才重新总结（全量重写覆盖）",
+        json_schema_extra={
+            "label": "重总结推进数",
+            "hint": "对方再发这么多条消息后标记待重总结，等下次扫描时才真正重新总结。",
+            **_ui_i18n("Re-summarize push count", "New messages before re-summarize queue"),
+        },
+    )
+    model: str = Field(
+        default="replyer",
+        description="总结使用的模型：填模型任务名（replyer/planner/utils 等，默认 replyer）或 WebUI 模型列表里的具体模型名；留空走 utils 任务",
+        json_schema_extra={
+            "label": "总结模型",
+            "hint": "填任务名走对应任务路由；或填具体模型名；留空=utils。",
+            "placeholder": "replyer",
+            **_ui_i18n("Summary model", "Task name (replyer) or concrete model name; empty = utils"),
+        },
+    )
+    max_tokens: int = Field(
+        default=1024,
+        ge=0,
+        description="总结 LLM 请求的最大 token 数（0 = 不限制）",
+        json_schema_extra={
+            "label": "最大 token 数",
+            "hint": "0 表示不限制；默认提示词约输出 400 字，1024 足够。",
+            **_ui_i18n("Max tokens", "0 = unlimited"),
+        },
+    )
+    prompt: str = Field(
+        default=DEFAULT_SUMMARY_PROMPT,
+        description="总结提示词（system 角色，发给 LLM 的总结要求）：默认值就是插件内置提示词**全文**（生成的默认配置文件里直接写入全文）；把本项清空（或只留空白）则回退使用内置提示词。支持占位符：{bot_name}=bot 名字，{user_nickname}=对方昵称，{user_id}=对方 QQ 号",
+        json_schema_extra={
+            "label": "总结提示词",
+            "hint": "默认=内置提示词全文；清空（或纯空白）=回退内置提示词；可用 {bot_name} {user_nickname} {user_id}。",
+            "x-widget": "textarea",
+            "rows": 8,
+            "placeholder": "默认即内置提示词全文；清空回退内置",
+            **_ui_i18n(
+                "Summary prompt",
+                "Defaults to the built-in prompt in full; blank falls back to the built-in prompt. "
+                "Supports {bot_name}/{user_nickname}/{user_id}.",
+            ),
+        },
+    )
+    # ---- 注入（原 [inject]）----
+    inject_planner: bool = Field(
+        default=True,
+        description="是否把私聊概括注入 planner 上下文（首条 SystemMessageItem 之后）",
+        json_schema_extra={
+            "label": "注入 planner",
+            "hint": "决定 bot 的决策模型能否想起私聊内容。",
+            **_ui_i18n("Inject into planner"),
+        },
+    )
+    inject_reply: bool = Field(
+        default=True,
+        description="是否把私聊概括注入 reply 上下文（首条 SystemMessageItem 之后）",
+        json_schema_extra={
+            "label": "注入 reply",
+            "hint": "决定 bot 回复时能否想起私聊内容。",
+            **_ui_i18n("Inject into reply"),
+        },
+    )
+    planner_user_mode: Literal["trigger", "recent_users"] = Field(
+        default="trigger",
+        description="planner 注入的用户选择：trigger=按触发 planner 的消息的归属用户；recent_users=按触发 planner 的消息最近的 N 条非 bot 消息的用户（N = 下方的 planner 最近用户数）",
+        json_schema_extra={
+            "label": "planner 注入用户",
+            "hint": "trigger=只看触发消息是谁发的；recent_users=看最近 N 条群消息里都有谁。",
+            **_ui_i18n("Planner user mode", "trigger = triggering user; recent_users = users of recent N messages"),
+        },
+    )
+    recent_user_count: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="planner 注入用户选择为 recent_users 模式时，取触发 planner 的消息最近的 N 条非 bot 消息中包含的用户（默认 5，可修改）",
+        json_schema_extra={
+            "label": "planner 最近用户数",
+            "hint": "recent_users 模式下取最近多少条非 bot 群消息里出现过的用户（默认 5）。",
+            **_ui_i18n("Planner recent users", "Users from recent N non-bot messages"),
+        },
+    )
+    reply_user_mode: Literal["reply_source", "follow_planner"] = Field(
+        default="reply_source",
+        description="reply 注入的用户选择：reply_source=按要回复的消息来源用户；follow_planner=跟随 planner 注入的用户",
+        json_schema_extra={
+            "label": "reply 注入用户",
+            "hint": "reply_source=回复谁就注入与谁的私聊；follow_planner=与 planner 同一批人。",
+            **_ui_i18n("Reply user mode", "reply_source / follow_planner"),
+        },
+    )
+    # ---- 总结库（原 [store]）----
+    summary_ttl_hours: float = Field(
+        default=24.0,
+        ge=0.1,
+        description="总结内容截止时间超出多久后丢弃（小时）；过期总结会在扫描时删除且不再注入",
+        json_schema_extra={
+            "label": "总结保留时长（小时）",
+            "hint": "总结里最后一次聊天时间距今超过这个时长就作废删除。",
+            **_ui_i18n("Summary TTL (hours)", "Discard summaries older than this"),
+        },
+    )
+    # ---- 作用范围（原 [scope]）----
+    # 1.2.0 定稿：黑白名单**共用一张名单**，语义由各自的 mode 字段决定（旧 group_whitelist /
+    # group_blacklist / user_whitelist / user_blacklist 四字段已删，语义不同故不做映射迁移）。
+    group_list_mode: Literal["blacklist", "whitelist"] = Field(
+        default="blacklist",
+        description="群聊名单模式：blacklist=名单内的群不生效（名单留空则全部生效）；whitelist=仅名单内的群生效（名单留空则全部不生效）",
+        json_schema_extra={
+            "label": "群聊名单模式",
+            "hint": "blacklist=名单内的群禁用；whitelist=只有名单内的群启用。",
+            **_ui_i18n("Group list mode", "blacklist = listed groups off; whitelist = only listed groups on"),
+        },
+    )
+    group_list: List[str] = Field(
+        default_factory=list,
+        description="群聊名单（群号列表，按「群聊名单模式」解释）：黑名单模式=名单内的群不生效、留空等于全部生效；白名单模式=仅名单内的群生效、留空等于全部不生效",
+        json_schema_extra={
+            "label": "群聊名单",
+            "hint": "黑名单模式=名单内的群不生效、留空等于全部生效；白名单模式=仅名单内的群生效、留空等于全部不生效。",
+            **_ui_i18n(
+                "Group list",
+                "Blacklist mode: listed groups are excluded, empty = every group works. "
+                "Whitelist mode: only listed groups work, empty = none.",
+            ),
+        },
+    )
+    user_list_mode: Literal["blacklist", "whitelist"] = Field(
+        default="blacklist",
+        description="用户名单模式：blacklist=名单内的用户不扫描/不注入（名单留空则全部生效）；whitelist=仅名单内的用户扫描/注入（名单留空则全部不生效）",
+        json_schema_extra={
+            "label": "用户名单模式",
+            "hint": "blacklist=名单内的用户禁用；whitelist=只有名单内的用户启用。",
+            **_ui_i18n("User list mode", "blacklist = listed users off; whitelist = only listed users on"),
+        },
+    )
+    user_list: List[str] = Field(
+        default_factory=list,
+        description="用户名单（QQ 号列表，按「用户名单模式」解释）：黑名单模式=名单内的用户不扫描/不注入、留空等于全部生效；白名单模式=仅名单内的用户扫描/注入、留空等于全部不生效",
+        json_schema_extra={
+            "label": "用户名单",
+            "hint": "黑名单模式=名单内的用户不扫描/不注入、留空等于全部生效；白名单模式=仅名单内的用户扫描/注入、留空等于全部不生效。",
+            **_ui_i18n(
+                "User list",
+                "Blacklist mode: listed users are skipped, empty = all users. "
+                "Whitelist mode: only listed users are scanned/injected, empty = none.",
+            ),
+        },
+    )
+    # ---- 主动召回（原 [tool]）----
+    recall_retention_minutes: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=1440,
+        description="粘性召回保留分钟数：工具成功召回后，该用户的私聊概括会在这段时间内继续注入 reply 上下文；再次成功召回会刷新",
+        json_schema_extra={
+            "label": "粘性召回保留（分钟）",
+            "hint": "工具召回成功后，这段时间内的回复会继续带上该用户的概括；再次召回会重新计时。",
+            **_ui_i18n("Sticky recall (minutes)", "How long a successful recall keeps injecting"),
+        },
+    )
+    context_window_messages: int = Field(
+        default=50,
+        ge=5,
+        le=200,
+        description="名称候选取最近多少条群消息：工具按这个范围解析用户昵称，只认当前会话上下文里出现过的用户",
+        json_schema_extra={
+            "label": "候选上下文消息数",
+            "hint": "只看当前聊流最近这么多条消息里出现过的昵称；调大=能认出更早发言的人。",
+            **_ui_i18n("Context window messages", "Recent messages used to resolve user names"),
+        },
+    )
+
+
 class TextRulesSectionConfig(PluginConfigBase):
     """对 bot 出站纯文本做替换或整条覆盖。"""
 
     __ui_label__ = "文本替换规则"
     __ui_icon__ = "find_replace"
-    __ui_order__ = 12
+    __ui_order__ = 13
     __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
         "en": {
             "title": "Text Rules",
@@ -1919,12 +2602,17 @@ class BetterPostProcessingConfig(PluginConfigBase):
        ``[quote_reply_private]`` 引用回复（私聊）→ ``[quote_reply_private_weights]`` 它的权重；
     3. ``[chinese_typo]`` 错别字 → ``[chinese_typo_weights]`` 它的纠正方式权重；
     4. ``[response_splitter]`` 分段（分割参数 + 打字速度 + 接管机制）→
-       ``[empty_reply_fallback]`` 空回复兜底（复用前者的兜底提示词）；
+       ``[empty_reply_fallback]`` 回复兜底（空回复补发 + 兜底文本）；
     5. ``[emoji_meaning]`` 表情包含义库（排在"分段"与"回复后表情包"之间）；
-    6. 其它功能节（回复后表情包 / 表情包跟风 / 文本替换规则 / 表情包冷却）。
+    6. 其它功能节（回复后表情包 / 表情包跟风 / 表情包冷却 / 文本替换规则）。
 
     不区分"宿主提供的"还是"插件提供的"：同一个功能的开关都放同一个板块，宿主本来就有的参数
     直接用宿主的字段名与说明；**权重类参数一律另开一个权重板块、紧跟在它的功能板块之后**。
+
+    1.2.0（阶段 3 合并）在 ``text_rules`` 之后追加四个板块；1.3.0 起顺序为
+    ``[cross_chat_recall]`` → ``[self_reply_guard]`` → ``[duplicate_reply_guard]`` →
+    ``[intercept_log]``（前三个默认关闭、``intercept_log`` 维持开启；
+    ``cross_chat_recall`` 因 SDK 不支持两级嵌套 section 而**平铺**，见该类上方注释）。
     """
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
@@ -1946,7 +2634,7 @@ class BetterPostProcessingConfig(PluginConfigBase):
     )
     # ---- 分段 ----
     response_splitter: ResponseSplitterSectionConfig = Field(default_factory=ResponseSplitterSectionConfig)
-    # ---- 空回复兜底（默认关闭；复用 [response_splitter] 的兜底提示词）----
+    # ---- 回复兜底（默认关闭；兜底文本配置也在这里）----
     empty_reply_fallback: EmptyReplyFallbackSectionConfig = Field(
         default_factory=EmptyReplyFallbackSectionConfig
     )
@@ -1955,8 +2643,15 @@ class BetterPostProcessingConfig(PluginConfigBase):
     # ---- 其它功能 ----
     emoji_after_reply: EmojiAfterReplySectionConfig = Field(default_factory=EmojiAfterReplySectionConfig)
     emoji_follow: EmojiFollowSectionConfig = Field(default_factory=EmojiFollowSectionConfig)
-    text_rules: TextRulesSectionConfig = Field(default_factory=TextRulesSectionConfig)
     emoji_cooldown: EmojiCooldownSectionConfig = Field(default_factory=EmojiCooldownSectionConfig)
+    text_rules: TextRulesSectionConfig = Field(default_factory=TextRulesSectionConfig)
+    # ---- 阶段 3 合并模块（默认关闭；尾随在主配置末端，计划书 6.2）----
+    cross_chat_recall: CrossChatRecallSectionConfig = Field(default_factory=CrossChatRecallSectionConfig)
+    self_reply_guard: SelfReplyGuardSectionConfig = Field(default_factory=SelfReplyGuardSectionConfig)
+    duplicate_reply_guard: DuplicateReplyGuardSectionConfig = Field(
+        default_factory=DuplicateReplyGuardSectionConfig
+    )
+    intercept_log: InterceptLogSectionConfig = Field(default_factory=InterceptLogSectionConfig)
 
 
 class BetterPostProcessingPlugin(
@@ -1964,6 +2659,8 @@ class BetterPostProcessingPlugin(
     QuoteTakeoverMixin,
     PostProcessTakeoverMixin,
     EmptyReplyFallbackMixin,
+    SelfReplyGuardMixin,
+    CrossChatRecallMixin,
     MaiBotPlugin,
 ):
     """回复后处理接管、回复方式抽取、表情包互动与出站文本规则增强插件。
@@ -1974,6 +2671,9 @@ class BetterPostProcessingPlugin(
     各自的前置条件（需要宿主关闭哪些能力）由 ``modules/requirements.py`` 统一判定。
     ``/bpp`` 状态命令与兜底测试命令在 ``modules/status_command.py``（同为 mixin）。
     ``modules/empty_reply_fallback.py`` 负责"replyer 一条正文都没生成"时的兜底补发。
+    ``modules/self_reply_guard.py``（自回复/重复回复拦截）与 ``modules/cross_chat_recall.py``
+    （跨聊私聊回忆）是 1.2.0 阶段 3 合并进来的两个模块，**默认关闭**：关闭时各自 Hook
+    零副作用直接放行，本插件行为与 1.1.3 完全一致。
     本类保留共享基础设施：回复轮记录、文本规则、表情包相关功能。
     """
 
@@ -2046,6 +2746,9 @@ class BetterPostProcessingPlugin(
         self._tasks: set[asyncio.Task] = set()
         self._init_post_process_takeover()
         self._init_empty_reply_fallback()
+        # 阶段 3 合并模块（默认关闭）：自回复/重复回复拦截与跨聊私聊回忆的状态初始化。
+        self._init_self_reply_guard()
+        self._init_cross_chat_recall()
 
     # ------------------------------------------------------------------
     # 配置生成（宿主现值作为默认值 + 给 config.toml 补行尾注释）
@@ -2198,6 +2901,11 @@ class BetterPostProcessingPlugin(
         self._rebuild_derived_state()
         await self._refresh_global_config()
         self._initialize_meaning_store()
+        # 阶段 3 合并模块：拦截独立日志写入器就绪；跨聊私聊回忆执行一次性旧数据迁移
+        # （copy 不删，见 modules/cross_chat_recall.py::migrate_legacy_data_once），
+        # 模块开启时才建库/读宿主配置。
+        self._self_reply_guard_start()
+        await self._cross_chat_recall_start()
         # 循环无条件启动（内部按配置与库可用性自门控），保证含义库关闭时状态清理仍有节奏。
         self._track_task(asyncio.create_task(self._meaning_worker_loop()))
         # 后处理接管激活时预热拼音/字频/词频（后台线程，避免首次接管回复卡顿）。
@@ -2271,15 +2979,22 @@ class BetterPostProcessingPlugin(
         self._stream_sending_texts.clear()
         self._pending_follow_ups.clear()
         self._prepared_segments.clear()
+        self._planner_segment_records.clear()
         self._pending_quote_targets.clear()
         if self._meaning_store is not None:
             self._meaning_store.close()
             self._meaning_store = None
+        # 阶段 3 合并模块：关闭拦截独立日志写入器、取消跨聊私聊回忆的后台扫描并关库。
+        self._self_reply_guard_stop()
+        await self._cross_chat_recall_stop()
         self.ctx.logger.info("插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             self._rebuild_derived_state()
+            # 阶段 3 合并模块：拦截独立日志按新配置重建；跨聊私聊回忆在模块被打开时补齐运行时。
+            self._self_reply_guard_on_config_update()
+            await self._cross_chat_recall_on_config_update(version)
             self.ctx.logger.info(
                 "插件配置已更新：文本规则 replace=%d, cover=%d, 忽略=%d；回复方式权重 群聊=%s 私聊=%s",
                 len(self._parsed_rules.replaces),
@@ -3582,7 +4297,7 @@ class BetterPostProcessingPlugin(
             self.ctx.logger.warning("表情包跟风执行失败: %s", exc)
 
     # ------------------------------------------------------------------
-    # Hook 5：replyer 空回复兜底（生成可见回复失败时补一条兜底消息）
+    # Hook 5：replyer 回复兜底（生成可见回复失败时补一条兜底消息）
     # ------------------------------------------------------------------
 
     @HookHandler(
@@ -3590,14 +4305,14 @@ class BetterPostProcessingPlugin(
         name="empty_reply_fallback",
         description=(
             "blocking：replyer 生成的正文为空（模型返回空内容 / 后处理前 Hook 清空）且无工具调用时，"
-            "把 response 改写成一条兜底提示词（默认关闭；文本复用 [response_splitter] 的异常兜底提示词）"
+            "把 response 改写成一条兜底提示词（默认关闭；文本复用 [empty_reply_fallback] 的异常兜底提示词）"
         ),
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_replyer_after_response_fallback_hook(self, **kwargs: Any) -> Dict[str, Any]:
-        """空回复兜底的 Hook 入口（实现见 ``modules/empty_reply_fallback.py``）。
+        """回复兜底的 Hook 入口（实现见 ``modules/empty_reply_fallback.py``）。
 
         为什么挂这里：宿主 ``src/maisaka/builtin_tool/reply.py`` 在生成可见回复失败时
         直接 ``return build_failure_result(...)``（第 420 行），**根本不会调用**

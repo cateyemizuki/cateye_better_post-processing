@@ -55,7 +55,7 @@
 ### `/bpp fallback`：实测异常兜底提示词
 
 **引用一条消息**后发送 `/bpp fallback`，插件按与真实兜底完全同源的逻辑抽一条兜底
-提示词（`[response_splitter] fallback_prompts` 自定义列表优先，留空退宿主自带的
+提示词（`[empty_reply_fallback] fallback_prompts` 自定义列表优先，留空退宿主自带的
 「<昵称>不知道哦」那组），替换 `{bot_name}` / `{user_name}` 占位（`user_name` =
 被引用消息的发送者名称，群名片优先；他人可控文本，1.1.2 起替换前做长度截断（24 字符）与控制字符清理），然后**以引用回复的方式**发出。测试消息不写入
 bot 的对话上下文（`sync_to_maisaka_history=False`），不污染记忆；发送与分段补发走

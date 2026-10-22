@@ -12,7 +12,9 @@
 **不受前置条件约束**的模块（宿主开关任意状态都照常工作）：
 `emoji_after_reply`（回复后表情包）、`emoji_follow`（表情包跟风）、
 `emoji_meaning`（表情包含义库）、`text_rules`（文本替换规则）、
-`empty_reply_fallback`（空回复兜底，默认关闭）。
+`empty_reply_fallback`（回复兜底，默认关闭）、
+`self_reply_guard` / `duplicate_reply_guard`（1.2.0 合并的自回复/重复回复拦截，默认关闭）、
+`cross_chat_recall`（1.2.0 合并的跨聊私聊回忆，默认关闭）。
 
 为什么两个接管都需要关掉「丰富回复」：开启后回复工具会给消息挂图片/表情/@ 等附件，
 分段与引用语义都由富回复链路接管，插件的"首段文本"判定与引用注入会与宿主打架。
@@ -48,7 +50,10 @@ MODULE_LABELS: Dict[str, str] = {
     "emoji_follow": "表情包跟风",
     "emoji_meaning": "表情包含义库",
     "text_rules": "文本替换规则",
-    "empty_reply_fallback": "空回复兜底",
+    "empty_reply_fallback": "回复兜底",
+    "self_reply_guard": "自回复拦截",
+    "duplicate_reply_guard": "重复回复拦截",
+    "cross_chat_recall": "跨聊私聊回忆",
 }
 
 # 不受宿主开关约束的模块（用于启动日志与 /bpp 状态展示）。
@@ -58,6 +63,10 @@ UNRESTRICTED_MODULES: Tuple[str, ...] = (
     "emoji_meaning",
     "text_rules",
     "empty_reply_fallback",
+    # 1.2.0 阶段 3 合并的三个模块（默认关闭；不依赖宿主关闭任何能力）
+    "self_reply_guard",
+    "duplicate_reply_guard",
+    "cross_chat_recall",
 )
 
 # 前置条件判定需要读取的全部宿主配置路径（按声明顺序去重）。

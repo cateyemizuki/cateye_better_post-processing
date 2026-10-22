@@ -47,6 +47,11 @@
 > 插件接管后会跳过宿主自身的处理，两者不会重复）。两种口径的效果差别只在
 > `[chinese_typo] enable` 的「跟随宿主」语义，见[错别字板块说明](docs/CONFIG.md#chinese_typo-错别字)。
 
+> **平台支持（1.3.1 起明确）**：多段发送与引用注入依赖 `send_service.after_build_message` /
+> `send_service.before_send` 等出站 Hook，目前仅支持 QQ 的 **NapCat / SnowLuma** 适配器。
+> CLI 或其它绕过 `send_service` 的发送路径不会经过这些 Hook，分段/首段改写不生效；
+> 非上述适配器建议使用旧版插件；也可关闭后处理接管（分段）后仅使用其它功能。
+
 ### 关完之后应该看到什么
 
 启动 / 热重载后，日志里这三行应该是「可用」（后处理接管按所选口径显示完整接管或错别字接管）：
@@ -70,18 +75,23 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 
 | 功能 | 默认 | 说明 |
 |---|---|---|
-| 后处理接管 | 开 | **需宿主不在做错别字处理**：`response_post_process.enable_response_post_process = false`（完整接管）**或** `response_post_process.enable_response_post_process = true` 且 `chinese_typo.enable = false`（错别字接管，1.1.1 起），且 `experimental.enable_rich_reply = false`：以与 MaiBot 一致的原逻辑接管错别字注入 + 分段 + 颜文字保护 + 长度/句数守卫（参数沿用宿主 `response_splitter.*` / `chinese_typo.*` / `typing_speed`；分段复刻已同步 MaiBot 1.3.0 的分段合并修复）；**各分段作为独立消息依次发送**（首段走宿主原生链路，其余由插件补发并模拟打字）；**错字纠正方式恒由权重池决定**（直接发送 / 引用纠正 / 撤回重发 / 不纠正，可延迟到最后；撤回前有「撤回反应时间」），`@昵称` 不会被错字污染、也不会重复 @ |
+| 后处理接管 | 开 | **需宿主不在做错别字处理**：`response_post_process.enable_response_post_process = false`（完整接管）**或** `response_post_process.enable_response_post_process = true` 且 `chinese_typo.enable = false`（错别字接管，1.1.1 起），且 `experimental.enable_rich_reply = false`：以与 MaiBot 一致的原逻辑接管错别字注入 + 分段 + 颜文字保护 + 长度/句数守卫（参数沿用宿主 `response_splitter.*` / `chinese_typo.*` / `typing_speed`；分段复刻已同步 MaiBot 1.3.0 的分段合并修复）；**各分段作为独立消息依次发送**（首段走宿主原生链路，其余由插件补发并模拟打字）；**1.3.1 起 reply 工具结果记录完整回复全文**（实际发送仍为分条，避免 planner 误以为消息未发完）；**1.3.2 起 planner 请求前会按实际缺失分段补齐 items**（只补缺失，未分段/已同步的段不重复）；**错字纠正方式恒由权重池决定**（直接发送 / 引用纠正 / 撤回重发 / 不纠正，可延迟到最后；撤回前有「撤回反应时间」），`@昵称` 不会被错字污染、也不会重复 @ |
 | 引用回复接管 | 开 | **需宿主关闭** `chat.reply_style.enable_reply_quote` **与** `experimental.enable_rich_reply`：为指向目标消息的回复**按权重**抽取发送方式：直接回复 / 引用回复 / @回复 / 引用＋@回复；**群聊与私聊权重、过旧规则、"同一消息只引用一次"记录各自独立**（私聊恒不 @） |
 | 同一消息只引用一次 | 开 | 一条目标消息被引用过之后，之后对该消息的任何回复都不再引用（群聊/私聊分开记录）；抽到直接回复不消耗机会 |
 | 回复后表情包 | 开 | planner 激活回复后，若整轮回复没有携带表情包，按概率补发一张（指定情绪标签或随机）；planner 本轮已计划发表情/贴表情、或本轮回复实际没发出时不补发 |
 | 表情包跟风 | 开 | 群友连续发送 `threshold` 条表情包后，按配置方式跟发一张（与最后一个同情绪 / 指定情绪 / 纯随机）；不计入 bot 自身消息与插件注入的合成记录 |
 | 文本替换规则 | 空 | 对 bot 发出的纯文本做词替换或整条覆盖，可配多条；默认只作用于 planner 拉起的回复流程，不碰其它插件直接发出的文本 |
 | 表情包含义库 | 开 | 为表情包补录视觉模型生成的"准确内容"，并在发给模型的请求里把 `[表情包: 标签]` 改写成标签 + 内容描述（默认改 replyer 与 planner 请求） |
-| 异常兜底提示词 | 空 | 后处理接管触发「过长 / 句子太多」兜底时，从自定义列表**随机抽一条**发送（支持 `{bot_name}` / `{user_name}` 占位）；留空 = 只用宿主自带的兜底提示词 |
+| 异常兜底提示词 | 空 | （1.3.0 起位于 `[empty_reply_fallback]`）后处理接管触发「过长 / 句子太多」兜底、或回复兜底补发时，从自定义列表**随机抽一条**发送（支持 `{bot_name}` / `{user_name}` 占位）；留空 = 只用宿主自带的兜底提示词 |
 | 错字黑名单 | 空 | （1.1.3）名单里的**字或词**不会被错字命中，保持原样：填字 = 该字不被改成错字、别的字也不会被错改成它；填词 = 整词不被替换且词内每个字一并受保护。用来护住人名、专有名词、关键字。**留空 = 关闭** |
-| 空回复兜底 | **关** | （1.1.3）replyer **一条正文都没生成**时（模型返回空内容，或后处理前 Hook 把正文清空），补一条兜底消息，避免"bot 已读不回"。文本复用上面的「异常兜底提示词」；有工具调用 / 已有正文 / 同一轮已补过时不介入。**默认关闭** = 与宿主行为完全一致 |
+| 回复兜底 | **关** | （1.1.3，1.3.0 起板块改名并收纳兜底文本配置）replyer **一条正文都没生成**时（模型返回空内容，或后处理前 Hook 把正文清空），补一条兜底消息，避免"bot 已读不回"。兜底文本（「异常兜底提示词」）与「兜底回复的自称」都在本板块配置；有工具调用 / 已有正文 / 同一轮已补过时不介入。**默认关闭** = 与宿主行为完全一致 |
 | 私聊禁用撤回 | **开** | （1.1.3）**私聊里根本不抽「撤回重发」**——`recall` 在**抽签阶段**就从权重池里剔除，剩余方式（`direct` / `quote` / `none`）按原权重比例重新归一化抽取，所以私聊里不会产生任何撤回动作，也不是"抽到撤回再降级"。原因：私聊中 bot 撤回自己的消息时，适配器会把这条撤回**显示成「是用户撤回了消息」**，于是 bot 的上下文里凭空多出"对方撤回了一条消息"——它会误以为是用户撤回了什么，从而被错误引导（追问、道歉）。**群聊不受影响**（群里撤回就是 bot 自己撤回，语义正确）。**默认开启**；关闭 = 私聊也照常从池子里抽撤回（回到旧行为） |
-| /bpp 状态命令 | 恒可用 | **仅 operator 可用**（宿主 `plugin.permission` 名单 + 本地控制台，非 operator 由宿主拦截）。`/bpp` 用**合并转发**发送各模块当前状态（**一图流**渲染，渲染失败退回文字）；`/bpp fallback` 引用一条消息实测兜底提示词（插件总开关关闭时拦截） |
+| 自回复拦截 | **关** | （1.2.0，阶段 3 合并自 cateye_duplicate_reply_guard）Planner 对 **bot 自己发出的消息**调用 `reply` 时拦截：**生成前**从 `output_items` 里剔除该调用（零 token），**发送前**再兜底 `abort`；自身消息 ID 来自 planner 上下文扫描 + 出站消息台账（零 RPC）。**私聊默认豁免**但受连续上限约束（默认 2 次，0 = 无上限）；**群聊默认不豁免**，可开启群聊豁免并设次数（默认 1 次）。成功回复一条非自身消息后连续豁免计数清零。**默认关闭** = 与 1.1.3 行为一致 |
+| 重复回复拦截 | **关** | （1.2.0，同一来源）同一条目标消息在去重窗口（默认 180 秒）内被再次回复时拦截（生成前剔除 + 发送前兜底）；"已回复"只在**送达回执 `sent=True`** 之后登记，生成成功但发送失败不误拦后续重试；距上次回复已过延时阈值（默认 30 秒）的"再补一句"按补充说明放行。**默认关闭** |
+| 拦截日志 | **开** | （1.2.0）拦住的行为逐条写进插件数据目录下的独立 JSONL 日志（默认 `intercept.jsonl`，可配文件名 / 单文件上限 / 轮转份数 / 是否回显宿主主日志）。守卫模块关闭时天然无输出，不算独立功能开关 |
+| 跨聊私聊回忆 | **关** | （1.2.0，阶段 3 合并自 cateye_mai_cross-chat_recall）扫描群友与 bot 的私聊 → LLM 总结入库 → 把概括（对象 + 起止时间 + 正文）注入**群聊** planner / replyer 上下文；可配扫描触发方式（planner / push / reply）、总结阈值与提示词（**默认即内置提示词全文**，清空回退内置）、注入用户选择、群 / 用户**名单**（黑名单 / 白名单模式共用一张名单）、总结 TTL。**默认关闭** = 不扫描、不注入、不建库 |
+| 主动召回工具 | **关**（随模块） | （1.2.0）LLM 工具 `recall_private_chat`：仅在**群聊**会话里按昵称（多候选时可传 QQ 号）主动召回某群友的私聊概括；召回成功后该用户按「粘性召回保留」（默认 5 分钟）继续随 reply 注入，期间再次召回会刷新。随「跨聊私聊回忆」开关门控（关闭时工具与 `/ccr` 两命令一律不响应） |
+| /bpp 状态命令 | 恒可用 | **仅 operator 可用**（宿主 `plugin.permission` 名单 + 本地控制台，非 operator 由宿主拦截）。`/bpp` 用**合并转发**发送各模块当前状态（**一图流**渲染，渲染失败退回文字）；`/bpp fallback` 引用一条消息实测兜底提示词（插件总开关关闭时拦截）。另有随「跨聊私聊回忆」迁入的 `/ccr debug test`（调试：强制注入自己的私聊回忆）与 `/ccr clean`（清空总结库并清粘性标记）两个 operator 命令 |
 
 > ⏱️ **多段发送的等待行为（体验说明，1.1.2 起置顶）**：分段补发期间，两个 BLOCKING 等待钩子
 > 会把**新入站消息 / planner 请求**先挡住等补发完成——极端情况下（补发卡住且
@@ -90,6 +100,11 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 > 接管生效时，启动日志会重申这条上限。**不想等待**：把 `[response_splitter]
 > wait_timeout_seconds` 调小或设 `0`（完全不等待）。机制细节见
 > [docs/CONFIG.md](docs/CONFIG.md) 的「发送形态（复刻宿主分段发送）」。
+>
+> 📌 **1.3.1 起**：`reply` 工具结果记录的是**完整回复全文**，实际发送仍为分条——
+> planner 收尾轮不会再把"工具结果只有首段"当成消息没发完；**1.3.2 起** planner 请求前还会
+> 检查 items，只补实际缺失的回复分段（三句只缺最后一句就只补最后一句，已同步的段不重复），
+> 并按回复段顺序插到相邻已存在段旁，不会追加到尾部的人物画像/时间/分析指令之后。
 
 <!-- TOC -->
 
@@ -121,7 +136,8 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 > `maisaka.replyer.before_model_request`、`chat.receive.before_process`、`chat.receive.after_process`、
 > `emoji.register.after_build_description`、`emoji.maisaka.before_select`、`message.get_by_id`、`message.get_by_time_in_chat`、
 > `emoji.*`、`config.get`、`database.query`、`llm.generate`、`send.emoji`、`send.text`、
-> `send.forward`、`send.image`、`render.html2png`、`api.call`）在 MaiBot 1.2.3 / 1.3.0
+> `send.forward`、`send.image`、`render.html2png`、`api.call`、`message.get_recent`、
+> `chat.get_all_streams`、`chat.get_stream_by_user_id`）在 MaiBot 1.2.3 / 1.3.0
 > 与 maibot_sdk 2.8.0 / 2.8.2 上验证。manifest 声明的最低宿主版本为 1.2.3。
 >
 > 多段发送（`[response_splitter]` 的 `takeover`）需要 `send.text` 能力，
@@ -149,7 +165,7 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 |---|---|---|
 | 引用回复接管（`quote_reply`） | `chat.reply_style.enable_reply_quote = false` 且 `experimental.enable_rich_reply = false` | 受制 |
 | 后处理接管（`response_splitter`） | `response_post_process.enable_response_post_process = false`（**完整接管**）**或** `chinese_typo.enable = false`（**错别字接管**，宿主后处理开启但错别字关闭——1.1.1 起），二选一；且 `experimental.enable_rich_reply = false` | 受制 |
-| 回复后表情包 / 表情包跟风 / 表情包含义库 / 文本替换规则 / 空回复兜底 | —— | **不受制**，宿主开关任意状态都照常工作 |
+| 回复后表情包 / 表情包跟风 / 表情包含义库 / 表情包冷却 / 文本替换规则 / 回复兜底 / 自回复拦截 / 重复回复拦截 / 跨聊私聊回忆 | —— | **不受制**，宿主开关任意状态都照常工作 |
 
 > **后处理接管的两条满足路径（1.1.1 起）**：核心判据是"**宿主不在做错别字处理**"——
 > ① 宿主后处理总开关关闭 → 插件完整接管（错别字 + 分段，1.0.0 起的原行为）；
@@ -179,11 +195,14 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 完整的配置文档已拆分到 **[docs/CONFIG.md](docs/CONFIG.md)**，包括：
 
 - 配置板块总览与三条通用规则（含「跟随宿主」的四级取值链路）；
-- 全部字段的取值范围与校验表（共 33 项有范围约束）；
+- 全部字段的取值范围与校验表（共 50 项有范围约束）；
 - 各板块字段表与行为说明：`[plugin]` / `[quote_reply]`（含权重） / `[quote_reply_private]` /
-  `[chinese_typo]`（含纠正方式权重、错字黑名单） / `[response_splitter]`（分段、打字速度、异常兜底、
-  等待与 55 秒钳制） / `[empty_reply_fallback]`（空回复兜底） / `[emoji_after_reply]` /
-  `[emoji_follow]` / `[emoji_cooldown]` / `[text_rules]` / `[emoji_meaning]`；
+  `[chinese_typo]`（含纠正方式权重、错字黑名单） / `[response_splitter]`（分段、打字速度、
+  等待与 55 秒钳制） / `[empty_reply_fallback]`（回复兜底：补发开关 + 兜底文本 + 自称） /
+  `[emoji_meaning]` / `[emoji_after_reply]` / `[emoji_follow]` / `[emoji_cooldown]` /
+  `[text_rules]` / `[cross_chat_recall]`（跨聊私聊回忆＋主动召回工具，1.2.0） /
+  `[self_reply_guard]`（自回复拦截，1.2.0） / `[duplicate_reply_guard]`（重复回复拦截，1.2.0） /
+  `[intercept_log]`（拦截独立日志，1.2.0）；
 - WebUI 显示与翻译说明。
 
 `/bpp` 状态命令与 `/bpp fallback` 详见 [docs/BPP_COMMAND.md](docs/BPP_COMMAND.md)；
@@ -191,7 +210,7 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 
 ## 能力声明（capabilities）
 
-manifest 声明 **14** 项能力，与代码里的实际调用一一对应（审核时用 AST 双向对账过：
+manifest 声明 **17** 项能力，与代码里的实际调用一一对应（审核时用 AST 双向对账过：
 `self.ctx.<代理>.<方法>` 收集到的能力集合与 manifest **完全相同**，既没有"声明了没用到"，
 也没有"用了没声明"；`ctx.logger` / `ctx.paths` 不是能力代理，不计入）：
 
@@ -199,8 +218,11 @@ manifest 声明 **14** 项能力，与代码里的实际调用一一对应（审
 |---|---|
 | `api.call` | 走适配器公开 API 撤回消息（「撤回重发」纠错分支）。**口径说明**：`api.call` 本身是能触达适配器任意动作的宽口径能力，本插件只调**两个写死的撤回入口**（`adapter.napcat.message.delete_msg` 与兜底的 `adapter.napcat.action.call`，同一个 `delete_msg` 动作的两种适配器形态），且 `message_id` 一律取自**插件自己刚发出的消息**的发送回执——只撤自己刚发出去的消息，不撤用户消息、不调其它任何动作 |
 | `config.get` | 读宿主配置（模块前置条件判定、`留空 = 跟随宿主`） |
-| `message.get_by_id` | 取被回复消息（@ 目标、目标时间戳用于过旧判定、`/bpp fallback` 回查被引用消息的发送者） |
-| `message.get_by_time_in_chat` | 统计"目标之后已有多少条消息" |
+| `message.get_by_id` | 取被回复消息（@ 目标、目标时间戳用于过旧判定、`/bpp fallback` 回查被引用消息的发送者；跨聊私聊回忆反查被回复消息的归属用户） |
+| `message.get_recent` | 跨聊私聊回忆：取聊流最近消息（选注入用户、扫描候选用户、工具按昵称解析候选） |
+| `chat.get_all_streams` | 跨聊私聊回忆：按 session_id 查聊天流（区分群聊/私聊、取群号与昵称，60 秒缓存） |
+| `chat.get_stream_by_user_id` | 跨聊私聊回忆：按用户查其与 bot 的私聊流（总结扫描用） |
+| `message.get_by_time_in_chat` | 统计"目标之后已有多少条消息"；跨聊私聊回忆按时间窗拉取群友私聊消息用于总结 |
 | `emoji.get_by_description` / `emoji.get_random` / `emoji.get_count` | 表情包抽取、含义库抽样与统计 |
 | `database.query` | 读宿主表情库的 **`Images` 表**：按图片 hash 查 `full_path`，含义生成时定位表情包文件（配置读取不走这里——宿主 `[chinese_typo]` 等配置走 `config.get` 与首次生成时的 `bot_config.toml` 直读，0.14.3 文案修正） |
 | `llm.generate` | 表情包含义的视觉模型生成 |
@@ -251,12 +273,16 @@ manifest 声明 **14** 项能力，与代码里的实际调用一一对应（审
 
   | 文件 | 职责 |
   |---|---|
-  | `plugin.py` | 配置模型、生命周期、共享基础设施（回复轮记录、文本规则、表情包功能），组合下面四个 mixin |
+  | `plugin.py` | 配置模型、生命周期、共享基础设施（回复轮记录、文本规则、表情包功能），组合下面六个 mixin |
   | `modules/requirements.py` | 各模块的宿主前置条件与可用性判定（纯逻辑，可离线单测） |
   | `modules/post_process_takeover.py` | 后处理接管：Hook 1~5 + 多段发送 + 补发缓存 + 异常兜底提示词占位替换 |
-  | `modules/empty_reply_fallback.py` | 空回复兜底（1.1.3，默认关闭）：replyer 一条正文都没生成时补发一条兜底消息 |
+  | `modules/empty_reply_fallback.py` | 回复兜底（1.1.3，默认关闭）：replyer 一条正文都没生成时补发一条兜底消息，兜底文本与自称也在该板块配置 |
   | `modules/quote_takeover.py` | 引用回复接管：权重抽取 + 过旧规则 + 同一消息只引用一次 |
   | `modules/status_command.py` | `/bpp` 状态命令（合并转发 + 一图流渲染 + 文字兜底）与 `/bpp fallback` 兜底测试（1.0.0） |
+  | `modules/self_reply_guard.py` | 自回复 / 重复回复拦截（1.2.0，默认关闭；迁自 cateye_duplicate_reply_guard） |
+  | `modules/cross_chat_recall.py` | 跨聊私聊回忆（1.2.0，默认关闭；迁自 cateye_mai_cross-chat_recall）+ 旧数据迁移函数 |
+  | `intercept_log.py` | 拦截独立 JSONL 日志（1.2.0；迁自 cateye_duplicate_reply_guard） |
+  | `helpers.py` / `injector.py` / `name_resolver.py` / `scanner.py` / `store.py` / `summarizer.py` / `logging_setup.py` | 跨聊私聊回忆的支撑模块（1.2.0；迁自 cateye_mai_cross-chat_recall，`logging_setup` 只随迁不初始化） |
   | `post_processing.py` | 宿主后处理算法逐行复刻（纯逻辑，可离线单测）+ 兜底提示词抽取 |
   | `emoji_meanings.py` / `text_rules.py` | 表情包含义库存储与提示词 / 文本规则解析 |
 
@@ -307,5 +333,10 @@ manifest 声明 **14** 项能力，与代码里的实际调用一一对应（审
   **让位机制**和平共存（见[与其它插件共存](#与其它插件共存)）。没有它先把"接管宿主分段"这条路
   蹚出来，本插件不会在 0.10.0 去逐项复刻宿主的分段链路。**感谢久远与这个项目。**
   如果你的需求是"更主动、更激进的分段"，请直接使用它——本插件的分段只在宿主总开关关闭时兜底。
+- **思路来源**（自回复拦截）：**[机器人自回复硬拦截（maibot-self-reply-guard）](https://github.com/kumburovicbranko682-boop/maibot-self-reply-guard)**
+  （插件中心 ID `github.kumburovicbranko682-boop.self-reply-guard`，作者 `kumburovicbranko682-boop`，MIT）——
+  本插件「自回复拦截」这一功能方向，以及「**生成前剔除 reply 工具调用 + 发送前 abort**」两层防线的思路
+  来自该项目；本项目为**独立实现、未复用其源码**（判定为零 RPC：planner 上下文扫描 `is_self_message`
+  + 出站消息 ID 台账 + 轮标记）。
 - 感谢 **MaiBot**（[Mai-with-u/MaiBot](https://github.com/Mai-with-u/MaiBot)）与其插件体系
   （`maibot_sdk`）：本插件的分段与错别字逻辑派生自宿主源码，全部宿主数据访问都走宿主公开能力。

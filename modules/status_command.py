@@ -7,7 +7,7 @@
   **渲染失败时退回文字**（节点里放 text 段）；合并转发本身失败时再逐级退回
   ``send.image`` / ``send.text`` 直发（官方文档建议的兼容口径：适配器可能不支持转发）。
 * ``/bpp fallback``——对**命令引用的那条消息**触发一次异常兜底测试：按
-  ``[response_splitter] fallback_prompts`` 的当前配置抽一条兜底提示词
+  ``[empty_reply_fallback] fallback_prompts`` 的当前配置抽一条兜底提示词
   （留空 = 宿主自带的那组），替换 ``{bot_name}`` / ``{user_name}`` 占位后
   **以引用回复的方式**发给被引用消息的发送者所在会话——所见即真实兜底触发时的效果。
   测试消息不写入 Maisaka 对话上下文（``sync_to_maisaka_history=False``），避免污染 bot 记忆。
@@ -339,10 +339,40 @@ class StatusCommandMixin:
             return total > 0, detail
         if key == "empty_reply_fallback":
             enabled = bool(getattr(cfg.empty_reply_fallback, "enabled", False))
-            # 兜底文本与「异常兜底提示词」共用一份列表，这里点明，方便排查"补出来的是什么"。
+            # 兜底文本取本板块的「异常兜底提示词」，这里点明，方便排查"补出来的是什么"。
             prompts = self._custom_fallback_prompts()
             source = f"自定义 {len(prompts)} 条" if prompts else "宿主自带兜底"
             return enabled, f"兜底文本={source}"
+        # ---- 1.2.0 阶段 3 合并的三个模块（默认关闭；不依赖宿主前置条件）----
+        if key == "self_reply_guard":
+            guard = cfg.self_reply_guard
+            enabled = bool(getattr(guard, "enabled", False))
+            detail = (
+                f"生成前剔除={'开' if guard.strip_at_planner else '关'}、"
+                f"发送前兜底={'开' if guard.abort_at_send else '关'}、"
+                f"私聊豁免={'开' if guard.exempt_private_chat else '关'}"
+            )
+            return enabled, detail
+        if key == "duplicate_reply_guard":
+            guard = cfg.duplicate_reply_guard
+            enabled = bool(getattr(guard, "enabled", False))
+            detail = (
+                f"去重窗口={guard.dedupe_window_seconds} 秒、"
+                f"生成前剔除={'开' if guard.strip_at_planner else '关'}、"
+                f"发送前兜底={'开' if guard.abort_at_send else '关'}、"
+                f"延时补充={'开' if guard.allow_late_repeat else '关'}"
+            )
+            return enabled, detail
+        if key == "cross_chat_recall":
+            recall = cfg.cross_chat_recall
+            enabled = bool(getattr(recall, "enabled", False))
+            detail = (
+                f"扫描触发={recall.trigger_mode}、"
+                f"注入 planner={'开' if recall.inject_planner else '关'}、"
+                f"注入 reply={'开' if recall.inject_reply else '关'}、"
+                f"主动召回工具={'随模块' if enabled else '不可用'}"
+            )
+            return enabled, detail
         return None, ""
 
     def _collect_header_facts(self) -> List[Tuple[str, str]]:
@@ -550,7 +580,7 @@ class StatusCommandMixin:
     async def _bpp_fallback_test(self, kwargs: Dict[str, Any], stream_id: str) -> None:
         """对**命令引用的那条消息**触发一次异常兜底测试。
 
-        流程与真实兜底完全同源：从 ``[response_splitter] fallback_prompts`` 的当前配置
+        流程与真实兜底完全同源：从 ``[empty_reply_fallback] fallback_prompts`` 的当前配置
         随机抽一条（留空 = 宿主自带的兜底提示词组），替换 ``{bot_name}`` / ``{user_name}``
         占位（user_name = 被引用消息的发送者名称，群名片优先；他人可控文本，替换前做
         长度截断与控制字符清理），然后**引用那条消息**发出。
@@ -589,7 +619,7 @@ class StatusCommandMixin:
         # 「兜底回复的自称」生效值只解析一次：既是宿主自带兜底提示词的 <昵称> 前缀，
         # 也是 {bot_name} 占位符的替换值（两处原本各调一次 _resolve_mirror）。
         bot_name = str(
-            self._resolve_mirror("response_splitter", "fallback_nickname", "bot_nickname", "text")
+            self._resolve_mirror("empty_reply_fallback", "fallback_nickname", "bot_nickname", "text")
             or ""
         )
         prompts = self._custom_fallback_prompts()

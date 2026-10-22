@@ -6,11 +6,14 @@
 
 Hook 分工（多段发送）：
 
-1. ``maisaka.reply.before_post_process``（blocking）：算分段 → 只回传第 1 段，其余入缓存；
-2. ``send_service.after_build_message``（blocking）：按首段文本反查缓存 → 登记待补发；
+1. ``maisaka.reply.before_post_process``（blocking）：算分段 → 回传全文（供宿主 reply 工具
+   结果记录完整内容），其余入缓存；
+2. ``send_service.after_build_message``（blocking）：按全文文本反查缓存，并把实际出站
+   截回第 1 段 → 登记待补发；
 3. ``send_service.after_send``（observe）：确认首段发出后，后台顺序补发剩余分段；
 4. ``maisaka.planner.before_request`` / ``chat.receive.before_process``（blocking）：补发
-   未完成时先等待（带超时），避免下一轮上下文缺段、新消息与旧回复交错。
+   未完成时先等待（带超时）；planner 请求前还会按 ``items`` 中实际缺失的分段补齐，
+   避免下一轮上下文缺段、新消息与旧回复交错。
 
 错字纠正（见 ``post_processing.PostProcessor.plan``）：
 
@@ -31,9 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 import tomllib
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -169,7 +175,7 @@ _HOST_MIRROR_FIELDS: Tuple[Tuple[str, str, str, str, str, str, str], ...] = (
         "chinese_typo",
         "word_replace_rate",
     ),
-    ("bot_nickname", "response_splitter", "fallback_nickname", "bot_nickname", "text", "bot", "nickname"),
+    ("bot_nickname", "empty_reply_fallback", "fallback_nickname", "bot_nickname", "text", "bot", "nickname"),
 )
 
 # 只喂给**宿主复刻路径**（``PostProcessor.process``）的宿主参数：(PostProcessor 形参, ``_cfg`` 短键)。
@@ -248,10 +254,16 @@ _TYPING_SINGLE_CHAR_EXTRA_SECONDS = 0.3
 # 以 ``force_suggestion=True`` 调生成器），否则会出现"打了错字却既不纠正也不撤回"。
 _HOST_TYPO_VISIBLE_PROBABILITY = 0.5
 
-# 预分段缓存 TTL：Hook 之间靠 (会话, 首段文本) 关联，超时未消费即丢弃。
+# 预分段缓存 TTL：Hook 之间靠 (会话, 全文文本) 关联，超时未消费即丢弃。
 _PREPARED_SEGMENT_TTL_SECONDS = 120.0
 # 单会话最多保留几轮预分段（防异常堆积）。
 _PREPARED_SEGMENT_MAX_ROUNDS = 8
+# planner 上下文补齐记录 TTL：记录本轮已发送分段（文本 + 消息 id），供
+# maisaka.planner.before_request 只补真正缺失的段；超时未补齐即丢弃。
+_PLANNER_SEGMENT_RECORD_TTL_SECONDS = 120.0
+# 首段发送后等待 after_send 登记 sent 的宽限；超过仍无 sent/任务视为发送失败，
+# 避免 before_send abort / 发送管线异常时 planner 白等满 wait_timeout_seconds。
+_PLANNER_SEGMENT_FIRST_SEND_GRACE_SECONDS = 5.0
 # 待补发登记的 TTL（首段发送失败/被中止时的兜底清理）。
 _PENDING_FOLLOW_UP_TTL_SECONDS = 120.0
 # 补发单段的重试次数。
@@ -285,8 +297,12 @@ class PostProcessTakeoverMixin:
         self._processor: Optional[PostProcessor] = None
         # 生效参数的来源（"宿主" / "插件覆盖"），仅用于日志。
         self._processor_param_sources: Dict[str, str] = {}
-        # 多段发送：预分段缓存 session_id -> {首段文本键: (登记时刻, 剩余分段)}。
-        self._prepared_segments: Dict[str, Dict[str, Tuple[float, List[ProcessedResponseSegment]]]] = {}
+        # 多段发送：预分段缓存 session_id -> {全文文本键: [(登记时刻, 首段文本, 后续动作), ...]}。
+        # 用列表而不是单值：120s 内出现两次完全相同的全文时，按到达顺序各取各的，不互相覆盖。
+        self._prepared_segments: Dict[str, Dict[str, List[Tuple[float, str, List["FollowUpItem"]]]]] = {}
+        # 多段发送：planner 上下文补齐记录。session_id -> {full_key, first_text, sent, done, ...}
+        # 只记录实际发送成功的回复分段（文本 + 平台消息 id），planner 请求前按 items 实际缺失补齐。
+        self._planner_segment_records: Dict[str, Dict[str, Any]] = {}
         # 多段发送：待补发登记 lookup_key -> 补发数据（首段发送成功后才真正发出）。
         self._pending_follow_ups: Dict[str, Dict[str, Any]] = {}
         # 多段发送：会话 -> 进行中的补发任务（planner / 入站消息等待用）。
@@ -392,11 +408,11 @@ class PostProcessTakeoverMixin:
         return not self._is_follow_host(self._mirror_raw(section, field))
 
     def _custom_fallback_prompts(self) -> List[str]:
-        """用户自定义的异常兜底提示词列表（``[response_splitter] fallback_prompts``）。
+        """用户自定义的异常兜底提示词列表（``[empty_reply_fallback] fallback_prompts``）。
 
         去掉空白项、保持配置顺序；空列表（默认）= 只用宿主自带的兜底提示词。
         """
-        raw = getattr(self.config.response_splitter, "fallback_prompts", None)
+        raw = getattr(self.config.empty_reply_fallback, "fallback_prompts", None)
         if not isinstance(raw, (list, tuple)):
             return []
         return [str(item).strip() for item in raw if str(item).strip()]
@@ -423,7 +439,7 @@ class PostProcessTakeoverMixin:
             if self._typo_takeover_mode() and not self._mirror_is_explicit("chinese_typo", "enable"):
                 params["typo_enable"] = True
                 sources["typo_enable"] = "错别字接管"
-            # 自定义异常兜底提示词（1.0.0）：非空时接管路径的兜底改从这份列表随机抽取，
+            # 自定义异常兜底提示词（1.0.0；1.3.0 起配置位于 [empty_reply_fallback]）：非空时接管路径的兜底改从这份列表随机抽取，
             # 模板里的 {bot_name}/{user_name} 占位符在事件循环侧替换（见
             # handle_before_post_process 的 _format_fallback_placeholders）。
             params["custom_fallback_prompts"] = self._custom_fallback_prompts()
@@ -622,7 +638,7 @@ class PostProcessTakeoverMixin:
         ):
             return segments
         bot_name = str(
-            self._resolve_mirror("response_splitter", "fallback_nickname", "bot_nickname", "text") or ""
+            self._resolve_mirror("empty_reply_fallback", "fallback_nickname", "bot_nickname", "text") or ""
         )
         user_name = ""
         if reply_message_id and any("{user_name}" in segment.text for segment in segments):
@@ -774,40 +790,60 @@ class PostProcessTakeoverMixin:
     # ---- 预分段缓存（Hook 1 写入，Hook 2 消费） ----
 
     def _store_prepared_segments(
-        self, session_id: str, first_text: str, items: List["FollowUpItem"]
+        self,
+        session_id: str,
+        full_text: str,
+        first_text: str,
+        items: List["FollowUpItem"],
     ) -> bool:
-        """登记"首段 + 后续动作序列"，供出站 Hook 按首段文本反查。"""
-        key = self._text_key(first_text)
-        if not session_id or not key or not items:
+        """登记"首段 + 后续动作序列"，供出站 Hook 按**全文**文本反查。"""
+        key = self._text_key(full_text)
+        first = str(first_text or "").strip()
+        if not session_id or not key or not first or not items:
             return False
         bucket = self._prepared_segments.setdefault(session_id, {})
         now = time.monotonic()
-        for stale_key, (stored_at, _) in list(bucket.items()):
-            if now - stored_at > _PREPARED_SEGMENT_TTL_SECONDS:
+        for stale_key, entries in list(bucket.items()):
+            entries[:] = [
+                entry for entry in entries if now - entry[0] <= _PREPARED_SEGMENT_TTL_SECONDS
+            ]
+            if not entries:
                 bucket.pop(stale_key, None)
-        bucket[key] = (now, list(items))
-        while len(bucket) > _PREPARED_SEGMENT_MAX_ROUNDS:
-            oldest_key = min(bucket.items(), key=lambda item: item[1][0])[0]
-            bucket.pop(oldest_key, None)
+        bucket.setdefault(key, []).append((now, first, list(items)))
+        while sum(len(entries) for entries in bucket.values()) > _PREPARED_SEGMENT_MAX_ROUNDS:
+            oldest_key = min(bucket, key=lambda candidate: bucket[candidate][0][0])
+            bucket[oldest_key].pop(0)
+            if not bucket[oldest_key]:
+                bucket.pop(oldest_key, None)
         return True
 
 
-    def _take_prepared_segments(self, session_id: str, text: str) -> List["FollowUpItem"]:
-        """按首段文本取走后续动作序列（取走即删除，避免同一条发送被补发两次）。"""
+    def _take_prepared_segments(
+        self, session_id: str, text: str
+    ) -> Optional[Tuple[str, List["FollowUpItem"]]]:
+        """按全文文本取走"首段 + 后续动作序列"（取走即删除，避免同一条发送被补发两次）。"""
         bucket = self._prepared_segments.get(session_id)
         if not bucket:
-            return []
-        entry = bucket.pop(self._text_key(text), None)
-        if entry is None:
-            if not bucket:
-                self._prepared_segments.pop(session_id, None)
-            return []
+            return None
+        key = self._text_key(text)
+        entries = bucket.get(key)
+        if not entries:
+            return None
+        taken: Optional[Tuple[float, str, List["FollowUpItem"]]] = None
+        now = time.monotonic()
+        while entries:
+            entry = entries.pop(0)
+            if now - entry[0] <= _PREPARED_SEGMENT_TTL_SECONDS:
+                taken = entry
+                break
+        if not entries:
+            bucket.pop(key, None)
         if not bucket:
             self._prepared_segments.pop(session_id, None)
-        stored_at, items = entry
-        if time.monotonic() - stored_at > _PREPARED_SEGMENT_TTL_SECONDS:
-            return []
-        return list(items)
+        if taken is None:
+            return None
+        _stored_at, first_text, items = taken
+        return str(first_text or "").strip(), list(items)
 
 
     # ---- 待补发登记（Hook 2 写入，Hook 3 消费） ----
@@ -818,6 +854,25 @@ class PostProcessTakeoverMixin:
         if not session_id or not normalized_text:
             return ""
         return "\x1f".join((str(session_id), str(timestamp or ""), normalized_text))
+
+    @staticmethod
+    def _pending_message_key(session_id: str, message_id: Any) -> str:
+        """待补发登记的消息 id 键；必须带 session，避免跨会话同毫秒 id 撞键。"""
+        normalized_session = str(session_id or "").strip()
+        normalized_id = str(message_id or "").strip()
+        if not normalized_session or not normalized_id:
+            return ""
+        return f"{normalized_session}\x1fmsg\x1f{normalized_id}"
+
+    @staticmethod
+    def _pending_time_key(session_id: str, timestamp: Any) -> str:
+        """待补发登记的时间键：before_send 可能改文本、message_id 会换平台 id，
+        但同一条发送的 session + timestamp 不变，用它兜底关联。"""
+        normalized_session = str(session_id or "").strip()
+        normalized_time = str(timestamp or "").strip()
+        if not normalized_session or not normalized_time:
+            return ""
+        return f"{normalized_session}\x1ftime\x1f{normalized_time}"
 
 
     def _register_pending_follow_up(self, keys: List[str], data: Dict[str, Any]) -> None:
@@ -887,6 +942,261 @@ class PostProcessTakeoverMixin:
             self.ctx.logger.debug("等待补发任务异常: %s", exc)
         return len(tasks)
 
+
+    # ---- planner 上下文补齐（按实际缺失分段，不盲目补） ----
+    # ------------------------------------------------------------------
+
+    def _begin_planner_segment_record(
+        self, session_id: str, full_text: str, first_text: str
+    ) -> None:
+        """登记本轮回复分段记录；planner 请求前据此判断哪些段还没进 items。"""
+        normalized_first = str(first_text or "").strip()
+        if not session_id or not normalized_first:
+            return
+        self._planner_segment_records[session_id] = {
+            "full_key": self._text_key(full_text),
+            "first_text": normalized_first,
+            "sent": [],
+            "done": asyncio.Event(),
+            "rewritten": False,
+            "outbound_time_key": "",
+            "task": None,
+            "created_at": time.monotonic(),
+        }
+
+    def _get_planner_segment_record(
+        self, session_id: str, *, first_text: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """取未过期的本轮记录；``first_text`` 非空时还要求首段一致，避免串轮。"""
+        record = self._planner_segment_records.get(session_id)
+        if record is None:
+            return None
+        if time.monotonic() - float(record.get("created_at", 0.0)) > _PLANNER_SEGMENT_RECORD_TTL_SECONDS:
+            self._planner_segment_records.pop(session_id, None)
+            return None
+        if first_text is not None and record.get("first_text") != str(first_text or "").strip():
+            return None
+        return record
+
+    def _mark_planner_record_rewritten(
+        self, session_id: str, matched_text: str, *, timestamp: Any = None
+    ) -> None:
+        """记录“全文出站消息已被截回首段”，只有这种轮次才需要按段补齐。"""
+        record = self._get_planner_segment_record(session_id)
+        if record is None or record.get("full_key") != self._text_key(matched_text):
+            return
+        record["rewritten"] = True
+        if timestamp is not None:
+            record["outbound_time_key"] = self._pending_time_key(session_id, timestamp)
+
+    def _record_planner_sent_segment(
+        self, session_id: str, first_text: str, text: str, message_id: str
+    ) -> None:
+        """登记一条实际发送成功的回复分段（文本 + 平台消息 id）。"""
+        record = self._get_planner_segment_record(session_id, first_text=first_text)
+        if record is None or not record.get("rewritten"):
+            return
+        normalized_text = str(text or "").strip()
+        if not normalized_text:
+            return
+        record["sent"].append((normalized_text, str(message_id or "").strip()))
+
+    def _finish_planner_segment_record(
+        self, session_id: str, *, first_text: Optional[str] = None
+    ) -> None:
+        """补发结束/失败时放行 planner 等待（即使没有可补齐的段）。"""
+        record = self._get_planner_segment_record(session_id, first_text=first_text)
+        if record is not None:
+            record["done"].set()
+
+    @staticmethod
+    def _collect_self_message_items(items: List[Any]) -> List[Tuple[int, str, str]]:
+        """收集 planner items 里 bot 自身消息：(item_index, msg_id, 正文 key)。"""
+        collected: List[Tuple[int, str, str]] = []
+        for item_index, item in enumerate(items):
+            if not isinstance(item, dict) or item.get("item_type") != "UserMessageItem":
+                continue
+            text = "".join(
+                str(part.get("text") or "")
+                for part in item.get("parts") or []
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+            # 只认 planner 消息前缀标签里的 is_self_message，正文里恰好出现该字符串不算。
+            prefix_match = re.match(r"^\s*<message\b[^>]*>", text)
+            if prefix_match is None or 'is_self_message="true"' not in prefix_match.group(0):
+                continue
+            # 只认消息前缀标签里的 msg_id，正文里恰好出现 msg_id="..." 不算。
+            match = re.search(r'\bmsg_id="([^"]*)"', prefix_match.group(0))
+            message_id = match.group(1) if match and match.group(1) else ""
+            # 去掉宿主 planner 前缀后再比正文；避免把工具结果里的全文当成“消息已存在”。
+            content = text[prefix_match.end():]
+            content = re.sub(r"\s*</message>\s*$", "", content, count=1)
+            content_key = "".join(content.split())
+            collected.append((item_index, message_id, content_key))
+        return collected
+
+    def _inject_missing_planner_segments(
+        self,
+        session_id: str,
+        kwargs: Dict[str, Any],
+        *,
+        record: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """只把实际发送成功、但当前 items 里确实缺失的回复分段追加进请求。
+
+        存在性优先按平台 ``msg_id`` 判断，缺 id 时退回自消息正文比对；因此
+        “三句只缺最后一句”只会补最后一句，已同步进上下文的段不会重复。
+
+        ``record`` 由调用方传入等待过的那一轮；如果等待期间同会话已经开始新一轮
+        （dict 里的对象已不是它），本次请求不做跨轮注入。
+        """
+        current = self._planner_segment_records.get(session_id)
+        if record is not None and current is not record:
+            return None
+        if record is None:
+            record = current
+        if record is None:
+            return None
+        if not record.get("rewritten"):
+            # 全文没有被截回（说明走了单条兜底/缓存未命中）：不按段补。
+            if current is record:
+                self._planner_segment_records.pop(session_id, None)
+            return None
+        if not record.get("sent"):
+            # 首段可能还在发送中（after_send 尚未跑完）：wait_timeout_seconds=0 时
+            # 不要立刻丢弃记录，留给下一轮 planner 再判断；只有已确认失败才移除。
+            if record["done"].is_set() and current is record:
+                self._planner_segment_records.pop(session_id, None)
+            return None
+        items = kwargs.get("items")
+        if not isinstance(items, list):
+            return None
+        self_items = self._collect_self_message_items(items)
+        used_item_indexes: Set[int] = set()
+        present_segments: Dict[int, int] = {}
+        missing: List[Tuple[int, str, str]] = []
+        for segment_index, (text, message_id) in enumerate(record["sent"]):
+            text_key = self._text_key(text)
+            matched_item_index: Optional[int] = None
+            if message_id:
+                for item_index, item_message_id, _item_text_key in self_items:
+                    if item_index not in used_item_indexes and item_message_id == message_id:
+                        matched_item_index = item_index
+                        break
+            else:
+                for item_index, _item_message_id, item_text_key in self_items:
+                    if item_index not in used_item_indexes and item_text_key == text_key:
+                        matched_item_index = item_index
+                        break
+            if matched_item_index is None:
+                missing.append((segment_index, text, message_id))
+                continue
+            used_item_indexes.add(matched_item_index)
+            present_segments[segment_index] = matched_item_index
+        if not missing:
+            # 只有补发全部结束才移除记录；wait_timeout_seconds=0 / 等待超时时，
+            # 当前已发送的段可能只是前 k 段，后面还会继续发送。
+            if record["done"].is_set() and current is record:
+                self._planner_segment_records.pop(session_id, None)
+                self.ctx.logger.debug("planner 上下文已含全部回复分段，移除补齐记录（会话 %s）", session_id)
+            return None
+        try:
+            bot_name = str(
+                self._resolve_mirror("empty_reply_fallback", "fallback_nickname", "bot_nickname", "text") or ""
+            ).strip()
+        except Exception:
+            bot_name = ""
+        safe_bot_name = (bot_name or "bot").replace('"', "&quot;")
+        now = datetime.now()
+
+        def _build_missing_item(text: str, message_id: str) -> Dict[str, Any]:
+            attrs: List[str] = []
+            safe_message_id = str(message_id or "").replace('"', "&quot;")
+            if safe_message_id:
+                attrs.append(f'msg_id="{safe_message_id}"')
+            attrs.append(f'time="{time.strftime("%H:%M:%S")}"')
+            attrs.append(f'user="{safe_bot_name}"')
+            attrs.append('is_self_message="true"')
+            return {
+                "item_type": "UserMessageItem",
+                "meta": {
+                    "item_id": uuid.uuid4().hex,
+                    "logical_turn_id": None,
+                    "timestamp": now.isoformat(),
+                },
+                "parts": [
+                    {
+                        "type": "text",
+                        "text": f"<message {' '.join(attrs)}>\n{text}",
+                    }
+                ],
+            }
+
+        missing_items = [
+            _build_missing_item(text, message_id) for _index, text, message_id in missing
+        ]
+        new_items: List[Any] = []
+        if present_segments:
+            # 保持回复段顺序：缺中间段 → 插到“下一个已存在段”之前；缺尾段 →
+            # 插到最后一个已存在段之后。这样不会跑到 system-reminder / 人物画像 /
+            # 时间 / 分析指令这些尾部合成项之后，也不会插到已存在的中段前面。
+            insert_before: Dict[int, List[Dict[str, Any]]] = {}
+            insert_after_last: List[Dict[str, Any]] = []
+            last_present_item_index = max(present_segments.values())
+            for (segment_index, _text, _message_id), missing_item in zip(missing, missing_items):
+                later_present = [
+                    (present_segment_index, present_item_index)
+                    for present_segment_index, present_item_index in present_segments.items()
+                    if present_segment_index > segment_index
+                ]
+                if later_present:
+                    next_present_item_index = min(later_present, key=lambda pair: pair[0])[1]
+                    insert_before.setdefault(next_present_item_index, []).append(missing_item)
+                else:
+                    insert_after_last.append(missing_item)
+            for item_index, item in enumerate(items):
+                new_items.extend(insert_before.get(item_index, []))
+                new_items.append(item)
+                if item_index == last_present_item_index:
+                    new_items.extend(insert_after_last)
+        else:
+            # 本轮所有段都缺失：退到“最后一条 bot 自身消息之后”（通常在聊天历史
+            # 末尾、尾部合成项之前）；没有自身消息就插在末尾的分析指令之前。
+            last_self_item_index = max((index for index, _, _ in self_items), default=None)
+            instruction_index: Optional[int] = None
+            if last_self_item_index is None:
+                for item_index in range(len(items) - 1, -1, -1):
+                    item = items[item_index]
+                    if not isinstance(item, dict) or item.get("item_type") != "UserMessageItem":
+                        continue
+                    text = "".join(
+                        str(part.get("text") or "")
+                        for part in item.get("parts") or []
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
+                    if "你需要输出对" in text or "思考是否进行工具调用" in text:
+                        instruction_index = item_index
+                        break
+            if last_self_item_index is not None:
+                for item_index, item in enumerate(items):
+                    new_items.append(item)
+                    if item_index == last_self_item_index:
+                        new_items.extend(missing_items)
+            elif instruction_index is not None:
+                for item_index, item in enumerate(items):
+                    if item_index == instruction_index:
+                        new_items.extend(missing_items)
+                    new_items.append(item)
+            else:
+                new_items = list(items) + missing_items
+        self.ctx.logger.info(
+            "planner 上下文补齐缺失分段：会话 %s，缺失 %s 段，已按回复段顺序插入",
+            session_id,
+            len(missing),
+        )
+        modified = dict(kwargs)
+        modified["items"] = new_items
+        return modified
 
     def _mark_stream_sending(self, session_id: str, text_key: str) -> None:
         self._stream_sending_texts.setdefault(session_id, set()).add(text_key)
@@ -1054,6 +1364,7 @@ class PostProcessTakeoverMixin:
         **抽签阶段**就把 recall 从权重池里剔除（见 ``_skip_recall_in_session``），
         因此本序列里根本不会构建出撤回项——无需在此处再做任何"降级"判断。
         """
+        record = self._get_planner_segment_record(session_id, first_text=first_text)
         previous_id = previous_message_id
         previous_text = first_text
         sent_slots: Dict[int, str] = {0: previous_message_id} if previous_message_id else {}
@@ -1124,11 +1435,16 @@ class PostProcessTakeoverMixin:
                         previous_message_id=base_id,
                     )
                 if sent_id:
+                    # 撤回成功/兜底后重发的修正句才是最终留在历史里的消息；即时纠正
+                    # （slot<0）也一样要进补齐记录，不能只记 slot>=0 的回复分段。
+                    record_message_id = sent_id if sent_id != previous_id else ""
                     previous_id = sent_id
                     previous_text = item.text
                     if slot >= 0:
                         sent_slots[slot] = sent_id
                         sent_slot_texts[slot] = item.text
+                    if record is not None and str(item.text or "").strip():
+                        record["sent"].append((str(item.text).strip(), record_message_id))
                 else:
                     failed += 1
                     self.ctx.logger.error("撤回后重发失败: %r", item.text[:40])
@@ -1156,11 +1472,20 @@ class PostProcessTakeoverMixin:
                 sync_history=item.slot not in recalled_slots,
             )
             if sent_id:
+                record_message_id = sent_id if sent_id != previous_id else ""
                 previous_id = sent_id
                 previous_text = item.text
                 if item.slot >= 0:
                     sent_slots[item.slot] = sent_id
                     sent_slot_texts[item.slot] = item.text
+                # 被撤回的段（recalled_slots）没有写进 Maisaka 历史，不能补进上下文；
+                # 纠正段（slot=-1）与普通分段一样都是实际写入历史的 bot 消息。
+                if (
+                    record is not None
+                    and item.slot not in recalled_slots
+                    and str(item.text or "").strip()
+                ):
+                    record["sent"].append((str(item.text).strip(), record_message_id))
             else:
                 failed += 1
                 self.ctx.logger.error("补发消息失败，跳过第 %s 条: %r", position, item.text[:40])
@@ -1195,9 +1520,10 @@ class PostProcessTakeoverMixin:
         分段交给它们，本插件只保留"回复方式（@/引用）/ 文本规则 / 表情包"那部分工作；
         它们没认领（未安装、未命中、失败）时，本插件照常接管，作为兜底。
 
-        多段发送开启时这里只回传**第 1 段**，其余分段登记到预分段缓存，由
-        ``send_service.after_build_message`` + ``after_send`` 补发——复刻宿主"每段一条
-        消息"的发送效果（首段仍走宿主原生发送链，引用/写库/历史同步不受影响）。
+        多段发送开启时这里回传**全文**（所有分段拼接），让宿主 ``reply`` 工具的结果与
+        ``ToolResultMessage`` 记录完整内容；其余分段登记到预分段缓存，实际出站时由
+        ``send_service.after_build_message`` 截回第 1 段、``after_send`` 补发剩余分段——
+        复刻宿主"每段一条消息"的发送效果（首段仍走宿主原生发送链，引用/写库/历史同步不受影响）。
 
         后处理本身是纯 CPU 计算（毫秒级），放到线程里执行以免阻塞事件循环；
         出错时原样放行，交由框架按自身开关处理，不吞掉这条回复。
@@ -1324,14 +1650,23 @@ class PostProcessTakeoverMixin:
 
         if multi_ok and session_id:
             first_segment = segments[0]
+            # 回传给宿主的"全文"只由分段正文拼成（纠正动作不是回复内容，不参与拼接）；
+            # 宿主 reply 工具据此生成 ToolResultMessage，planner 才不会误判"没发完"。
+            full_text = "".join(segment.text + segment.separator for segment in segments).strip()
+            if not full_text:
+                full_text = first_segment.text
             items = self._build_follow_up_items(segments, corrections, deferred)
-            if items and self._store_prepared_segments(session_id, first_segment.text, items):
-                modified["response"] = first_segment.text
+            if items and self._store_prepared_segments(
+                session_id, full_text, first_segment.text, items
+            ):
+                self._begin_planner_segment_record(session_id, full_text, first_segment.text)
+                modified["response"] = full_text
                 modified["skip_post_process"] = True
                 modified["enable_splitter"] = True
                 modified["enable_chinese_typo"] = True
                 self.ctx.logger.info(
-                    "后处理接管：共 %s 段%s，首段直发、登记 %s 条后续动作（会话 %s）",
+                    "后处理接管：共 %s 段%s，全文回传供 reply 工具结果、首段将在出站 Hook 截回；"
+                    "登记 %s 条后续动作（会话 %s）",
                     len(segments),
                     "（含错字纠正 " + str(len(corrections) + len(deferred)) + " 处）" if has_extra_messages else "",
                     len(items),
@@ -1426,15 +1761,24 @@ class PostProcessTakeoverMixin:
     @HookHandler(
         "send_service.after_build_message",
         name="post_process_follow_up_registrar",
-        description="多段发送：首段出站时登记剩余分段，交给 after_send 补发",
+        description="多段发送：按全文查出缓存，把实际出站截回第 1 段并登记剩余分段交给 after_send 补发",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_after_build_message(self, **kwargs: Any) -> Dict[str, Any]:
-        """只消费 Hook 1 登记的预分段缓存；未命中一律放行。
+        """按**全文**消费 Hook 1 登记的预分段缓存；未命中一律放行。
 
-        未命中意味着这条出站消息不是"本轮回复的首段"（命令回执、其它插件用
+        本条出站消息携带的文本可能是"全文"（``before_post_process`` 把所有分段拼成一条
+        回传给宿主，让 ``reply`` 工具结果与 ``ToolResultMessage`` 记录完整内容）。插件按
+        全文查到缓存后，把**实际发送**的消息体截回第 1 段（只替换 text 组件，reply / at /
+        image / emoji 等非 text 组件原样保留），其余分段仍由 ``after_send`` 补发——所以
+        不会把全文一次性发出去，也不会让 planner 误以为回复没发完。
+
+        匹配时优先用 ``raw_message`` 的原文，再退回 ``processed_plain_text``：宿主可能给
+        可见文本加上 ``[发言内容]`` 等前缀，原文才是我们回传的全文。
+
+        未命中意味着这条出站消息不是"本轮回复的全文"（命令回执、其它插件用
         ``ctx.send.*`` 发出的消息、表情/图片等），天然跳过；补发期间的重入也在此挡掉。
 
         重入判据是"**这条文本是否正在被本插件补发**"，而不是会话级开关：补发窗口内
@@ -1449,19 +1793,67 @@ class PostProcessTakeoverMixin:
         session_id = str(kwargs.get("stream_id") or message.get("session_id") or "").strip()
         if not session_id:
             return {"action": "continue"}
-        outbound_text = str(kwargs.get("processed_plain_text") or "").strip() or self._extract_outbound_text(message)
-        if self._is_own_follow_up_text(session_id, outbound_text):
+        # ``processed_plain_text`` 可能被宿主的可见文本渲染加上 ``[发言内容]`` 等前缀；
+        # 原始 ``raw_message`` 文本才是我们回传的全文。两个都试，优先用原文匹配缓存，
+        # 避免因宿主渲染差异导致全文被当作普通消息一次性发出。
+        raw_text = self._extract_outbound_text(message)
+        processed_text = str(kwargs.get("processed_plain_text") or "").strip()
+        candidate_texts: List[str] = []
+        for candidate in (raw_text, processed_text):
+            if candidate and candidate not in candidate_texts:
+                candidate_texts.append(candidate)
+        if not candidate_texts:
+            return {"action": "continue"}
+        if any(self._is_own_follow_up_text(session_id, text) for text in candidate_texts):
             # 本插件自己正在补发的分段：不消费预分段缓存（否则会把另一轮的待补发
             # 分段误取走），也不需要再次登记。
             self.ctx.logger.debug("补发分段自身的出站消息，跳过预分段登记（会话 %s）", session_id)
             return {"action": "continue"}
-        items = self._take_prepared_segments(session_id, outbound_text)
-        if not items:
+        prepared: Optional[Tuple[str, List["FollowUpItem"]]] = None
+        matched_text = ""
+        for candidate in candidate_texts:
+            prepared = self._take_prepared_segments(session_id, candidate)
+            if prepared is not None:
+                matched_text = candidate
+                break
+        if prepared is None:
             return {"action": "continue"}
+        first_text, items = prepared
+        if not first_text:
+            # 缓存里的首段异常为空：原样放行，不截断也不登记（避免把全文当首段发出去）。
+            return {"action": "continue"}
+        self._mark_planner_record_rewritten(
+            session_id, matched_text, timestamp=message.get("timestamp")
+        )
+        # 实际发送只保留第 1 段：替换（或插入）唯一的 text 组件，非 text 组件全部保留。
+        mutated_message = dict(message)
+        components = message.get("raw_message")
+        new_components: List[Any] = []
+        text_written = False
+        if isinstance(components, list):
+            for component in components:
+                if isinstance(component, dict) and str(component.get("type") or "") == "text":
+                    if not text_written:
+                        new_components.append({"type": "text", "data": first_text})
+                        text_written = True
+                    continue
+                new_components.append(component)
+        if not text_written:
+            new_components.insert(0, {"type": "text", "data": first_text})
+        mutated_message["raw_message"] = new_components
+        mutated_message["processed_plain_text"] = first_text
+        # 宿主 Hook 的 modified_kwargs 是**完整替换**：必须带上 stream_id / typing /
+        # set_reply / storage_message / show_log 等全部原参数，否则发送行为被重置。
+        modified_kwargs = dict(kwargs)
+        modified_kwargs["message"] = mutated_message
+        modified_kwargs["processed_plain_text"] = first_text
         self._register_pending_follow_up(
             [
-                str(message.get("message_id") or "").strip(),
-                self._follow_up_tracking_key(session_id, message.get("timestamp"), outbound_text),
+                self._pending_message_key(session_id, message.get("message_id")),
+                self._follow_up_tracking_key(session_id, message.get("timestamp"), first_text),
+                # before_send 的假 @ 过滤/文本规则可能改写出站文本；session+timestamp
+                # 不受文本与平台 message_id 改写影响，是稳定兜底键。
+                self._pending_time_key(session_id, message.get("timestamp")),
             ],
             {
                 "session_id": session_id,
@@ -1470,11 +1862,11 @@ class PostProcessTakeoverMixin:
                 # （宿主那侧由【打字速度】决定等多久，0 = 不等）。
                 "typing": True,
                 # 首段正文：撤回反应时间留空时按它的打字时长自动决定（见 _recall_delay_seconds）。
-                "first_text": outbound_text,
+                "first_text": first_text,
                 "registered_at": time.monotonic(),
             },
         )
-        return {"action": "continue"}
+        return {"action": "continue", "modified_kwargs": modified_kwargs}
 
     # Hook 2d：多段发送——首段发成功后补发（observe）
     # ------------------------------------------------------------------
@@ -1504,32 +1896,64 @@ class PostProcessTakeoverMixin:
             return
         entry = self._resolve_pending_follow_up(
             [
-                str(message.get("message_id") or "").strip(),
+                self._pending_message_key(session_id, message.get("message_id")),
+                # 文本可能已被 before_send 改写，文本键只作次选；时间键不受改写影响。
                 self._follow_up_tracking_key(session_id, message.get("timestamp"), outbound_text),
+                self._pending_time_key(session_id, message.get("timestamp")),
             ]
         )
         if entry is None:
+            # 不是本插件登记的首段发送（或登记丢失）：若时间键命中本轮 record，
+            # 仍要放行 planner 等待，避免 before_send 改写文本后白等。
+            record = self._get_planner_segment_record(session_id)
+            if (
+                record is not None
+                and record.get("outbound_time_key")
+                and record.get("outbound_time_key")
+                == self._pending_time_key(session_id, message.get("timestamp"))
+            ):
+                record["done"].set()
+            else:
+                self._finish_planner_segment_record(session_id, first_text=outbound_text)
             return
+        first_text = str(entry.get("first_text") or "").strip()
         items = [item for item in entry.get("items") or [] if str(getattr(item, "text", "") or "").strip()]
         if not items:
+            self._finish_planner_segment_record(session_id, first_text=first_text)
             return
         if not bool(kwargs.get("sent")):
+            self._finish_planner_segment_record(session_id, first_text=first_text)
             self.ctx.logger.warning(
                 "后处理接管：首段发送失败，放弃 %s 条后续动作（会话 %s）", len(items), session_id
             )
             return
         # 宿主在 after_send 之前已回填平台消息 id，可直接作为更正段的引用目标。
         previous_message_id = str(message.get("message_id") or "").strip()
-        task = asyncio.create_task(
-            self._run_follow_up_items(
-                session_id,
-                items,
-                typing=bool(entry.get("typing", True)),
-                previous_message_id=previous_message_id,
-                first_text=str(entry.get("first_text") or ""),
-            )
+        # record 仍按首段原文匹配；存进 sent 的正文用 after_send 实际出站文本，
+        # 这样 before_send 改写后（假 @/文本规则）Plan A 的正文兜底也能对上历史。
+        self._record_planner_sent_segment(
+            session_id, first_text, outbound_text or first_text, previous_message_id
         )
-        self._track_follow_up_task(session_id, task)
+        record = self._get_planner_segment_record(session_id, first_text=first_text)
+        try:
+            task = asyncio.create_task(
+                self._run_follow_up_items(
+                    session_id,
+                    items,
+                    typing=bool(entry.get("typing", True)),
+                    previous_message_id=previous_message_id,
+                    first_text=first_text,
+                )
+            )
+            self._track_follow_up_task(session_id, task)
+            if record is not None:
+                # record 绑定自己的 task；宽限判断不能看会话级旧任务。
+                record["task"] = task
+                # 任务异常结束时也必须放行 planner 等待；正常结束时同样由这里收尾。
+                task.add_done_callback(lambda _task, r=record: r["done"].set())
+        except Exception as exc:
+            self.ctx.logger.error("启动补发任务失败（会话 %s）: %s", session_id, exc)
+            self._finish_planner_segment_record(session_id, first_text=first_text)
 
     # Hook 2e：多段发送——时序守卫（planner / 入站消息等待补发完成）
     # ------------------------------------------------------------------
@@ -1537,7 +1961,7 @@ class PostProcessTakeoverMixin:
     @HookHandler(
         "maisaka.planner.before_request",
         name="post_process_follow_up_waiter",
-        description="blocking：本轮补发未完成时先等待，避免下一轮 planner 上下文缺少后半段",
+        description="blocking：本轮补发未完成时先等待，并按 items 中实际缺失的分段补齐 planner 上下文",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         error_policy=ErrorPolicy.SKIP,
@@ -1546,12 +1970,66 @@ class PostProcessTakeoverMixin:
     async def handle_planner_wait_for_follow_ups(self, **kwargs: Any) -> Dict[str, Any]:
         if not self._multi_message_active():
             return {"action": "continue"}
+        # 子代理（表达选择/行为分析等）与主 planner 共用 session_id，但
+        # tool_definitions=[]；它们没有 reply 工具，不应等待/注入本轮补发。
+        tool_definitions = kwargs.get("tool_definitions")
+        if isinstance(tool_definitions, list) and not tool_definitions:
+            return {"action": "continue"}
         session_id = str(kwargs.get("session_id") or "").strip()
-        waited = await self._wait_for_stream_follow_ups(session_id)
-        if waited:
-            self.ctx.logger.info(
-                "后处理接管：planner 请求等待 %s 个补发任务结束（会话 %s）", waited, session_id
+        if not session_id:
+            return {"action": "continue"}
+        record = self._get_planner_segment_record(session_id)
+        if record is not None and not record.get("rewritten"):
+            # 全文没有被截回（单条兜底/缓存未命中）：不会按段补，也没必要等补发任务。
+            if self._planner_segment_records.get(session_id) is record:
+                self._planner_segment_records.pop(session_id, None)
+            record = None
+        if record is not None:
+            timeout = max(float(self.config.response_splitter.wait_timeout_seconds), 0.0)
+            timeout = min(
+                timeout,
+                _FOLLOW_UP_WAIT_HOOK_TIMEOUT_MS / 1000.0 - _FOLLOW_UP_WAIT_HEADROOM_SECONDS,
             )
+            wait_timeout = timeout
+            record_task = record.get("task")
+            has_task = record_task is not None and not record_task.done()
+            age = time.monotonic() - float(record.get("created_at", 0.0))
+            if timeout > 0 and not record["done"].is_set() and not record.get("sent") and not has_task:
+                # 首段还没登记 sent、也没有补发任务：只等到短宽限，避免
+                # before_send abort / 发送管线异常导致 planner 白等满 30s。
+                if age >= _PLANNER_SEGMENT_FIRST_SEND_GRACE_SECONDS:
+                    record["done"].set()
+                else:
+                    wait_timeout = min(timeout, _PLANNER_SEGMENT_FIRST_SEND_GRACE_SECONDS - age)
+            if wait_timeout > 0 and not record["done"].is_set():
+                try:
+                    await asyncio.wait_for(record["done"].wait(), timeout=wait_timeout)
+                except asyncio.TimeoutError:
+                    self.ctx.logger.warning(
+                        "后处理接管：planner 等待补发超时 %.1fs（会话 %s），按已发送分段补齐",
+                        wait_timeout,
+                        session_id,
+                    )
+            if (
+                timeout > 0
+                and not record["done"].is_set()
+                and not record.get("sent")
+                and not has_task
+                and time.monotonic() - float(record.get("created_at", 0.0))
+                >= _PLANNER_SEGMENT_FIRST_SEND_GRACE_SECONDS
+            ):
+                # 宽限内 after_send 始终没来：按首段发送失败收尾，避免记录悬挂。
+                record["done"].set()
+        else:
+            waited = await self._wait_for_stream_follow_ups(session_id)
+            if waited:
+                self.ctx.logger.info(
+                    "后处理接管：planner 请求等待 %s 个补发任务结束（会话 %s）", waited, session_id
+                )
+        if record is not None:
+            modified = self._inject_missing_planner_segments(session_id, kwargs, record=record)
+            if modified is not None:
+                return {"action": "continue", "modified_kwargs": modified}
         return {"action": "continue"}
 
 

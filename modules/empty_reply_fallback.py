@@ -1,4 +1,4 @@
-"""空回复兜底（1.1.3 新增）：replyer 生成可见回复失败时，补一条兜底消息。
+"""回复兜底（1.1.3 新增，1.3.0 起含兜底文本配置）：replyer 生成可见回复失败时，补一条兜底消息。
 
 ## 要解决的场景
 
@@ -32,9 +32,9 @@ elif "response" in after_response_kwargs:
 
 ## 与「异常兜底提示词」共用配置
 
-兜底文本复用 ``[response_splitter] fallback_prompts``（同一份列表、同样的
+兜底文本取 ``[empty_reply_fallback] fallback_prompts``（同一份列表、同样的
 ``{bot_name}`` / ``{user_name}`` 占位符语义）；列表为空时回退宿主自带兜底提示词
-（``build_default_fallback_replies``）。「兜底回复的自称」取 ``[response_splitter]
+（``build_default_fallback_replies``）。「兜底回复的自称」取 ``[empty_reply_fallback]
 fallback_nickname``。
 
 ## 独立开关
@@ -57,7 +57,7 @@ _PLACEHOLDER_USER_NAME = "{user_name}"
 
 
 class EmptyReplyFallbackMixin:
-    """空回复兜底的状态与 Hook。"""
+    """回复兜底的状态与 Hook。"""
 
     def _init_empty_reply_fallback(self) -> None:
         """初始化状态（由插件类 ``__init__`` 调用）。
@@ -70,7 +70,7 @@ class EmptyReplyFallbackMixin:
     # ---- 开关 ----
 
     def _empty_reply_fallback_active(self) -> bool:
-        """空回复兜底是否生效：插件开启 + 本模块开关打开。"""
+        """回复兜底是否生效：插件开启 + 本模块开关打开。"""
         if not self._plugin_enabled():
             return False
         return bool(getattr(self.config.empty_reply_fallback, "enabled", False))
@@ -103,13 +103,13 @@ class EmptyReplyFallbackMixin:
 
     def _fallback_prompt_list(self) -> List[str]:
         """生效的兜底提示词列表（用户自定义优先，空则用宿主自带的）。"""
-        raw = getattr(self.config.response_splitter, "fallback_prompts", None)
+        raw = getattr(self.config.empty_reply_fallback, "fallback_prompts", None)
         if isinstance(raw, (list, tuple)):
             prompts = [str(item).strip() for item in raw if str(item).strip()]
             if prompts:
                 return prompts
         bot_name = str(
-            self._resolve_mirror("response_splitter", "fallback_nickname", "bot_nickname", "text") or ""
+            self._resolve_mirror("empty_reply_fallback", "fallback_nickname", "bot_nickname", "text") or ""
         )
         return build_default_fallback_replies(bot_name)
 
@@ -126,7 +126,7 @@ class EmptyReplyFallbackMixin:
         if _PLACEHOLDER_BOT_NAME not in text and _PLACEHOLDER_USER_NAME not in text:
             return text
         bot_name = str(
-            self._resolve_mirror("response_splitter", "fallback_nickname", "bot_nickname", "text") or ""
+            self._resolve_mirror("empty_reply_fallback", "fallback_nickname", "bot_nickname", "text") or ""
         )
         user_name = ""
         if reply_message_id and _PLACEHOLDER_USER_NAME in text:
@@ -134,7 +134,7 @@ class EmptyReplyFallbackMixin:
                 target = await self._lookup_reply_target(reply_message_id)
             except Exception as exc:
                 target = None
-                self.ctx.logger.debug("空回复兜底 user_name 查询失败（按空处理）: %s", exc)
+                self.ctx.logger.debug("回复兜底 user_name 查询失败（按空处理）: %s", exc)
             if target is not None:
                 user_name = str(target[2] or "").strip() or str(target[1] or "").strip()
         return text.replace(_PLACEHOLDER_BOT_NAME, bot_name).replace(_PLACEHOLDER_USER_NAME, user_name)
@@ -171,7 +171,7 @@ class EmptyReplyFallbackMixin:
         try:
             fallback_text = await self._build_empty_reply_fallback_text(reply_message_id)
         except Exception as exc:
-            self.ctx.logger.warning("空回复兜底文本生成失败，放弃介入: %s", exc)
+            self.ctx.logger.warning("回复兜底文本生成失败，放弃介入: %s", exc)
             return {"action": "continue"}
         if not fallback_text:
             return {"action": "continue"}
