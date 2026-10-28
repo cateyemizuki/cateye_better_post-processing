@@ -240,7 +240,7 @@ from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_mod
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.3.2"
+SUPPORTED_CONFIG_VERSION = "1.3.3"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -1437,6 +1437,25 @@ class ResponseSplitterSectionConfig(PluginConfigBase):
             "label": "分段条数上限",
             "x-toml-comment": "分段条数上限，超过就并成一条消息。0 = 不限制（只用宿主的条数）。",
             **_ui_i18n("Max segments", "0 = follow the host max_split_num."),
+        },
+    )
+    final_newline_action: Literal["保持原样", "取消回车", "额外拆分一段"] = Field(
+        default="保持原样",
+        description=(
+            "分段完成后的最终回车处理：保持原样 / 取消回车 / 额外拆分一段。"
+            "仅分段成功且未触发条数上限时生效；额外拆分无视条数上限，"
+            "只在第一个包含回车、且两侧都有内容的段落处拆成两段"
+        ),
+        json_schema_extra={
+            "label": "分段后回车处理",
+            "x-toml-comment": (
+                "分段完成后遇到回车：保持原样 / 取消回车 / 额外拆分一段（无视条数上限）。"
+                "超限不分段时不处理。"
+            ),
+            **_ui_i18n(
+                "After-split newline",
+                "Keep / remove newline / split one extra segment (ignores the segment cap).",
+            ),
         },
     )
     wait_timeout_seconds: int = Field(
@@ -2981,6 +3000,7 @@ class BetterPostProcessingPlugin(
         self._prepared_segments.clear()
         self._planner_segment_records.clear()
         self._pending_quote_targets.clear()
+        self._pending_at_targets.clear()
         if self._meaning_store is not None:
             self._meaning_store.close()
             self._meaning_store = None
@@ -3148,10 +3168,18 @@ class BetterPostProcessingPlugin(
         outbound_text = self._extract_outbound_text(message)
         own_follow_up = self._is_own_follow_up_text(session_id, outbound_text)
         quote_target = ""
+        at_target_info: Dict[str, str] = {}
         if own_follow_up:
             quote_bucket = self._pending_quote_targets.get(session_id)
             if quote_bucket:
                 quote_target = str(quote_bucket.get(self._text_key(outbound_text)) or "").strip()
+            at_bucket = self._pending_at_targets.get(session_id)
+            if at_bucket:
+                raw_at_info = at_bucket.get(self._text_key(outbound_text))
+                if isinstance(raw_at_info, dict):
+                    at_target_info = dict(raw_at_info)
+                elif raw_at_info:
+                    at_target_info = {"target_id": str(raw_at_info).strip()}
 
         try:
             # 假 @ 过滤必须排在「文本规则」与「回复方式抽取」**之前**：先清掉 LLM 手写的文本 @，
@@ -3188,6 +3216,30 @@ class BetterPostProcessingPlugin(
             modified["set_reply"] = True
             modified["reply_message_id"] = quote_target
             changed = True
+
+        if at_target_info:
+            try:
+                changed = await self._apply_preserved_at(
+                    message,
+                    str(at_target_info.get("target_id") or "").strip(),
+                    user_id=str(at_target_info.get("user_id") or "").strip(),
+                    nickname=str(at_target_info.get("nickname") or "").strip(),
+                    cardname=str(at_target_info.get("cardname") or "").strip(),
+                ) or changed
+            except Exception as exc:
+                self.ctx.logger.warning("恢复首段 @ 失败，保持原样: %s", exc)
+
+        # 首条文本分段（宿主原生发送链）实际带没带引用/@：在发送前记录一次，
+        # 后续若因错字撤回重发头部，用它恢复引用/@。
+        try:
+            self._record_reply_head_style(
+                session_id=session_id,
+                message=message,
+                modified=modified,
+                reply_message_id=reply_message_id,
+            )
+        except Exception as exc:
+            self.ctx.logger.debug("记录首段回复方式失败（忽略）: %s", exc)
 
         if not changed:
             return {"action": "continue"}
@@ -3614,6 +3666,9 @@ class BetterPostProcessingPlugin(
             "emoji_done": False,
             # 引用回复接管是否已抽取过回复方式（同一轮只在首条文本分段抽取一次）。
             "style_done": False,
+            # 首条文本分段实际带没带引用/@；撤回重发头部时据此恢复。
+            "head_style": None,
+            "head_style_recorded": False,
         }
         self._prune_stale_state(now)
 

@@ -38,7 +38,7 @@ import re
 import time
 import tomllib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -46,7 +46,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from maibot_sdk import HookHandler
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
-from ..post_processing import PostProcessor, ProcessedResponseSegment
+from ..post_processing import CorrectionDecision, PostProcessor, ProcessedResponseSegment
 
 
 @dataclass(frozen=True)
@@ -311,6 +311,8 @@ class PostProcessTakeoverMixin:
         self._stream_sending_texts: Dict[str, Set[str]] = {}
         # 多段发送：会话 -> {分段文本键: 待注入的引用目标 id}（更正段引用上一段）。
         self._pending_quote_targets: Dict[str, Dict[str, str]] = {}
+        # 撤回重发头部消息时保留原首段的 @：会话 -> {分段文本键: 原 at 目标信息}。
+        self._pending_at_targets: Dict[str, Dict[str, Dict[str, str]]] = {}
 
 
     # 后处理接管（错别字 + 分段）
@@ -1235,10 +1237,14 @@ class PostProcessTakeoverMixin:
         *,
         typing: bool,
         quote_target: str = "",
+        at_target: str = "",
+        at_user_id: str = "",
+        at_nickname: str = "",
+        at_cardname: str = "",
         previous_message_id: str = "",
         sync_history: bool = True,
     ) -> Optional[str]:
-        """补发一条文本消息；``quote_target`` 非空时给它注入引用。失败返回 None。
+        """补发一条文本消息；``quote_target`` / ``at_target`` 非空时在 before_send 注入引用 / @。
 
         ``sync_history=False``：不把这条件写入 Maisaka 对话历史——用于"发出后马上会被撤回"
         的消息，让 bot 自己的上下文里只留下修正句（撤回后重发的语义）。
@@ -1257,6 +1263,14 @@ class PostProcessTakeoverMixin:
                 # ctx.send.text 传不了 reply_message，因此在 before_send 里给这条发送注入引用
                 # （宿主侧 set_reply + reply_message_id 会被 _prepare_message_for_platform_io 用上）。
                 self._pending_quote_targets.setdefault(session_id, {})[text_key] = quote_target
+            if at_target:
+                # ctx.send.text 也无法直接带 at 组件；before_send 按这个目标重新注入。
+                self._pending_at_targets.setdefault(session_id, {})[text_key] = {
+                    "target_id": at_target,
+                    "user_id": str(at_user_id or "").strip(),
+                    "nickname": str(at_nickname or "").strip(),
+                    "cardname": str(at_cardname or "").strip(),
+                }
             simulated = self._simulated_typing_seconds(normalized) if typing else None
             host_typing = bool(typing) and simulated is None
             for attempt in range(_FOLLOW_UP_SEND_MAX_ATTEMPTS):
@@ -1295,6 +1309,11 @@ class PostProcessTakeoverMixin:
                 quote_bucket.pop(text_key, None)
                 if not quote_bucket:
                     self._pending_quote_targets.pop(session_id, None)
+            at_bucket = self._pending_at_targets.get(session_id)
+            if at_bucket is not None:
+                at_bucket.pop(text_key, None)
+                if not at_bucket:
+                    self._pending_at_targets.pop(session_id, None)
 
 
     async def _recall_message(self, message_id: str) -> bool:
@@ -1386,6 +1405,8 @@ class PostProcessTakeoverMixin:
             if target_slot >= 0:
                 recalled_slots.add(target_slot)
         failed = 0
+        first_segment_id = sent_slots.get(0, "")
+        reply_round = getattr(self, "_reply_rounds", {}).get(session_id) if session_id else None
         for position, item in enumerate(items, start=1):
             index = position - 1
             if item.kind == "recall":
@@ -1393,6 +1414,50 @@ class PostProcessTakeoverMixin:
                 target_id = sent_slots.get(slot, "") if slot >= 0 else previous_id
                 target_text = sent_slot_texts.get(slot, "") if slot >= 0 else previous_text
                 fallback = str(getattr(self.config.chinese_typo, "recall_fallback", "quote") or "quote")
+                # 撤回的是本轮首段（头信息）时，修正句要恢复原首段的引用/@；
+                # 引用对象是原回复目标消息，而不是刚被撤回的 bot 消息。
+                is_head_recall = slot == 0 or (
+                    slot < 0
+                    and (
+                        (bool(target_id) and target_id == first_segment_id)
+                        # 首段 id 缺失时，第一项纠正仍应视为头部纠正（恢复引用/@ 不依赖 id）
+                        or (not first_segment_id and index == 0)
+                    )
+                )
+                head_style = (
+                    reply_round.get("head_style")
+                    if is_head_recall and isinstance(reply_round, dict)
+                    else None
+                )
+                preserved_quote_target = (
+                    str(
+                        head_style.get("quote_target")
+                        or head_style.get("target_id")
+                        or ""
+                    ).strip()
+                    if isinstance(head_style, dict) and head_style.get("has_quote")
+                    else ""
+                )
+                preserved_at_target = (
+                    str(head_style.get("target_id") or "").strip()
+                    if isinstance(head_style, dict) and head_style.get("has_at")
+                    else ""
+                )
+                preserved_at_user_id = (
+                    str(head_style.get("at_user_id") or "").strip()
+                    if isinstance(head_style, dict) and head_style.get("has_at")
+                    else ""
+                )
+                preserved_at_nickname = (
+                    str(head_style.get("at_nickname") or "").strip()
+                    if isinstance(head_style, dict) and head_style.get("has_at")
+                    else ""
+                )
+                preserved_at_cardname = (
+                    str(head_style.get("at_cardname") or "").strip()
+                    if isinstance(head_style, dict) and head_style.get("has_at")
+                    else ""
+                )
                 if not target_id:
                     self.ctx.logger.warning(
                         "撤回重发：找不到要撤回的消息 id（slot=%s），改为直接发送修正句: %r",
@@ -1403,6 +1468,11 @@ class PostProcessTakeoverMixin:
                         session_id,
                         item.text,
                         typing=typing,
+                        quote_target=preserved_quote_target,
+                        at_target=preserved_at_target,
+                        at_user_id=preserved_at_user_id,
+                        at_nickname=preserved_at_nickname,
+                        at_cardname=preserved_at_cardname,
                         previous_message_id=previous_id,
                     )
                 else:
@@ -1418,20 +1488,32 @@ class PostProcessTakeoverMixin:
                             # 刚补发出去的那条已被撤回：后面若还有"引用上一条"的动作，不能引用它。
                             previous_id = ""
                             previous_text = ""
-                        quote_target = ""
+                        quote_target = preserved_quote_target
                         base_id = ""
                     elif fallback == "none":
                         self.ctx.logger.warning("撤回失败且配置为不兜底，跳过该条纠正: %r", item.text[:40])
                         continue
                     else:
                         # 兜底：quote = 改成引用那条错字消息发送；direct = 直接发送。
-                        quote_target = target_id if fallback == "quote" else ""
-                        base_id = target_id if fallback == "quote" else ""
+                        # 头部撤回且原首段有引用时，引用对象必须是原回复目标，不是 bot 消息。
+                        quote_target = (
+                            preserved_quote_target
+                            or (target_id if fallback == "quote" else "")
+                        )
+                        base_id = (
+                            target_id
+                            if fallback == "quote" and not preserved_quote_target
+                            else ""
+                        )
                     sent_id = await self._send_follow_up_text(
                         session_id,
                         item.text,
                         typing=typing,
                         quote_target=quote_target,
+                        at_target=preserved_at_target,
+                        at_user_id=preserved_at_user_id,
+                        at_nickname=preserved_at_nickname,
+                        at_cardname=preserved_at_cardname,
                         previous_message_id=base_id,
                     )
                 if sent_id:
@@ -1640,12 +1722,47 @@ class PostProcessTakeoverMixin:
 
         session_id = str(modified.get("session_id") or "").strip()
         max_segments = max(int(self.config.response_splitter.max_segments), 0)
+        # 分段后回车最终处理：必须在错字/分段逻辑全部完成后、构造 follow-up 之前。
+        # 早退（超长/句数超限）或已超过分段条数上限时按“不分段”，整段跳过；
+        # 只有正常分段结果才处理。额外拆分允许突破条数上限 1 段。
+        original_segment_count = len(segments)
+        over_segment_cap = max_segments > 0 and original_segment_count > max_segments
+        newline_action = str(
+            getattr(self.config.response_splitter, "final_newline_action", "保持原样") or "保持原样"
+        ).strip()
+        extra_split_count = 0
+        newline_changed = False
+        # “超限保留全文”（overflow=True）同样是超限不分段：宿主返回单段全文，
+        # 不能再按回车拆/改，否则违反“超限不分段即使有回车也不处理”。
+        overflow_fallback = bool(stats.get("early")) or bool(stats.get("overflow"))
+        if not overflow_fallback and not over_segment_cap and session_id:
+            segments, corrections, deferred, extra_split_count, newline_changed = (
+                self._apply_final_newline_policy(segments, corrections, deferred)
+            )
+            if newline_changed:
+                self.ctx.logger.info(
+                    "分段后回车处理：%s，%s 段 -> %s 段（额外拆分=%s，会话 %s）",
+                    newline_action,
+                    original_segment_count,
+                    len(segments),
+                    extra_split_count,
+                    session_id,
+                )
+        elif newline_action != "保持原样" and (overflow_fallback or over_segment_cap):
+            self.ctx.logger.info(
+                "分段后回车处理跳过：%s（%s，会话 %s）",
+                newline_action,
+                "早退/超限不分段" if overflow_fallback else "超过分段条数上限",
+                session_id or "?",
+            )
         # 新分支把纠正动作也变成独立消息；单段 + 有纠正时同样需要多段发送通道。
         has_extra_messages = bool(corrections) or bool(deferred)
         multi_ok = (
             self._multi_message_active()
             and (len(segments) > 1 or has_extra_messages)
-            and (max_segments <= 0 or len(segments) <= max_segments)
+            # 额外拆分的那一段“无视上限”：只放宽本插件 max_segments 的最终判定；
+            # 原始分段数超过上限时上面已经整段跳过。
+            and (max_segments <= 0 or len(segments) <= max_segments + extra_split_count)
         )
 
         if multi_ok and session_id:
@@ -1754,6 +1871,82 @@ class PostProcessTakeoverMixin:
                 )
             ]
         return []
+
+    def _apply_final_newline_policy(
+        self,
+        segments: List[ProcessedResponseSegment],
+        corrections: Dict[int, CorrectionDecision],
+        deferred: Tuple[CorrectionDecision, ...],
+    ) -> Tuple[List[ProcessedResponseSegment], Dict[int, CorrectionDecision], Tuple[CorrectionDecision, ...], int, bool]:
+        """分段全部完成后的最终回车处理（在错字/分段逻辑之后）。
+
+        返回 ``(segments, corrections, deferred, extra_split_count, changed)``。
+        ``extra_split_count`` 仅用于让调用方在“额外拆分一段”时放宽分段条数上限；
+        其他动作不改变段数。
+        """
+        action = str(
+            getattr(self.config.response_splitter, "final_newline_action", "保持原样")
+            or "保持原样"
+        ).strip()
+        if action == "取消回车":
+            updated: List[ProcessedResponseSegment] = []
+            changed = False
+            for segment in segments:
+                cleaned = re.sub(r"[\r\n]+", "", segment.text)
+                if cleaned != segment.text and cleaned.strip():
+                    updated.append(replace(segment, text=cleaned))
+                    changed = True
+                else:
+                    updated.append(segment)
+            return updated, corrections, deferred, 0, changed
+        if action != "额外拆分一段":
+            return segments, corrections, deferred, 0, False
+
+        # 带错字纠正/延迟纠正的段不能在这里拆：纠正的 segment_index 无法可靠判断
+        # 错字落在回车前还是后；拆了会让撤回重发引用错段。跳过该段，继续找其它段。
+        corrected_segment_indexes = set(corrections) | {
+            decision.segment_index for decision in deferred
+        }
+        for index, segment in enumerate(segments):
+            if index in corrected_segment_indexes:
+                continue
+            text = segment.text
+            for match in re.finditer(r"\r\n|\r|\n", text):
+                before = text[: match.start()]
+                after = text[match.end():]
+                if not before.strip() or not after.strip():
+                    continue
+                # 只做“额外一段”：在第一个两侧都有内容的回车处拆成前后两段，
+                # 后续即使还有回车也留给后段，不继续无限拆。
+                first = ProcessedResponseSegment(
+                    text=before.strip(),
+                    quote_previous=segment.quote_previous,
+                    # 保留原回车作为 full_text 拼接分隔符：两条实际消息分开，
+                    # 但回传给 reply 工具结果的全文仍保留换行，不会粘成一行。
+                    separator=match.group(0),
+                )
+                second = ProcessedResponseSegment(
+                    text=after.strip(),
+                    quote_previous=False,
+                    separator=segment.separator,
+                )
+                updated_segments = [*segments[:index], first, second, *segments[index + 1:]]
+                updated_corrections: Dict[int, CorrectionDecision] = {}
+                for segment_index, decision in corrections.items():
+                    if segment_index > index:
+                        updated_corrections[segment_index + 1] = replace(
+                            decision, segment_index=segment_index + 1
+                        )
+                    else:
+                        updated_corrections[segment_index] = decision
+                updated_deferred = tuple(
+                    replace(decision, segment_index=decision.segment_index + 1)
+                    if decision.segment_index > index
+                    else decision
+                    for decision in deferred
+                )
+                return updated_segments, updated_corrections, updated_deferred, 1, True
+        return segments, corrections, deferred, 0, False
 
     # Hook 2c：多段发送——登记待补发分段（blocking）
     # ------------------------------------------------------------------

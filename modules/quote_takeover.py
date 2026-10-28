@@ -144,6 +144,110 @@ class QuoteTakeoverMixin:
             return False
         return bool(self._quote_section_config(message).takeover)
 
+    @staticmethod
+    def _has_component_type(raw_message: Any, component_type: str) -> bool:
+        if not isinstance(raw_message, list):
+            return False
+        return any(
+            isinstance(component, dict)
+            and str(component.get("type") or "") == component_type
+            for component in raw_message
+        )
+
+    def _record_reply_head_style(
+        self,
+        *,
+        session_id: str,
+        message: Dict[str, Any],
+        modified: Dict[str, Any],
+        reply_message_id: str,
+    ) -> None:
+        """记录本轮首条文本分段实际带没带引用/@，供“撤回重发头部”时恢复。"""
+        reply_round = self._reply_rounds.get(session_id) if session_id else None
+        if not reply_round or reply_round.get("head_style_recorded"):
+            return
+        target_id = str(reply_round.get("target_id") or "").strip()
+        if not target_id or str(reply_message_id or "").strip() != target_id:
+            return
+        if not self._has_text_component(message):
+            return
+        raw_message = message.get("raw_message")
+        has_quote = bool(modified.get("set_reply")) or self._has_component_type(
+            raw_message, "reply"
+        )
+        has_at = self._has_component_type(raw_message, "at")
+        quote_target = str(modified.get("reply_message_id") or "").strip()
+        at_user_id = at_nickname = at_cardname = ""
+        for component in raw_message if isinstance(raw_message, list) else []:
+            if not isinstance(component, dict):
+                continue
+            component_type = str(component.get("type") or "")
+            data = component.get("data")
+            if component_type == "reply" and isinstance(data, dict):
+                quote_target = str(data.get("target_message_id") or "").strip() or quote_target
+            elif component_type == "at" and isinstance(data, dict) and not at_user_id:
+                at_user_id = str(data.get("target_user_id") or "").strip()
+                at_nickname = str(data.get("target_user_nickname") or "").strip()
+                at_cardname = str(data.get("target_user_cardname") or "").strip()
+        reply_round["head_style"] = {
+            "has_quote": has_quote,
+            "has_at": has_at,
+            "target_id": target_id,
+            "quote_target": quote_target or target_id,
+            "at_user_id": at_user_id,
+            "at_nickname": at_nickname,
+            "at_cardname": at_cardname,
+        }
+        reply_round["head_style_recorded"] = True
+        self.ctx.logger.debug(
+            "记录本轮首段回复方式：quote=%s at=%s（会话 %s，target=%s）",
+            reply_round["head_style"]["has_quote"],
+            reply_round["head_style"]["has_at"],
+            session_id,
+            target_id,
+        )
+
+    async def _apply_preserved_at(
+        self,
+        message: Dict[str, Any],
+        target_id: str,
+        *,
+        user_id: str = "",
+        nickname: str = "",
+        cardname: str = "",
+    ) -> bool:
+        """撤回重发头部时，把原首段对回复目标的真实 @ 重新注入到修正消息。"""
+        raw_message = message.get("raw_message")
+        if not isinstance(raw_message, list):
+            return False
+        if self._has_leading_at(raw_message):
+            return False
+        if not user_id:
+            target = await self._lookup_reply_target(target_id)
+            if target is None:
+                return False
+            user_id, nickname, cardname = target[0], target[1], target[2]
+        literal_mention = self._leading_text_at_mention(raw_message)
+        if literal_mention is not None:
+            component_index, mention, mention_name = literal_mention
+            if not self._mention_matches_target(mention_name, nickname, cardname):
+                # 开头是另一个人的字面 @：不叠真实 at，避免一条消息两个 @。
+                return False
+            # 是回复目标的字面 @（可能是“@目标，xxx”这种不带空格的形式）：
+            # 先删掉字面提及，再注入真实 at，否则真实 at 永远不会出现。
+            raw_message = self._strip_leading_text_mention(
+                raw_message, component_index, mention
+            )
+        message["raw_message"] = self._inject_at_component(
+            raw_message,
+            user_id=user_id,
+            nickname=nickname,
+            cardname=cardname,
+            with_space=self._at_trailing_space(),
+        )
+        self.ctx.logger.info("撤回重发头部：已重新注入原回复目标的 @（target=%s）", target_id)
+        return True
+
     async def _apply_reply_style(self, modified: Dict[str, Any], message: Dict[str, Any]) -> bool:
         """引用回复接管激活时，为**本轮回复的首条文本分段**按权重抽取发送方式。
 
