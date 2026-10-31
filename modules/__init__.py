@@ -5,7 +5,9 @@
 - ``quote_takeover``：引用回复接管（直接 / 引用 / @ / 引用＋@ 的权重抽取）；
 - ``empty_reply_fallback``：回复兜底（replyer 一条正文都没生成时补一条兜底消息 + 兜底文本配置，默认关闭）；
 - ``status_command``：``/bpp`` 状态命令（合并转发 + 一图流，渲染失败退回文字）与
-  ``/bpp fallback`` 兜底测试。
+  ``/bpp fallback`` 兜底测试；
+- ``reply_cleanup``：出站回复清洗（删除中括号内的表情文本 + 清理粘连标点，分段前执行）；
+- ``at_cooldown``：每聊天流独立的 @ 冷却（上下文初始化、出站 at 清洗、送达登记）。
 
 接管与命令模块都以 **mixin** 形式提供能力，由 ``plugin.py`` 的插件类组合（SDK 用
 ``dir(instance)`` 收集组件，继承来的 HookHandler / Command 一样会被注册）。共享基础设施

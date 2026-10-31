@@ -1,8 +1,9 @@
 """引用回复接管模块：宿主关闭「启用引用回复」时按权重抽取回复方式。
 
 **宿主前置条件**（由 ``modules.requirements`` 判定）：宿主
-``chat.reply_style.enable_reply_quote`` 与 ``experimental.enable_rich_reply`` 都必须为
-``false``；任一未关闭时本模块**完全静默**——既不抽取回复方式，也不改写引用/@。
+``chat.reply_style.enable_reply_quote`` 必须为 ``false``，且丰富回复未开启
+（``experimental.enable_rich_reply`` 读不到 = 未开启，新版宿主已无该字段）；任一未满足时
+本模块**完全静默**——既不抽取回复方式，也不改写引用/@。
 
 抽取口径：直接回复 / 引用回复 / @回复 / 引用＋@回复 四选一（私聊恒不 @），并叠加
 「对话已推进」「目标过旧」「同一消息只引用一次」三条调整规则。只作用于本插件登记的
@@ -90,9 +91,9 @@ class QuoteTakeoverMixin:
     def _quote_takeover_active(self) -> bool:
         """框架引用回复开关关闭，且群聊或私聊任一侧接管开启时，接管引用回复。
 
-        宿主前置条件（``chat.reply_style.enable_reply_quote`` 与
-        ``experimental.enable_rich_reply`` 都关闭）由 ``modules.requirements`` 判定；
-        未满足时本模块**完全静默**：不抽取回复方式、不改写引用/@。
+        宿主前置条件（``chat.reply_style.enable_reply_quote`` 关闭、丰富回复未开启——
+        ``experimental.enable_rich_reply`` 读不到即视为未开启）由 ``modules.requirements``
+        判定；未满足时本模块**完全静默**：不抽取回复方式、不改写引用/@。
         """
         if not self._plugin_enabled():
             return False
@@ -104,6 +105,26 @@ class QuoteTakeoverMixin:
     def _quote_section_config(self, message: Dict[str, Any]) -> Any:
         """按会话类型取引用回复**功能**配置节（``[quote_reply]`` / ``[quote_reply_private]``）。"""
         return self.config.quote_reply if self._is_group_message(message) else self.config.quote_reply_private
+
+    def _at_cooldown_remaining_safe(self, session_id: str) -> float:
+        """@ 冷却剩余秒数（安全取值：单独使用本 mixin 的测试对象没有该状态时返回 0）。"""
+        getter = getattr(self, "_at_cooldown_remaining", None)
+        if not callable(getter):
+            return 0.0
+        try:
+            return float(getter(session_id))
+        except Exception:
+            return 0.0
+
+    def _mark_at_cooldown_safe(self, session_id: str) -> None:
+        """注入 @ 后立刻刷新冷却（不等 after_send，避免同轮后续消息抢跑）。"""
+        marker = getattr(self, "_mark_at_cooldown", None)
+        if not callable(marker):
+            return
+        try:
+            marker(session_id)
+        except Exception:
+            pass
 
     def _at_trailing_space(self) -> bool:
         """注入真实 @ 时是否额外补一个空格组件（``[plugin] at_trailing_space``）。
@@ -220,6 +241,12 @@ class QuoteTakeoverMixin:
         raw_message = message.get("raw_message")
         if not isinstance(raw_message, list):
             return False
+        if self._at_cooldown_remaining_safe(str(message.get("session_id") or "")) > 0:
+            self.ctx.logger.info(
+                "撤回重发头部：@ 冷却中，跳过恢复 @（会话 %s）",
+                str(message.get("session_id") or "?")[:12],
+            )
+            return False
         if self._has_leading_at(raw_message):
             return False
         if not user_id:
@@ -245,6 +272,7 @@ class QuoteTakeoverMixin:
             cardname=cardname,
             with_space=self._at_trailing_space(),
         )
+        self._mark_at_cooldown_safe(str(message.get("session_id") or ""))
         self.ctx.logger.info("撤回重发头部：已重新注入原回复目标的 @（target=%s）", target_id)
         return True
 
@@ -414,6 +442,25 @@ class QuoteTakeoverMixin:
                 reply_message_id,
             )
 
+        # 每聊天流 @ 冷却：冷却期内不抽 @ / 引用＋@；如果池子里只剩 @ 项，回退为直接回复
+        # （而不是让 ``_pick_reply_style`` 的"全零回退引用"把消息变成引用）。
+        remaining = self._at_cooldown_remaining_safe(session_id)
+        if remaining > 0:
+            if weights is None:
+                weights = {name: float(weight) for name, weight in self._weights_for_message(message).items()}
+            at_weight = float(weights.get("at", 0.0)) + float(weights.get("quote_at", 0.0))
+            weights["at"] = 0.0
+            weights["quote_at"] = 0.0
+            if not any(float(value) > 0 for value in weights.values()):
+                weights = {"direct": 1.0, "quote": 0.0, "at": 0.0, "quote_at": 0.0}
+            if at_weight > 0:
+                self.ctx.logger.info(
+                    "@ 冷却中（剩余 %.1f 秒），本次不抽 @（会话 %s，原 @ 权重 %.1f）",
+                    remaining,
+                    session_id[:12],
+                    at_weight,
+                )
+
         style = self._pick_reply_style(weights, message)
         if style == "direct":
             return False
@@ -440,6 +487,7 @@ class QuoteTakeoverMixin:
                             with_space=at_with_space,
                         )
                         message["raw_message"] = injected
+                        self._mark_at_cooldown_safe(session_id)
                         self.ctx.logger.info(
                             "回复方式=%s（字面 @ 升级为真实 @）：前缀组件 %s（会话 %s，引用=%s）",
                             style,
@@ -515,6 +563,7 @@ class QuoteTakeoverMixin:
                     with_space=at_with_space,
                 )
                 message["raw_message"] = injected
+                self._mark_at_cooldown_safe(session_id)
                 self.ctx.logger.info(
                     "回复方式=%s（注入 @）：前缀组件 %s（会话 %s，引用=%s）",
                     style,

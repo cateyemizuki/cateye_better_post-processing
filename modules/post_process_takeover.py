@@ -1,8 +1,9 @@
 """后处理接管模块：错别字 + 分段 + 多段发送（完整复刻宿主后处理框架效果）。
 
-**宿主前置条件**（由 ``modules.requirements`` 判定）：宿主
-``response_post_process.enable_response_post_process`` 与 ``experimental.enable_rich_reply``
-都必须为 ``false``；任一未关闭时本模块全部 Hook **静默返回**、不做任何处理。
+**宿主前置条件**（由 ``modules.requirements`` 判定）：宿主需**不在做错别字处理**
+（``response_post_process.enable_response_post_process = false`` 或 ``chinese_typo.enable = false``），
+且丰富回复未开启（``experimental.enable_rich_reply`` 读不到 = 未开启，新版宿主已无该字段）；
+任一未满足时本模块全部 Hook **静默返回**、不做任何处理。
 
 Hook 分工（多段发送）：
 

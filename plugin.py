@@ -9,17 +9,22 @@
 | ``modules/post_process_takeover.py`` | 后处理接管（错别字 + 分段 + 多段发送 + 异常兜底提示词占位替换） |
 | ``modules/quote_takeover.py`` | 引用回复接管（直接/引用/@/引用＋@ 权重抽取） |
 | ``modules/status_command.py`` | ``/bpp`` 状态命令（合并转发 + 一图流）与 ``/bpp fallback`` 兜底测试 |
+| ``modules/reply_cleanup.py`` | 出站回复清洗（删除中括号内的表情文本 + 清理粘连标点，分段前执行） |
+| ``modules/at_cooldown.py`` | 每聊天流独立的 @ 冷却（上下文初始化、出站 at 清洗、送达登记） |
 | ``modules/empty_reply_fallback.py`` | 回复兜底（默认关闭：replyer 一条正文都没生成时补一条；兜底文本配置也在此节） |
 | ``modules/self_reply_guard.py`` | 自回复 / 重复回复拦截（1.2.0 合并，默认关闭；迁自 cateye_duplicate_reply_guard） |
 | ``modules/cross_chat_recall.py`` | 跨聊私聊回忆（1.2.0 合并，默认关闭；迁自 cateye_mai_cross-chat_recall）+ 旧数据迁移 |
 | ``intercept_log.py`` / ``helpers.py`` / ``injector.py`` / ``name_resolver.py`` / ``scanner.py`` / ``store.py`` / ``summarizer.py`` / ``logging_setup.py`` | 1.2.0 随合并迁入的支撑模块（拦截 JSONL 日志、消息解析、注入块、名称解析、扫描、总结库、总结器、CCR 文件日志——后者只随迁不初始化） |
 | ``post_processing.py`` | 宿主后处理算法的逐行复刻（纯逻辑，可离线单测） |
 
-**模块前置条件**：两个接管模块都要求宿主**关闭对应能力**才会工作，且都额外要求关闭
-**丰富回复**（``experimental.enable_rich_reply``）：
+**模块前置条件**：两个接管模块都要求宿主**关闭对应能力**才会工作，且都额外要求
+**丰富回复未开启**（``experimental.enable_rich_reply``）：
 
-* 引用回复接管：宿主 ``chat.reply_style.enable_reply_quote = false`` + 丰富回复关闭；
-* 后处理接管：宿主 ``response_post_process.enable_response_post_process = false`` + 丰富回复关闭。
+* 引用回复接管：宿主 ``chat.reply_style.enable_reply_quote = false`` + 丰富回复未开启；
+* 后处理接管：宿主 ``response_post_process.enable_response_post_process = false`` + 丰富回复未开启。
+
+**丰富回复的判定口径（1.3.4 起）**：宿主新版已移除该字段，读取不到 = 丰富回复能力
+未开启（两个接管照常工作）；只有明确读到 ``True`` 才按开启处理、要求关闭。
 
 任一条件未满足时，对应模块**完全静默**（不改写、不介入、不发送），插件配置里打开也没用；
 表情包相关功能与文本规则不受这些条件约束。启动与每次配置变更都会打印各模块的可用状态。
@@ -32,7 +37,8 @@
 ``before_post_process`` 一个 Hook 无法把一条待发消息拆成多条；因此改用 **Hook 组合 +
 ``ctx.send.text``** 复现同一效果（见 ``modules/post_process_takeover.py`` 的模块说明）。
 
-当前提供九个互相独立的功能（其中 7~9 为 1.2.0 合并进来的三个模块，**默认关闭**）：
+当前提供十一个互相独立的功能（其中 7~9 为 1.2.0 合并进来的三个模块，**默认关闭**；
+10~11 为 1.4.0 新增的出站清洗与 @ 冷却，**默认开启**）：
 
 1. 后处理接管（``[response_splitter]``）：框架
    ``response_post_process.enable_response_post_process`` 关闭时，在
@@ -179,6 +185,15 @@
    随 reply 注入；``/ccr debug test``、``/ccr clean`` 两个 operator 命令随之迁入。
    实现见 ``modules/cross_chat_recall.py``（含旧插件数据的一次性 copy 迁移）。
 9. 拦截独立日志（``[intercept_log]``，1.2.0，默认开启）：仅服务于上面第 7 项，守卫关闭时无输出。
+10. 出站表情文本清洗（``[plugin] strip_emoji_text``，1.4.0，默认开启）：在回复正文刚生成、
+   引用/@ 组件尚未引入、分段尚未开始时（``maisaka.reply.before_post_process`` 的
+   BLOCKING/EARLY 处理器），删除中括号内包含「表情」的整段文本（宿主 ``[表情包: …]``、
+   插件 ``[表情包标签：…]`` / ``[表情包图片内容描述：…]``、``[表情]`` 等），并清理删除后
+   粘连的逗号/句号等标点。分段后再删会把被切开的括号漏掉，所以必须赶在分段前。
+11. 每聊天流 @ 冷却（``[at_cooldown]``，1.4.0，默认开启、15 秒）：按 session 独立；
+   每个聊天流首次出站时扫最近消息里 bot 自己的 @ 初始化，之后按送达消息刷新；冷却内
+   出站消息里的 ``at`` 组件（宿主 attach_at / 其它插件注入 / 本插件自己抽到的）一律移除，
+   ``quote_takeover`` 不抽 ``at`` / ``quote_at``，撤回重发头部也不恢复 @。
 
 聊天流表情冷却（``[emoji_cooldown]``）：``send_service.after_send``（observe）观察到
 任何来源（planner 的 send_emoji 工具、其它插件、本插件自身）的表情包消息发出后，
@@ -233,6 +248,8 @@ from .modules.post_process_takeover import (
 from .modules.empty_reply_fallback import EmptyReplyFallbackMixin
 from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.status_command import StatusCommandMixin
+from .modules.reply_cleanup import ReplyCleanupMixin
+from .modules.at_cooldown import AtCooldownMixin
 # 阶段 3 合并（1.2.0，迁自两个旧插件；旧插件目录原样保留）
 from .modules.self_reply_guard import SelfReplyGuardMixin
 from .modules.cross_chat_recall import CrossChatRecallMixin
@@ -240,7 +257,7 @@ from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_mod
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.3.3"
+SUPPORTED_CONFIG_VERSION = "1.4.0"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -369,7 +386,8 @@ _FAKE_AT_PATTERN = re.compile(
 
 
 # 为什么 filter_fake_at 放这里而不是某个功能板块：它跨板块（群聊/私聊、两个接管都算），
-# 且与 rich_reply_gate 是同一套门控口径（宿主开着「丰富回复」时插件整体不介入）。
+# 且与 rich_reply_gate 是同一套门控口径（宿主明确开着「丰富回复」时插件整体不介入；
+# 新版宿主已移除该字段，读不到视为未开启）。
 class PluginSectionConfig(PluginConfigBase):
     """插件总开关、跨板块门控与出站清洗开关。"""
 
@@ -393,18 +411,19 @@ class PluginSectionConfig(PluginConfigBase):
         default=True,
         description=(
             "两个接管模块（引用回复接管 / 后处理接管）是否要求宿主关闭「丰富回复」"
-            "（experimental.enable_rich_reply）。默认开启门控：宿主开着丰富回复时，回复工具会把"
+            "（experimental.enable_rich_reply）。默认开启门控：宿主明确开着丰富回复时，回复工具会把"
             "图片/表情/@ 附件挂到分段上，与多段发送、引用注入的语义冲突，因此两个接管保持静默。"
+            "**新版宿主已移除该字段，读取不到 = 丰富回复能力未开启，接管照常生效**。"
             "关闭本项后，宿主开着丰富回复也允许接管——此时附件只挂在首段、补发分段不带附件，"
             "请自行确认可接受"
         ),
         json_schema_extra={
             "label": "丰富回复门控",
-            "x-toml-comment": "开启时：宿主开着「丰富回复」就不接管（附件与分段语义冲突）。",
+            "x-toml-comment": "开启时：宿主明确开着「丰富回复」就不接管（读不到该开关 = 未开启，照常接管）。",
             **_ui_i18n(
                 "Rich reply gate",
                 "On (default): the two takeover modules stay silent while the host "
-                "experimental.enable_rich_reply is on.",
+                "experimental.enable_rich_reply is explicitly on (missing = feature absent).",
             ),
         },
     )
@@ -424,6 +443,24 @@ class PluginSectionConfig(PluginConfigBase):
                 "Filter fake @",
                 "Strip a leading text-only \"@name\" plus its trailing whitespace written by the LLM "
                 "(not a real mention).",
+            ),
+        },
+    )
+    strip_emoji_text: bool = Field(
+        default=True,
+        description=(
+            "出站清洗表情文本：在回复正文刚生成、引用/@ 组件尚未引入、分段尚未开始前，"
+            "删除中括号内包含「表情」二字的整段文本（如 `[表情包: 描述]`、"
+            "`[表情包标签：…]`、`[表情包图片内容描述：…]`、`[表情]`），"
+            "并清理删除后粘连的逗号/句号等标点。只处理 bot 本轮回复正文，不碰用户消息与命令响应"
+        ),
+        json_schema_extra={
+            "label": "出站清洗表情文本",
+            "x-toml-comment": "回复正文里中括号含「表情」的整段内容会被删掉（含粘连标点清理）。",
+            **_ui_i18n(
+                "Strip emoji text from replies",
+                "Remove bracketed emoji text (e.g. [表情包: ...], [表情包图片内容描述：...]) from the reply body "
+                "before quoting/@ injection and before splitting, then tidy glued punctuation.",
             ),
         },
     )
@@ -2611,6 +2648,51 @@ class EmojiMeaningSectionConfig(PluginConfigBase):
     )
 
 
+class AtCooldownSectionConfig(PluginConfigBase):
+    """同一聊天流里 bot 两次 @ 之间的最小间隔（默认开启，15 秒）。"""
+
+    __ui_label__ = "@ 冷却"
+    __ui_icon__ = "at-sign"
+    __ui_order__ = 18
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "@ cooldown",
+            "description": "Per-chat cooldown between mentions; also cleans host-generated @ during the cooldown.",
+        },
+    }
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "每个聊天流独立的 @ 冷却。开启后：冷却期内插件不再抽 @，出站消息里已有的 at 组件"
+            "（宿主 attach_at / 其它插件注入）会被移除；每个聊天流首次出站时会扫描最近消息里"
+            "bot 自己的 @ 来初始化冷却，避免插件重启后立刻又 @。默认开启"
+        ),
+        json_schema_extra={
+            "label": "启用 @ 冷却",
+            "x-toml-comment": "同一会话里两次 @ 的最小间隔；冷却中连宿主/其它插件的 @ 也会被清掉。",
+            **_ui_i18n(
+                "Enable @ cooldown",
+                "Per-chat: within the cooldown the plugin never injects @ and existing at components "
+                "from the host/other plugins are stripped; recent context is scanned once per chat.",
+            ),
+        },
+    )
+    seconds: float = Field(
+        default=15.0,
+        ge=0.0,
+        description="冷却时长（秒）：同一聊天流里两次 @ 之间的最小间隔；0 = 不冷却（等于关闭）",
+        json_schema_extra={
+            "label": "冷却时长（秒）",
+            "x-toml-comment": "同一会话里两次 @ 的最小间隔（秒）；0 = 关闭。",
+            **_ui_i18n(
+                "Cooldown (seconds)",
+                "Minimum interval between two mentions in the same chat; 0 disables the cooldown.",
+            ),
+        },
+    )
+
+
 class BetterPostProcessingConfig(PluginConfigBase):
     """插件完整配置。
 
@@ -2632,6 +2714,7 @@ class BetterPostProcessingConfig(PluginConfigBase):
     ``[cross_chat_recall]`` → ``[self_reply_guard]`` → ``[duplicate_reply_guard]`` →
     ``[intercept_log]``（前三个默认关闭、``intercept_log`` 维持开启；
     ``cross_chat_recall`` 因 SDK 不支持两级嵌套 section 而**平铺**，见该类上方注释）。
+    1.4.0 在末尾追加 ``[at_cooldown]``（默认开启、15 秒）。
     """
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
@@ -2671,6 +2754,8 @@ class BetterPostProcessingConfig(PluginConfigBase):
         default_factory=DuplicateReplyGuardSectionConfig
     )
     intercept_log: InterceptLogSectionConfig = Field(default_factory=InterceptLogSectionConfig)
+    # ---- 1.4.0：每聊天流独立的 @ 冷却（默认开启）----
+    at_cooldown: AtCooldownSectionConfig = Field(default_factory=AtCooldownSectionConfig)
 
 
 class BetterPostProcessingPlugin(
@@ -2680,6 +2765,8 @@ class BetterPostProcessingPlugin(
     EmptyReplyFallbackMixin,
     SelfReplyGuardMixin,
     CrossChatRecallMixin,
+    ReplyCleanupMixin,
+    AtCooldownMixin,
     MaiBotPlugin,
 ):
     """回复后处理接管、回复方式抽取、表情包互动与出站文本规则增强插件。
@@ -2725,6 +2812,9 @@ class BetterPostProcessingPlugin(
         self._planner_main_pending: set[str] = set()
         # 聊天流表情冷却起点（仅入库的表情包记录）：session_id -> 单调时钟。
         self._chat_emoji_cooldown_start: Dict[str, float] = {}
+        # 每聊天流 @ 冷却：session_id -> 最近一次 @ 的单调时钟；已做过上下文初始化的会话。
+        self._at_cooldown_last: Dict[str, float] = {}
+        self._at_cooldown_seeded: set[str] = set()
         # 群聊连续表情包计数：session_id -> {"count", "last", "last_desc"}。
         self._emoji_streaks: Dict[str, Dict[str, Any]] = {}
         # "对话已推进"/"回复目标超时"首次触发时用 info 记录，后续降为 debug。
@@ -3057,8 +3147,9 @@ class BetterPostProcessingPlugin(
             values[cache_key] = value
             values[path] = value
 
-        # 前置条件用到的其它宿主开关（如 experimental.enable_rich_reply）：读不到就存 None，
-        # 模块据此保持静默（保守优先——宁可不介入，也不要与宿主原生能力重复处理）。
+        # 前置条件用到的其它宿主开关（如 experimental.enable_rich_reply）：读不到就存 None。
+        # 普通开关按未满足处理（保守优先，保持静默）；「丰富回复」是新版宿主已移除的字段，
+        # 由 requirements 按「读不到 = 未开启」放行，避免接管在新宿主上永远静默。
         for path in REQUIRED_HOST_PATHS:
             if path not in values:
                 values[path] = await self._read_global_config(path, None)
@@ -3105,6 +3196,14 @@ class BetterPostProcessingPlugin(
     def _rich_reply_gate(self) -> bool:
         """「丰富回复」是否仍作为两个接管的硬门槛（``[plugin] rich_reply_gate``）。"""
         return bool(getattr(self.config.plugin, "rich_reply_gate", True))
+
+    def _rich_reply_enabled(self) -> bool:
+        """宿主「丰富回复」是否开启：**只有明确读到 True 才算开启**。
+
+        新版宿主已移除 ``experimental.enable_rich_reply`` 字段（读到的是 None），
+        此时视为丰富回复能力未开启；``_rich_reply_gate`` 关掉时也不受此约束。
+        """
+        return self._cfg.get("experimental.enable_rich_reply") is True
 
     def _module_status(self, key: str) -> Any:
         """判定某个模块当前是否可用（依据宿主配置快照）。"""
@@ -3162,6 +3261,27 @@ class BetterPostProcessingPlugin(
         session_id = str(message.get("session_id") or "").strip()
         reply_message_id = str(modified.get("reply_message_id") or "").strip()
         changed = False
+
+        # @ 冷却：每个聊天流首次出站时扫一遍最近消息里 bot 的 @ 来初始化；冷却中先清掉
+        # 宿主/其它插件已经挂在这个出站消息上的 at 组件。插件自己抽到的 @ 由
+        # ``_apply_reply_style`` 直接不抽，末尾还有一次兜底移除。
+        at_cooldown_active = False
+        if session_id:
+            try:
+                await self._seed_at_cooldown_from_context(session_id)
+            except Exception as exc:
+                self.ctx.logger.debug("@ 冷却上下文初始化失败（忽略）: %s", exc)
+            at_cooldown_active = self._at_cooldown_active(session_id)
+            if at_cooldown_active:
+                removed_at = self._strip_at_components(message)
+                if removed_at:
+                    changed = True
+                    self.ctx.logger.info(
+                        "出站清洗：@ 冷却中，移除 %d 个 at 组件（会话 %s，剩余 %.1f 秒）",
+                        removed_at,
+                        session_id[:12],
+                        self._at_cooldown_remaining(session_id),
+                    )
 
         # 本条发送是否为本插件正在补发的分段（多段发送）：文本规则据此把它认作
         # 本轮回复的一部分（这类发送 reply_message_id 为空，轮记录判定不成立）。
@@ -3229,6 +3349,18 @@ class BetterPostProcessingPlugin(
             except Exception as exc:
                 self.ctx.logger.warning("恢复首段 @ 失败，保持原样: %s", exc)
 
+        # @ 冷却兜底：上面的抽取/恢复分支理论上都已被拦，这里再清一次，保证冷却期内
+        # 任何来源的 at 组件都不会出现在出站消息里。
+        if at_cooldown_active:
+            removed_at = self._strip_at_components(message)
+            if removed_at:
+                changed = True
+                self.ctx.logger.info(
+                    "出站清洗：@ 冷却兜底，移除 %d 个 at 组件（会话 %s）",
+                    removed_at,
+                    session_id[:12],
+                )
+
         # 首条文本分段（宿主原生发送链）实际带没带引用/@：在发送前记录一次，
         # 后续若因错字撤回重发头部，用它恢复引用/@。
         try:
@@ -3257,9 +3389,9 @@ class BetterPostProcessingPlugin(
         适配器的文本段是原样下发），所以 QQ 里它不提醒任何人。留着它再叠上「引用回复接管」
         抽到 @ 时注入的**真实** at，一条消息里就会出现两个 @（0.11.3 线上事故）。
 
-        本功能与两个接管**同口径**：宿主开着「丰富回复」且 ``[plugin] rich_reply_gate`` 开启时，
-        插件整体不介入，这里也不动任何文本。宿主配置读不到（``_cfg`` 里没有该项）时按"允许"
-        处理——此时两个接管本就静默，清掉无意义的文本 @ 只会更干净。
+        本功能与两个接管**同口径**：宿主**明确开着**「丰富回复」且 ``[plugin] rich_reply_gate``
+        开启时，插件整体不介入，这里也不动任何文本。宿主配置读不到（新版宿主已移除该字段）
+        时按"丰富回复未开启"处理，照常清理文本 @。
         """
         if not self._plugin_enabled():
             return False
@@ -3267,7 +3399,7 @@ class BetterPostProcessingPlugin(
             return False
         if not self._rich_reply_gate():
             return True  # 门控关掉 = 宿主开着丰富回复也允许介入
-        return not bool(self._cfg.get("experimental.enable_rich_reply"))
+        return not self._rich_reply_enabled()
 
     async def _strip_leading_fake_at(
         self,
@@ -3891,6 +4023,8 @@ class BetterPostProcessingPlugin(
             return
 
         now = time.monotonic()
+        # @ 冷却：送达的消息里确实带 at 才刷新（发送失败/被 abort 的不算）。
+        self._note_outbound_at(session_id, message)
         components = message.get("raw_message")
         has_emoji = isinstance(components, list) and any(
             isinstance(component, dict) and str(component.get("type") or "") == "emoji"
@@ -5383,6 +5517,7 @@ class BetterPostProcessingPlugin(
             key for key, ts in self._chat_emoji_cooldown_start.items() if now - ts > cooldown_keep
         ]:
             self._chat_emoji_cooldown_start.pop(session_id, None)
+        self._prune_at_cooldown_state(now)
         for session_id in [
             key
             for key, bucket in self._session_emoji_refs.items()

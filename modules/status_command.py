@@ -3,7 +3,7 @@
 提供两个子命令（同一个 ``@Command`` 组件，正则捕获子命令）：
 
 * ``/bpp``——把插件当前各模块的状态**用合并转发发送**（``send.forward`` 单节点）：
-  状态先渲染成**一图流**（``render.html2png``，HTML 卡片 → PNG，节点里放 image 段），
+  状态先渲染成**一图流**（``render.html2png``，HTML 面板 → PNG，节点里放 image 段），
   **渲染失败时退回文字**（节点里放 text 段）；合并转发本身失败时再逐级退回
   ``send.image`` / ``send.text`` 直发（官方文档建议的兼容口径：适配器可能不支持转发）。
 * ``/bpp fallback``——对**命令引用的那条消息**触发一次异常兜底测试：按
@@ -39,10 +39,10 @@ from maibot_sdk import Command
 
 from ..post_processing import build_default_fallback_replies
 
-# 一图流的渲染参数：固定宽度、**按卡片元素截取**（高度贴合内容，见 _render_status_image）、
-# 2x 缩放保证清晰度。
+# 一图流的渲染参数：固定宽度、**按页面元素截取**（高度贴合内容，见 _render_status_image）、
+# 2x 缩放保证清晰度。1080 与「属于麦麦的生活」状态图同一版心（纸底/墨字/单红强调）。
 # allow_network 保持默认 False（宿主默认禁外网），HTML 里只用内联 CSS、不引用外部资源。
-_RENDER_VIEWPORT_WIDTH = 780
+_RENDER_VIEWPORT_WIDTH = 1080
 _RENDER_DEVICE_SCALE_FACTOR = 2.0
 
 # 合并转发节点的展示昵称（转发气泡里显示的名字）。
@@ -54,6 +54,25 @@ _STATE_AVAILABLE = "可用"
 _STATE_DISABLED = "已关闭"
 _STATE_SILENT = "静默"
 _STATE_ERROR = "异常"
+
+# 四态在版面上的形态：实心墨点 / 空心环 / 实心红点（需要处理）/ 实心红点（出错）。
+# 只借用「属于麦麦的生活」的纸底 + 墨字 + 单红强调色板，不引入第二套语义色。
+_STATE_DOTS = {
+    _STATE_AVAILABLE: ("background:#111111;", "#111111"),
+    _STATE_DISABLED: ("border:1.5px solid #A8A39A;", "#9A968D"),
+    _STATE_SILENT: ("background:#E8402A;", "#E8402A"),
+    _STATE_ERROR: ("background:#E8402A;", "#C9341F"),
+}
+
+# 右侧分节：编号 / 标题 / 归属模块（键与 requirements.MODULE_LABELS 一致）。
+# 后处理接管的两条子行（分段 / 错别字）都归在「接管」节里，顺序与状态收集一致。
+_MODULE_GROUPS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    ("01", "接管", ("quote_reply", "post_process")),
+    ("02", "表情包", ("emoji_after_reply", "emoji_follow", "emoji_meaning")),
+    ("03", "文本与兜底", ("text_rules", "empty_reply_fallback")),
+    ("04", "守卫", ("self_reply_guard", "duplicate_reply_guard")),
+    ("05", "跨聊", ("cross_chat_recall",)),
+)
 
 # ``/bpp fallback`` 的 ``{user_name}`` 占位值清理：它来自被引用消息的发送者昵称/群名片
 # （**他人可控文本**），替换后会由 bot 真实发出——长度截断 + 剔除不可打印字符
@@ -193,7 +212,7 @@ class StatusCommandMixin:
                     detail = f"{switch_detail}；{met}" if switch_detail else met
                 else:
                     detail = switch_detail or "不受宿主开关约束"
-            rows.append({"label": label, "state": state, "detail": detail})
+            rows.append({"key": key, "label": label, "state": state, "detail": detail})
         return rows
 
     def _post_process_status_rows(self, status: Any) -> List[Dict[str, str]]:
@@ -224,19 +243,21 @@ class StatusCommandMixin:
                 "如需接管，请关闭宿主「启用回复后处理」或「启用错别字」"
             )
             return [
-                {"label": "分段接管", "state": _STATE_SILENT, "detail": seg_detail},
-                {"label": "错别字接管", "state": _STATE_SILENT, "detail": typo_detail},
+                {"key": "post_process", "label": "分段接管", "state": _STATE_SILENT, "detail": seg_detail},
+                {"key": "post_process", "label": "错别字接管", "state": _STATE_SILENT, "detail": typo_detail},
             ]
         if not bool(self.config.response_splitter.takeover):
             prompts = self._custom_fallback_prompts()
             extra = f"；自定义兜底提示词 {len(prompts)} 条" if prompts else ""
             return [
                 {
+                    "key": "post_process",
                     "label": "分段接管",
                     "state": _STATE_DISABLED,
                     "detail": "插件接管开关已关闭（[response_splitter] takeover），分段保持宿主行为",
                 },
                 {
+                    "key": "post_process",
                     "label": "错别字接管",
                     "state": _STATE_DISABLED,
                     "detail": (
@@ -260,6 +281,7 @@ class StatusCommandMixin:
         # 错别字接管模式下分段归宿主，本插件仅复刻执行（见行文案），不算接管。
         if typo_only_mode:
             seg_row = {
+                "key": "post_process",
                 "label": "分段接管",
                 "state": _STATE_SILENT,
                 "detail": (
@@ -277,6 +299,7 @@ class StatusCommandMixin:
                 self._resolve_mirror("response_splitter", "enable", "response_splitter.enable", "switch")
             )
             seg_row = {
+                "key": "post_process",
                 "label": "分段接管",
                 "state": _STATE_AVAILABLE if seg_on else _STATE_DISABLED,
                 "detail": (
@@ -291,6 +314,7 @@ class StatusCommandMixin:
         return [
             seg_row,
             {
+                "key": "post_process",
                 "label": "错别字接管",
                 "state": _STATE_AVAILABLE if typo_on else _STATE_DISABLED,
                 "detail": typo_detail,
@@ -376,20 +400,50 @@ class StatusCommandMixin:
         return None, ""
 
     def _collect_header_facts(self) -> List[Tuple[str, str]]:
-        """卡片头部的全局事实（键值对）：总开关 / 门控 / 宿主丰富回复 / 版本。"""
+        """卡片左栏的全局事实（键值对）：版本 / 总开关 / 门控 / 宿主丰富回复 / 兜底提示词。"""
         rich_reply = self._cfg.get("experimental.enable_rich_reply")
-        if rich_reply is None:
-            rich_reply_text = "未读取到"
+        if rich_reply is True:
+            rich_reply_text = "开（需关闭）"
+        elif rich_reply is False:
+            rich_reply_text = "关"
         else:
-            rich_reply_text = "开" if rich_reply else "关"
+            # 新版宿主已移除该字段：读不到 = 丰富回复能力未开启，接管照常生效。
+            rich_reply_text = "未读取到（视为未开启）"
         gate_on = self._rich_reply_gate()
+        cleanup_on = bool(getattr(self.config.plugin, "strip_emoji_text", True))
+        at_cfg = getattr(self.config, "at_cooldown", None)
+        at_on = bool(getattr(at_cfg, "enabled", True))
+        try:
+            at_seconds = float(getattr(at_cfg, "seconds", 15.0) or 0.0)
+        except (TypeError, ValueError):
+            at_seconds = 0.0
         return [
             ("插件版本", self._plugin_version()),
             ("总开关", "开" if self._plugin_enabled() else "关"),
-            ("丰富回复门控", "开" if gate_on else "关（宿主开着丰富回复也接管）"),
+            ("丰富回复门控", "开" if gate_on else "关（不设门槛）"),
             ("宿主丰富回复", rich_reply_text),
+            ("出站表情清洗", "开" if cleanup_on else "关"),
+            ("@ 冷却", f"{at_seconds:g} 秒" if at_on and at_seconds > 0 else "关"),
             ("异常兜底提示词", self._fallback_prompts_summary()),
         ]
+
+    def _grouped_module_rows(self) -> List[Dict[str, Any]]:
+        """模块行按右侧分节归组：``{num, title, rows}``（空节不出现）。"""
+        buckets: Dict[str, List[Dict[str, str]]] = {}
+        for row in self._collect_module_rows():
+            buckets.setdefault(str(row.get("key") or ""), []).append(row)
+        groups: List[Dict[str, Any]] = []
+        for num, title, keys in _MODULE_GROUPS:
+            members: List[Dict[str, str]] = []
+            for key in keys:
+                members.extend(buckets.pop(key, []))
+            if members:
+                groups.append({"num": num, "title": title, "rows": members})
+        # 防御：未来新增模块忘了登记分组时也要显示出来，而不是静默丢失。
+        leftovers = [row for members in buckets.values() for row in members]
+        if leftovers:
+            groups.append({"num": "—", "title": "其它", "rows": leftovers})
+        return groups
 
     def _fallback_prompts_summary(self) -> str:
         """异常兜底提示词配置的一句摘要。"""
@@ -413,72 +467,128 @@ class StatusCommandMixin:
             _STATE_SILENT: "⚠",
             _STATE_ERROR: "✖",
         }
-        for row in self._collect_module_rows():
-            icon = state_icons.get(row["state"], "·")
-            lines.append(f"{icon} {row['label']}：{row['state']}（{row['detail']}）")
+        for group in self._grouped_module_rows():
+            lines.append(f"〔{group['num']} {group['title']}〕")
+            for row in group["rows"]:
+                icon = state_icons.get(row["state"], "·")
+                lines.append(f"{icon} {row['label']}：{row['state']}（{row['detail']}）")
         lines.append("──────────")
         lines.append(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("提示：/bpp fallback 引用一条消息，可实测异常兜底提示词。")
         return lines
 
     def _render_status_html(self) -> str:
-        """把状态渲染成一图流用的 HTML 卡片（全部内联 CSS，不引用任何外部资源）。
+        """把状态渲染成一图流用的 HTML 面板（全部内联 CSS，不引用任何外部资源）。
+
+        版式取自「属于麦麦的生活」的状态总览图：**纸底 / 墨字 / 单红强调**，
+        左侧事实轨 + 竖分隔线 + 右侧编号分节，页眉页脚各一条 2px 墨线，
+        行与行之间用 1px 细线分隔——不用圆角卡片、渐变与彩色徽标。
 
         宿主 ``render.html2png`` 默认 ``allow_network=False``，外部图片/字体/CSS 都不会加载，
-        因此样式必须完全内联；所有动态文本一律过 ``html.escape``（模块状态里会出现
-        宿主配置路径、用户昵称等不可信内容）。
+        因此样式必须完全内联（字体栈按「打包 Noto Sans SC → 系统中文字体」的顺序回退）；
+        所有动态文本一律过 ``html.escape``（模块状态里会出现宿主配置路径、用户昵称等不可信内容）。
         """
-        state_colors = {
-            _STATE_AVAILABLE: ("#1a7f37", "#e6f4ea"),
-            _STATE_DISABLED: ("#57606a", "#eaeef2"),
-            _STATE_SILENT: ("#9a6700", "#fff8c5"),
-            _STATE_ERROR: ("#cf222e", "#ffebe9"),
-        }
+        version = html.escape(self._plugin_version())
+        now_text = html.escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         parts: List[str] = [
             "<!DOCTYPE html><html><head><meta charset='utf-8'><style>",
-            "body{margin:0;background:transparent;}",
-            # 卡片宽度取 100%：铺满截图宽度（视口 780px，若出现经典滚动条则自动收窄），
-            # 不留右侧空带——固定 px 宽度小于视口时，多出的 body 透明区域会渲染成白色竖条。
-            ".card{width:100%;box-sizing:border-box;padding:28px 32px;"
-            "font-family:'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif;"
-            "background:linear-gradient(160deg,#f6f8fc 0%,#eef1f8 100%);color:#1f2328;}",
-            ".title{font-size:26px;font-weight:700;}",
-            ".subtitle{font-size:14px;color:#57606a;margin-top:6px;}",
-            ".facts{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0 6px;}",
-            ".fact{background:#ffffff;border:1px solid #d8dee4;border-radius:10px;"
-            "padding:8px 14px;font-size:14px;}",
-            ".fact b{color:#0969da;font-weight:600;}",
-            ".row{display:flex;align-items:flex-start;gap:12px;background:#ffffff;"
-            "border:1px solid #d8dee4;border-radius:12px;padding:12px 16px;margin-top:10px;}",
-            ".name{flex:0 0 150px;font-size:16px;font-weight:600;padding-top:2px;}",
-            ".badge{flex:0 0 auto;font-size:13px;font-weight:600;border-radius:999px;"
-            "padding:3px 12px;margin-top:1px;}",
-            ".detail{flex:1 1 auto;font-size:13.5px;color:#424a53;line-height:1.55;}",
-            ".footer{margin-top:18px;font-size:12.5px;color:#6e7781;}",
-            "</style></head><body><div class='card'>",
+            "*{box-sizing:border-box;}",
+            "body{margin:0;background:#F2F1ED;}",
+            # 页面宽度取 100%：铺满截图宽度（视口 1080px），不留右侧空带。
+            ".page{width:100%;padding:46px 64px 0;background:#F2F1ED;color:#111111;"
+            "font-family:'Noto Sans SC','Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif;}",
+            ".header{display:flex;align-items:center;justify-content:space-between;}",
+            ".brand{display:flex;align-items:center;gap:14px;}",
+            ".mark{width:14px;height:14px;background:#E8402A;}",
+            ".kicker{font-size:19px;font-weight:700;letter-spacing:6px;}",
+            ".brand-sub{font-size:14px;color:#6B6B6B;letter-spacing:1px;}",
+            ".title{font-size:18px;font-weight:700;letter-spacing:0.5px;}",
+            ".rule{margin-top:20px;height:2px;background:#111111;}",
+            ".body{display:flex;align-items:stretch;padding-top:26px;}",
+            ".rail{flex:0 0 300px;width:300px;padding-right:40px;}",
+            ".divider{flex:0 0 1px;width:1px;background:#CDCBC4;}",
+            ".main{flex:1 1 auto;min-width:0;padding-left:36px;}",
+            ".rail-block+.rail-block{margin-top:30px;padding-top:26px;border-top:1px solid #CDCBC4;}",
+            ".rail-label{font-size:19px;font-weight:700;color:#E8402A;letter-spacing:1px;}",
+            ".kv{display:flex;align-items:baseline;justify-content:space-between;gap:12px;"
+            "padding:10px 0;border-bottom:1px solid #DFDCD4;font-size:13px;}",
+            ".kv:last-child{border-bottom:none;}",
+            ".kv .k{flex:0 0 auto;color:#6B6B6B;}",
+            ".kv .v{color:#111111;font-weight:600;text-align:right;word-break:break-all;}",
+            ".cmd{display:flex;align-items:baseline;gap:10px;padding:9px 0;"
+            "border-bottom:1px solid #DFDCD4;font-size:12px;}",
+            ".cmd:last-child{border-bottom:none;}",
+            ".cmd .num{flex:0 0 18px;font-weight:700;color:#111111;}",
+            ".cmd .cmd-title{flex:0 0 30px;font-weight:700;color:#111111;}",
+            ".cmd .cmd-text{color:#6B6B6B;word-break:break-all;}",
+            ".section{padding-bottom:22px;margin-bottom:22px;border-bottom:1px solid #CDCBC4;}",
+            ".section:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0;}",
+            ".sec-head{display:flex;align-items:baseline;gap:12px;}",
+            ".sec-num{font-size:19px;font-weight:700;color:#E8402A;letter-spacing:1px;}",
+            ".sec-title{font-size:25px;font-weight:700;letter-spacing:1px;}",
+            ".sec-meta{margin-left:auto;font-size:13px;color:#6B6B6B;}",
+            ".row{display:flex;align-items:flex-start;gap:10px;padding:11px 0 10px;"
+            "border-bottom:1px solid #DFDCD4;}",
+            ".row:last-child{border-bottom:none;}",
+            ".row-name{flex:0 0 132px;font-size:15px;font-weight:600;padding-top:1px;}",
+            ".row-state{flex:0 0 64px;display:flex;align-items:center;gap:7px;"
+            "font-size:13px;font-weight:600;padding-top:2px;}",
+            ".dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;}",
+            ".row-detail{flex:1 1 auto;font-size:13px;line-height:1.6;color:#3F3F3F;}",
+            ".footer{margin-top:26px;border-top:2px solid #111111;display:flex;"
+            "justify-content:space-between;gap:24px;padding:14px 0 26px;font-size:14px;color:#6B6B6B;}",
+            "</style></head><body><div class='page'>",
         ]
         parts.append(
-            f"<div class='title'>更好的消息后处理 · 模块状态</div>"
-            f"<div class='subtitle'>v{html.escape(self._plugin_version())} ｜ /bpp</div>"
+            "<div class='header'>"
+            "<div class='brand'><div class='mark'></div>"
+            "<div class='kicker'>BPP · STATUS</div>"
+            "<div class='brand-sub'>更好的消息后处理</div></div>"
+            "<div class='title'>模块状态</div>"
+            "</div><div class='rule'></div>"
         )
-        parts.append("<div class='facts'>")
+        parts.append("<div class='body'><div class='rail'>")
+        parts.append("<div class='rail-block'><div class='rail-label'>概览</div>")
         for name, value in self._collect_header_facts():
             parts.append(
-                f"<div class='fact'>{html.escape(name)}：<b>{html.escape(str(value))}</b></div>"
+                f"<div class='kv'><span class='k'>{html.escape(name)}</span>"
+                f"<span class='v'>{html.escape(str(value))}</span></div>"
             )
         parts.append("</div>")
-        for row in self._collect_module_rows():
-            color, background = state_colors.get(row["state"], ("#57606a", "#eaeef2"))
-            parts.append(
-                "<div class='row'>"
-                f"<div class='name'>{html.escape(row['label'])}</div>"
-                f"<div class='badge' style='color:{color};background:{background};'>{html.escape(row['state'])}</div>"
-                f"<div class='detail'>{html.escape(row['detail'])}</div>"
-                "</div>"
-            )
         parts.append(
-            f"<div class='footer'>生成时间 {html.escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}"
-            " ｜ 提示：/bpp fallback 引用一条消息，可实测异常兜底提示词</div>"
+            "<div class='rail-block'><div class='rail-label'>命令</div>"
+            "<div class='cmd'><span class='num'>01</span><span class='cmd-title'>状态</span>"
+            "<span class='cmd-text'>/bpp</span></div>"
+            "<div class='cmd'><span class='num'>02</span><span class='cmd-title'>兜底</span>"
+            "<span class='cmd-text'>/bpp fallback</span></div>"
+            "</div>"
+        )
+        parts.append("</div><div class='divider'></div><div class='main'>")
+        for group in self._grouped_module_rows():
+            parts.append(
+                "<div class='section'><div class='sec-head'>"
+                f"<span class='sec-num'>{html.escape(str(group['num']))}</span>"
+                f"<span class='sec-title'>{html.escape(str(group['title']))}</span>"
+                f"<span class='sec-meta'>{len(group['rows'])} 项</span></div>"
+            )
+            for row in group["rows"]:
+                dot_style, state_color = _STATE_DOTS.get(row["state"], _STATE_DOTS[_STATE_DISABLED])
+                parts.append(
+                    "<div class='row'>"
+                    f"<div class='row-name'>{html.escape(row['label'])}</div>"
+                    f"<div class='row-state' style='color:{state_color};'>"
+                    f"<span class='dot' style='{dot_style}'></span>"
+                    f"{html.escape(row['state'])}</div>"
+                    f"<div class='row-detail'>{html.escape(row['detail'])}</div>"
+                    "</div>"
+                )
+            parts.append("</div>")
+        parts.append("</div></div>")
+        parts.append(
+            "<div class='footer'>"
+            f"<div>更好的消息后处理 v{version}</div>"
+            f"<div>生成时间 {now_text} ｜ /bpp fallback 可实测兜底</div>"
+            "</div>"
         )
         parts.append("</div></body></html>")
         return "".join(parts)
@@ -552,10 +662,10 @@ class StatusCommandMixin:
         try:
             result = await self.ctx.render.html2png(
                 html_text,
-                # 按卡片元素截取（高度贴合内容），而不是整页截图：整页（full_page）
-                # 截图的高度不会低于视口高度——内容不足一屏时（状态行少时约 700px，
-                # 视口 800px）图片底部会多出一段空白。视口仍给 780 宽定宽 + 兜底高度。
-                selector=".card",
+                # 按页面元素截取（高度贴合内容），而不是整页截图：整页（full_page）
+                # 截图的高度不会低于视口高度——内容不足一屏时图片底部会多出一段空白。
+                # 视口给 1080 定宽 + 兜底高度（实际高度由 .page 决定）。
+                selector=".page",
                 viewport={"width": _RENDER_VIEWPORT_WIDTH, "height": 800},
                 device_scale_factor=_RENDER_DEVICE_SCALE_FACTOR,
             )

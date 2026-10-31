@@ -6,8 +6,12 @@
 
 | 模块 | 需要的宿主前置条件 |
 |---|---|
-| `quote_reply`（引用回复接管，含私聊） | `chat.reply_style.enable_reply_quote = false` 且 `experimental.enable_rich_reply = false` |
-| `post_process`（后处理接管，含多段发送） | 宿主**不在做错别字处理**（二选一）：`response_post_process.enable_response_post_process = false`（完整接管，1.0.0 起）；**或** `chinese_typo.enable = false`（错别字接管：宿主后处理开启但错别字关闭，由本插件接管错别字与分段，1.1.1 起）。且 `experimental.enable_rich_reply = false` |
+| `quote_reply`（引用回复接管，含私聊） | `chat.reply_style.enable_reply_quote = false`，且丰富回复**未开启**（开关读取不到 = 未开启） |
+| `post_process`（后处理接管，含多段发送） | 宿主**不在做错别字处理**（二选一）：`response_post_process.enable_response_post_process = false`（完整接管，1.0.0 起）；**或** `chinese_typo.enable = false`（错别字接管：宿主后处理开启但错别字关闭，由本插件接管错别字与分段，1.1.1 起）。且丰富回复**未开启** |
+
+**丰富回复的判定口径**（1.3.4 起）：宿主新版已移除 `experimental.enable_rich_reply`
+字段，读取结果为 `None`——此时按「丰富回复能力未开启」处理，两个接管**不再静默**。
+只有明确读到 `True` 才算开启、才要求关闭（见 :func:`rich_reply_enabled`）。
 
 **不受前置条件约束**的模块（宿主开关任意状态都照常工作）：
 `emoji_after_reply`（回复后表情包）、`emoji_follow`（表情包跟风）、
@@ -16,7 +20,7 @@
 `self_reply_guard` / `duplicate_reply_guard`（1.2.0 合并的自回复/重复回复拦截，默认关闭）、
 `cross_chat_recall`（1.2.0 合并的跨聊私聊回忆，默认关闭）。
 
-为什么两个接管都需要关掉「丰富回复」：开启后回复工具会给消息挂图片/表情/@ 等附件，
+为什么丰富回复开启时两个接管都不工作：开启后回复工具会给消息挂图片/表情/@ 等附件，
 分段与引用语义都由富回复链路接管，插件的"首段文本"判定与引用注入会与宿主打架。
 """
 
@@ -25,7 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Tuple
 
-# 丰富回复（宿主实验性开关）配置路径：两个接管模块都要它关闭。
+# 丰富回复（宿主实验性开关）配置路径：两个接管模块都要它不开启。
+# 新版宿主已移除该字段：读取不到 = 能力未开启（见 rich_reply_enabled）。
 RICH_REPLY_PATH = "experimental.enable_rich_reply"
 
 # 后处理接管的两个宿主开关（1.1.1 起「二选一」）：
@@ -108,6 +113,16 @@ def _show(value: Any) -> str:
     return "未读取到" if value is None else repr(value)
 
 
+def rich_reply_enabled(host_values: Mapping[str, Any]) -> bool:
+    """宿主「丰富回复」是否开启：**只有明确读到 True 才算开启**。
+
+    宿主新版已移除 ``experimental.enable_rich_reply`` 字段，读取结果是 ``None``——
+    这时按「丰富回复能力未开启」处理，两个接管照常工作；只有旧的宿主才可能返回
+    ``True``（此时保持原有门控语义：要求用户去关掉）。
+    """
+    return host_values.get(RICH_REPLY_PATH) is True
+
+
 def _evaluate_post_process(
     host_values: Mapping[str, Any],
     *,
@@ -122,7 +137,8 @@ def _evaluate_post_process(
       分段与错别字都由本插件按宿主参数复刻执行，1.1.1 起）。
 
     另需满足「丰富回复」门控（``rich_reply_gate=False`` 时不把关当硬门槛）。
-    两个开关都读取失败时按**未满足**处理，让模块保持静默而不是冒险介入。
+    丰富回复**读取不到视为未开启**（新版宿主已移除该字段）；后处理两个开关都读取失败时
+    仍按**未满足**处理，让模块保持静默而不是冒险介入。
     """
     label = MODULE_LABELS["post_process"]
     unmet: List[str] = []
@@ -131,10 +147,12 @@ def _evaluate_post_process(
     rich = host_values.get(RICH_REPLY_PATH)
     if not rich_reply_gate:
         met.append("丰富回复未做门控")
+    elif rich is True:
+        unmet.append(f"需在宿主配置关闭「丰富回复」（{RICH_REPLY_PATH}，当前 True）")
     elif rich is False:
         met.append("丰富回复已关闭")
     else:
-        unmet.append(f"需在宿主配置关闭「丰富回复」（{RICH_REPLY_PATH}，当前 {_show(rich)}）")
+        met.append("丰富回复开关未读取到（视为未开启）")
 
     master = host_values.get(POST_PROCESS_MASTER_PATH)
     typo = host_values.get(POST_PROCESS_TYPO_PATH)
@@ -169,7 +187,9 @@ def evaluate_module(
     """判定单个模块是否可用。
 
     ``host_values`` 为宿主全局配置的快照（按**完整配置路径**取值）。
-    读取失败/缺失（值为 ``None``）时按**未满足**处理，让模块保持静默而不是冒险介入。
+    普通宿主开关读取失败/缺失（值为 ``None``）时按**未满足**处理，让模块保持静默而不是
+    冒险介入；唯一例外是「丰富回复」——它在新版宿主里已被移除，读取不到 = **未开启**
+    （否则两个接管会在新版宿主上永远静默）。
 
     ``rich_reply_gate=False``（对应插件配置 ``[plugin] rich_reply_gate`` 关闭）时，
     不再把「丰富回复」当硬门槛：宿主开着丰富回复也允许接管，状态行里会注明
@@ -186,10 +206,19 @@ def evaluate_module(
     unmet: List[str] = []
     met: List[str] = []
     for path, name, expected in requirements:
-        if path == RICH_REPLY_PATH and not rich_reply_gate:
-            met.append(f"{name}未做门控")
-            continue
         actual = host_values.get(path, None)
+        if path == RICH_REPLY_PATH:
+            # 丰富回复：门控关闭 / 明确关着 / 读不到（新版宿主已移除该字段）都放行，
+            # 只有明确读到 True 才要求去关掉。
+            if not rich_reply_gate:
+                met.append(f"{name}未做门控")
+            elif actual is False:
+                met.append(f"{name}已关闭")
+            elif isinstance(actual, bool):
+                unmet.append(f"需在宿主配置关闭「{name}」（{path}，当前 True）")
+            else:
+                met.append(f"{name}开关未读取到（视为未开启）")
+            continue
         if actual is expected:  # 严格比较：必须是 False 本身，错误 dict/None 都不算满足
             met.append(f"{name}已关闭")
         else:
