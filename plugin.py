@@ -1,4 +1,4 @@
-"""cateye_better_post_processing —— 回复后处理接管 / 回复方式抽取 / 表情包互动 / 出站文本规则增强。
+"""cateye_better_post-processing —— 回复后处理接管 / 回复方式抽取 / 表情包互动 / 出站文本规则增强。
 
 **代码结构**（0.10.1 起按"接管对象"拆分）：
 
