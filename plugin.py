@@ -268,7 +268,7 @@ from .modules.requirements import (
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.4.1"
+SUPPORTED_CONFIG_VERSION = "1.4.2"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -385,6 +385,12 @@ _ROUND_SENT_ID_MAX_ENTRIES = 20
 # 文本规则归属判定里"首条分段等待窗"的兜底秒数（宿主配置为 0 时使用）。
 _REPLY_FLOW_ARM_FALLBACK_SECONDS = 20.0
 
+# @ 独占（1.4.2）：EARLY 登记的"本插件保留的 at 目标"标记的 TTL 与容量上限。
+# 标记供 LATE 兜底区分自有 @ 与其它插件后补的 @；正常同一钩子链内即被消费，
+# TTL 只兜底"中途被其它插件 abort"等走不到 LATE 的漏网条目。
+_OWN_AT_MARK_TTL = 120.0
+_OWN_AT_MARK_MAX = 512
+
 # 「假 @」：LLM 手写在正文里的 "@某人"——`@` + 昵称字符 + **至少一个空白**。
 # 昵称字符集与 post_processing._AT_MENTION_PATTERN 保持一致（汉字/字母数字/下划线/连字符/间隔号）；
 # 空白认水平空白（半角、全角、Tab、NBSP）**与换行**（0.14.3 起）——LLM 爱把 `@某人` 单独放一行，
@@ -484,6 +490,26 @@ class PluginSectionConfig(PluginConfigBase):
             **_ui_i18n(
                 "Trailing space after @",
                 "Whether to inject an extra space component after the mention.",
+            ),
+        },
+    )
+    strip_external_at: bool = Field(
+        default=True,
+        description=(
+            "独占 @：对属于 bot 本轮回复的发送（含补发分段与错字更正段），在 before_send 入口"
+            "无条件移除出站消息上已挂的 at 组件（宿主回复工具 attach_at / 其它插件注入），"
+            "再由本插件「引用回复接管」按权重决定是否注入唯一的一个 @；LATE 兜底还会清掉"
+            "排在本插件之后的其它插件新注入的 at。只影响本轮回复，不碰其它插件的命令响应与"
+            "纯 at 消息。用于消除「宿主真实 at + 正文手写假 @」的重叠 @，以及宿主 at 的空格"
+            "在首段截回时丢失的问题。关闭后回到旧行为（仅 @ 冷却期清洗外部 at）"
+        ),
+        json_schema_extra={
+            "label": "独占 @（剥离外部 at）",
+            "x-toml-comment": "本轮回复先剥掉宿主/其它插件的 at，由本插件按权重决定唯一的一个 @。",
+            **_ui_i18n(
+                "Monopolize @ (strip external at)",
+                "For the bot's own reply flow, strip at components attached by the host/other plugins "
+                "before this plugin decides the single mention; a LATE guard removes later foreign mentions.",
             ),
         },
     )
@@ -2826,6 +2852,9 @@ class BetterPostProcessingPlugin(
         # 每聊天流 @ 冷却：session_id -> 最近一次 @ 的单调时钟；已做过上下文初始化的会话。
         self._at_cooldown_last: Dict[str, float] = {}
         self._at_cooldown_seeded: set[str] = set()
+        # @ 独占（1.4.2）：(session_id, message_id) -> (登记时刻, 本插件保留的 at 目标集合)。
+        # EARLY 处理器末尾登记、LATE 兜底消费；TTL 限长防漏（中途被 abort 走不到 LATE 时）。
+        self._own_at_marks: "OrderedDict[Tuple[str, str], Tuple[float, frozenset]]" = OrderedDict()
         # 群聊连续表情包计数：session_id -> {"count", "last", "last_desc"}。
         self._emoji_streaks: Dict[str, Dict[str, Any]] = {}
         # "对话已推进"/"回复目标超时"首次触发时用 info 记录，后续降为 debug。
@@ -3102,6 +3131,7 @@ class BetterPostProcessingPlugin(
         self._planner_segment_records.clear()
         self._pending_quote_targets.clear()
         self._pending_at_targets.clear()
+        self._own_at_marks.clear()
         if self._meaning_store is not None:
             self._meaning_store.close()
             self._meaning_store = None
@@ -3286,31 +3316,11 @@ class BetterPostProcessingPlugin(
         reply_message_id = str(modified.get("reply_message_id") or "").strip()
         changed = False
 
-        # @ 冷却：每个聊天流首次出站时扫一遍最近消息里 bot 的 @ 来初始化；冷却中先清掉
-        # 宿主/其它插件已经挂在这个出站消息上的 at 组件。插件自己抽到的 @ 由
-        # ``_apply_reply_style`` 直接不抽，末尾还有一次兜底移除。
-        at_cooldown_active = False
-        if session_id:
-            try:
-                await self._seed_at_cooldown_from_context(session_id)
-            except Exception as exc:
-                self.ctx.logger.debug("@ 冷却上下文初始化失败（忽略）: %s", exc)
-            at_cooldown_active = self._at_cooldown_active(session_id)
-            if at_cooldown_active:
-                removed_at = self._strip_at_components(message)
-                if removed_at:
-                    changed = True
-                    self.ctx.logger.info(
-                        "出站清洗：@ 冷却中，移除 %d 个 at 组件（会话 %s，剩余 %.1f 秒）",
-                        removed_at,
-                        session_id[:12],
-                        self._at_cooldown_remaining(session_id),
-                    )
-
         # 本条发送是否为本插件正在补发的分段（多段发送）：文本规则据此把它认作
         # 本轮回复的一部分（这类发送 reply_message_id 为空，轮记录判定不成立）。
         outbound_text = self._extract_outbound_text(message)
         own_follow_up = self._is_own_follow_up_text(session_id, outbound_text)
+        in_reply_flow = own_follow_up or self._message_in_reply_flow(session_id, reply_message_id)
         quote_target = ""
         at_target_info: Dict[str, str] = {}
         if own_follow_up:
@@ -3324,6 +3334,44 @@ class BetterPostProcessingPlugin(
                     at_target_info = dict(raw_at_info)
                 elif raw_at_info:
                     at_target_info = {"target_id": str(raw_at_info).strip()}
+
+        # @ 独占（1.4.2）：本轮回复内，入口无条件剥离外部 at。宿主 attach_at 与其它插件的
+        # 注入都发生在本钩子之前，而本插件自己的 @ 只在本处理器后续步骤注入，因此入口
+        # 看到的 at 必为外部。剥掉后假 @ 过滤不再被"开头是真 at"短路，正文里的字面 @
+        # 能正常被清理/升级，@ 与正文之间的空格也由本插件统一负责。
+        strip_external_at = (
+            in_reply_flow
+            and self._plugin_enabled()
+            and bool(getattr(self.config.plugin, "strip_external_at", True))
+        )
+
+        # @ 冷却：每个聊天流首次出站时扫一遍最近消息里 bot 的 @ 来初始化；冷却中先清掉
+        # 宿主/其它插件已经挂在这个出站消息上的 at 组件（@ 独占开启时同样走这次剥离）。
+        # 插件自己抽到的 @ 由 ``_apply_reply_style`` 直接不抽，末尾还有一次兜底移除。
+        at_cooldown_active = False
+        if session_id:
+            try:
+                await self._seed_at_cooldown_from_context(session_id)
+            except Exception as exc:
+                self.ctx.logger.debug("@ 冷却上下文初始化失败（忽略）: %s", exc)
+            at_cooldown_active = self._at_cooldown_active(session_id)
+            if at_cooldown_active or strip_external_at:
+                removed_at = self._strip_at_components(message)
+                if removed_at:
+                    changed = True
+                    if at_cooldown_active:
+                        self.ctx.logger.info(
+                            "出站清洗：@ 冷却中，移除 %d 个 at 组件（会话 %s，剩余 %.1f 秒）",
+                            removed_at,
+                            session_id[:12],
+                            self._at_cooldown_remaining(session_id),
+                        )
+                    else:
+                        self.ctx.logger.info(
+                            "出站清洗：@ 独占，移除 %d 个外部 at 组件（会话 %s）",
+                            removed_at,
+                            session_id[:12],
+                        )
 
         try:
             # 假 @ 过滤必须排在「文本规则」与「回复方式抽取」**之前**：先清掉 LLM 手写的文本 @，
@@ -3385,6 +3433,11 @@ class BetterPostProcessingPlugin(
                     session_id[:12],
                 )
 
+        # @ 独占 / @ 冷却：登记本条消息最终保留的 at 目标（此刻要么全是本插件注入的，
+        # 要么一个都没有），供 LATE 兜底区分其它插件在本处理器之后新补的 at。
+        if strip_external_at or at_cooldown_active:
+            self._register_own_at_mark(session_id, message)
+
         # 首条文本分段（宿主原生发送链）实际带没带引用/@：在发送前记录一次，
         # 后续若因错字撤回重发头部，用它恢复引用/@。
         try:
@@ -3399,6 +3452,74 @@ class BetterPostProcessingPlugin(
 
         if not changed:
             return {"action": "continue"}
+        return {"action": "continue", "modified_kwargs": modified}
+
+    def _register_own_at_mark(self, session_id: str, message: Dict[str, Any]) -> None:
+        """登记本条出站消息最终保留的 at 目标（供 LATE 兜底区分来源）。
+
+        调用时机在 EARLY 处理器完成所有注入/剥离之后：此刻消息里的 at 要么全是本插件
+        注入的，要么一个都没有（冷却期）。LATE 兜底按这份白名单放行，其余 at 一律视为
+        排在本插件之后的其它插件新注入的，移除。标记读后即删，TTL/容量双限防漏。
+        """
+        message_id = str(message.get("message_id") or "").strip()
+        if not session_id or not message_id:
+            return
+        targets: set = set()
+        components = message.get("raw_message")
+        if isinstance(components, list):
+            for component in components:
+                if not (isinstance(component, dict) and str(component.get("type") or "") == "at"):
+                    continue
+                data = component.get("data")
+                if isinstance(data, dict):
+                    target = str(data.get("target_user_id") or "").strip()
+                    if target:
+                        targets.add(target)
+        now = time.monotonic()
+        key = (session_id, message_id)
+        self._own_at_marks.pop(key, None)
+        self._own_at_marks[key] = (now, frozenset(targets))
+        while len(self._own_at_marks) > _OWN_AT_MARK_MAX:
+            self._own_at_marks.popitem(last=False)
+        expired = [k for k, (ts, _) in self._own_at_marks.items() if now - ts > _OWN_AT_MARK_TTL]
+        for k in expired:
+            self._own_at_marks.pop(k, None)
+
+    @HookHandler(
+        "send_service.before_send",
+        name="outbound_at_monopoly_guard",
+        description="@ 独占 LATE 兜底：清掉本插件 EARLY 处理之后其它插件新注入的 at（只放行 EARLY 登记的目标）",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_before_send_at_guard(self, **kwargs: Any) -> Dict[str, Any]:
+        """EARLY 处理器只能清它运行前就存在的 at；NORMAL/LATE 的其它插件仍可能在其后注入。
+
+        这里以 EARLY 登记的目标集合为白名单移除其余 at。只消费本插件登记过的标记：
+        没经过 EARLY 登记的消息（其它插件的命令响应、纯 at 消息等）一律不动。
+        @ 冷却期内白名单为空，等价于禁止任何来源的 at（与冷却口径一致）。
+        """
+        raw_message = kwargs.get("message")
+        if not isinstance(raw_message, dict):
+            return {"action": "continue"}
+        session_id = str(raw_message.get("session_id") or "").strip()
+        message_id = str(raw_message.get("message_id") or "").strip()
+        mark = self._own_at_marks.pop((session_id, message_id), None)
+        if mark is None:
+            return {"action": "continue"}
+        _, allowed = mark
+        message = dict(raw_message)
+        removed = self._strip_at_components(message, keep_targets=set(allowed))
+        if not removed:
+            return {"action": "continue"}
+        self.ctx.logger.info(
+            "出站清洗：@ 独占 LATE 兜底，移除 %d 个后注入的 at 组件（会话 %s）",
+            removed,
+            session_id[:12],
+        )
+        modified = dict(kwargs)
+        modified["message"] = message
         return {"action": "continue", "modified_kwargs": modified}
 
     # ------------------------------------------------------------------

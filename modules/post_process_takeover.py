@@ -1965,8 +1965,9 @@ class PostProcessTakeoverMixin:
 
         本条出站消息携带的文本可能是"全文"（``before_post_process`` 把所有分段拼成一条
         回传给宿主，让 ``reply`` 工具结果与 ``ToolResultMessage`` 记录完整内容）。插件按
-        全文查到缓存后，把**实际发送**的消息体截回第 1 段（只替换 text 组件，reply / at /
-        image / emoji 等非 text 组件原样保留），其余分段仍由 ``after_send`` 补发——所以
+        全文查到缓存后，把**实际发送**的消息体截回第 1 段（替换首个非空 text 组件，reply / at /
+        image / emoji 等非 text 组件原样保留；紧跟 at 的空格 text 段也保留，1.4.2），
+        其余分段仍由 ``after_send`` 补发——所以
         不会把全文一次性发出去，也不会让 planner 误以为回复没发完。
 
         匹配时优先用 ``raw_message`` 的原文，再退回 ``processed_plain_text``：宿主可能给
@@ -2019,21 +2020,40 @@ class PostProcessTakeoverMixin:
         self._mark_planner_record_rewritten(
             session_id, matched_text, timestamp=message.get("timestamp")
         )
-        # 实际发送只保留第 1 段：替换（或插入）唯一的 text 组件，非 text 组件全部保留。
+        # 实际发送只保留第 1 段：替换首个**非空** text 组件，非 text 组件全部保留。
+        # 1.4.2：紧跟 at 的纯空白 text 段（宿主 attach_at 的 [at, " ", 正文] 里那个空格）
+        # 原样保留——旧实现把它当"第一个 text"替换成首段正文，at 与正文粘连丢空格。
+        # 其余纯空白段照旧丢弃，避免引入前导/悬挂空格。
         mutated_message = dict(message)
         components = message.get("raw_message")
         new_components: List[Any] = []
         text_written = False
+        saw_text = False
         if isinstance(components, list):
             for component in components:
                 if isinstance(component, dict) and str(component.get("type") or "") == "text":
+                    saw_text = True
+                    data = str(component.get("data") or "")
+                    if not data.strip():
+                        if (
+                            not text_written
+                            and new_components
+                            and isinstance(new_components[-1], dict)
+                            and str(new_components[-1].get("type") or "") == "at"
+                        ):
+                            new_components.append(component)
+                        continue
                     if not text_written:
                         new_components.append({"type": "text", "data": first_text})
                         text_written = True
                     continue
                 new_components.append(component)
         if not text_written:
-            new_components.insert(0, {"type": "text", "data": first_text})
+            if saw_text:
+                # 只有空白 text（如 [at, " "]）：正文接在空白后面，保住 at 后的空格。
+                new_components.append({"type": "text", "data": first_text})
+            else:
+                new_components.insert(0, {"type": "text", "data": first_text})
         mutated_message["raw_message"] = new_components
         mutated_message["processed_plain_text"] = first_text
         # 宿主 Hook 的 modified_kwargs 是**完整替换**：必须带上 stream_id / typing /

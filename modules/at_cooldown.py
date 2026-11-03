@@ -115,11 +115,17 @@ class AtCooldownMixin:
         )
 
     @staticmethod
-    def _strip_at_components(message: Dict[str, Any]) -> int:
-        """原地移除消息里的全部 ``at`` 组件；返回移除数量。
+    def _strip_at_components(
+        message: Dict[str, Any], keep_targets: "set[str] | None" = None
+    ) -> int:
+        """原地移除消息里的 ``at`` 组件；返回移除数量。
 
         ``at`` 后面紧跟的文本组件若以空白开头，一并去掉那段空白（宿主 attach_at 会插
         ``[at, " ", 正文]``，只删 at 会留下前导空格）；纯空白文本组件直接丢弃。
+
+        ``keep_targets``（1.4.2）：非 None 时只移除 ``target_user_id`` **不在**集合里的
+        at——供「@ 独占」的 LATE 兜底保留本插件自己注入的 @、清掉其它插件后补的 @；
+        空集合等价于全部移除（@ 冷却期的口径）。
         """
         components = message.get("raw_message")
         if not isinstance(components, list):
@@ -133,6 +139,15 @@ class AtCooldownMixin:
                 trim_next = False
                 continue
             if str(component.get("type") or "") == "at":
+                if keep_targets is not None:
+                    data = component.get("data")
+                    target = ""
+                    if isinstance(data, Mapping):
+                        target = str(data.get("target_user_id") or "").strip()
+                    if target and target in keep_targets:
+                        cleaned.append(component)
+                        trim_next = False
+                        continue
                 removed += 1
                 trim_next = True
                 continue
