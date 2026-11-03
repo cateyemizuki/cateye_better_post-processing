@@ -21,6 +21,10 @@
 **丰富回复未开启**（``experimental.enable_rich_reply``）：
 
 * 引用回复接管：宿主 ``chat.reply_style.enable_reply_quote = false`` + 丰富回复未开启；
+
+**「启用引用回复」的判定口径（1.4.1 起）**：宿主新版已移除该字段（改用群聊/私聊「引用
+频率」），读取不到 = 按 ``false`` 处理（宿主不再把引用与否交给这个开关），引用回复接管
+照常生效；只有明确读到 ``True`` 才保持「宿主自己做引用回复、本插件静默」。
 * 后处理接管：宿主 ``response_post_process.enable_response_post_process = false`` + 丰富回复未开启。
 
 **丰富回复的判定口径（1.3.4 起）**：宿主新版已移除该字段，读取不到 = 丰富回复能力
@@ -61,7 +65,8 @@
    留空 = 跟随宿主，填了值 = 以插件为准（见 ``[response_splitter]`` 等节）。
    框架开关开启时插件完全不介入。
 2. 引用回复接管（``[quote_reply]`` 群聊 / ``[quote_reply_private]`` 私聊）：
-   框架 ``chat.reply_style.enable_reply_quote`` 关闭时，在
+   框架 ``chat.reply_style.enable_reply_quote`` 关闭时（宿主已移除该开关时读不到 = 按关闭
+   处理，1.4.1 起），在
    ``send_service.before_send`` 里为指向目标消息（``reply_message_id`` 非空）的回复
    按权重抽取发送方式：直接回复 / 引用回复 / @回复 / 引用＋@回复（私聊恒不 @，
    权重池只有直接回复与引用回复两项）。@ 回复的@目标为被回复消息的发送者
@@ -253,11 +258,17 @@ from .modules.at_cooldown import AtCooldownMixin
 # 阶段 3 合并（1.2.0，迁自两个旧插件；旧插件目录原样保留）
 from .modules.self_reply_guard import SelfReplyGuardMixin
 from .modules.cross_chat_recall import CrossChatRecallMixin
-from .modules.requirements import REQUIRED_HOST_PATHS, evaluate_module, iter_module_statuses
+from .modules.requirements import (
+    REPLY_QUOTE_PATH,
+    REQUIRED_HOST_PATHS,
+    evaluate_module,
+    iter_module_statuses,
+    normalize_reply_quote,
+)
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.4.0"
+SUPPORTED_CONFIG_VERSION = "1.4.1"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -3132,15 +3143,28 @@ class BetterPostProcessingPlugin(
         的前置条件判定用）。
         """
         values: Dict[str, Any] = {}
-        enable_reply_quote = await self._read_global_config("chat.reply_style.enable_reply_quote", True)
-        if not isinstance(enable_reply_quote, bool):
-            # 宿主执行失败时 SDK 原样返回错误 dict（truthy），显式回退避免误判开关状态。
-            self.ctx.logger.warning(
-                "宿主配置 enable_reply_quote 返回异常形态 %r，使用默认值 True", enable_reply_quote
-            )
-            enable_reply_quote = True
+        # 「启用引用回复」：**读不到 = 未开启（False）**。新版宿主（1.3.x 后期起）已移除
+        # ``chat.reply_style.enable_reply_quote``，改用群聊/私聊「引用频率」控制引用与否；
+        # 宿主不再提供这个开关时按"宿主不自己做引用回复"处理，否则引用回复接管会在新宿主上
+        # 永远静默（1.4.1 修复前：默认值写死 True，读不到就当成宿主开着）。
+        # 只有明确读到 bool 才采信；错误 dict 等其他形态一律按 False 处理（不冒险把接管关掉）。
+        reply_quote_raw = await self._read_global_config(REPLY_QUOTE_PATH, None)
+        # 完整路径存**缓存值**（bool 或 None），供 requirements 区分「宿主已关闭」与
+        # 「未读取到（新版宿主已移除）」两种放行原因；短键存**生效开关**（bool）供日志与
+        # 其它代码使用。
+        quote_cache, enable_reply_quote = normalize_reply_quote(reply_quote_raw)
+        values[REPLY_QUOTE_PATH] = quote_cache
         values["enable_reply_quote"] = enable_reply_quote
-        values["chat.reply_style.enable_reply_quote"] = enable_reply_quote
+        if reply_quote_raw is None:
+            self.ctx.logger.info(
+                "宿主配置未提供 enable_reply_quote（新版宿主已移除该字段，改用群聊/私聊"
+                "「引用频率」），按未开启处理：引用回复接管照常生效"
+            )
+        elif not isinstance(reply_quote_raw, bool):
+            # 宿主执行失败时 SDK 原样返回错误 dict（truthy）：显式回退，避免误判开关状态。
+            self.ctx.logger.warning(
+                "宿主配置 enable_reply_quote 返回异常形态 %r，按未开启（False）处理", reply_quote_raw
+            )
 
         for cache_key, path, default in _POST_PROCESS_CONFIG_KEYS:
             value = await self._read_global_config(path, default)

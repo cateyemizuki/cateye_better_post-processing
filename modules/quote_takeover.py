@@ -5,6 +5,10 @@
 （``experimental.enable_rich_reply`` 读不到 = 未开启，新版宿主已无该字段）；任一未满足时
 本模块**完全静默**——既不抽取回复方式，也不改写引用/@。
 
+**新版宿主兼容**（1.4.1）：宿主已移除 ``chat.reply_style.enable_reply_quote``、改用群聊/私聊
+「引用频率」，读取结果是 ``None``——此时按 ``false``（宿主不自己做引用回复）处理，本模块
+照常接管；只有明确读到 ``true`` 才静默。
+
 抽取口径：直接回复 / 引用回复 / @回复 / 引用＋@回复 四选一（私聊恒不 @），并叠加
 「对话已推进」「目标过旧」「同一消息只引用一次」三条调整规则。只作用于本插件登记的
 回复轮（由 ``maisaka.reply.before_post_process`` 标记）中指向轮目标的首条文本分段。
@@ -94,6 +98,9 @@ class QuoteTakeoverMixin:
         宿主前置条件（``chat.reply_style.enable_reply_quote`` 关闭、丰富回复未开启——
         ``experimental.enable_rich_reply`` 读不到即视为未开启）由 ``modules.requirements``
         判定；未满足时本模块**完全静默**：不抽取回复方式、不改写引用/@。
+
+        新宿主已移除引用开关（读取结果 ``None``）时按「关闭」放行（1.4.1），否则接管会在
+        新宿主上永远静默。
         """
         if not self._plugin_enabled():
             return False

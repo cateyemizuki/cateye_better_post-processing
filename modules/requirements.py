@@ -6,12 +6,18 @@
 
 | 模块 | 需要的宿主前置条件 |
 |---|---|
-| `quote_reply`（引用回复接管，含私聊） | `chat.reply_style.enable_reply_quote = false`，且丰富回复**未开启**（开关读取不到 = 未开启） |
+| `quote_reply`（引用回复接管，含私聊） | `chat.reply_style.enable_reply_quote = false`（新版宿主已移除该字段，读取不到 = 按关闭放行），且丰富回复**未开启**（开关读取不到 = 未开启） |
 | `post_process`（后处理接管，含多段发送） | 宿主**不在做错别字处理**（二选一）：`response_post_process.enable_response_post_process = false`（完整接管，1.0.0 起）；**或** `chinese_typo.enable = false`（错别字接管：宿主后处理开启但错别字关闭，由本插件接管错别字与分段，1.1.1 起）。且丰富回复**未开启** |
 
 **丰富回复的判定口径**（1.3.4 起）：宿主新版已移除 `experimental.enable_rich_reply`
 字段，读取结果为 `None`——此时按「丰富回复能力未开启」处理，两个接管**不再静默**。
 只有明确读到 `True` 才算开启、才要求关闭（见 :func:`rich_reply_enabled`）。
+
+**「启用引用回复」的判定口径**（1.4.1 起）：宿主新版（1.3.x 后期起）已移除
+`chat.reply_style.enable_reply_quote`，改用群聊/私聊「引用频率」控制引用与否，读取结果
+同样是 `None`——此时按「宿主不再把引用与否交给这个开关」处理，即**视为关闭**，引用回复
+接管照常生效；只有明确读到 `True` 才按「宿主自己做引用回复、本插件静默」处理。
+读不到却按 `True` 兜底会让接管在新宿主上永远静默（1.4.1 修复前正是如此）。
 
 **不受前置条件约束**的模块（宿主开关任意状态都照常工作）：
 `emoji_after_reply`（回复后表情包）、`emoji_follow`（表情包跟风）、
@@ -27,11 +33,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 # 丰富回复（宿主实验性开关）配置路径：两个接管模块都要它不开启。
 # 新版宿主已移除该字段：读取不到 = 能力未开启（见 rich_reply_enabled）。
 RICH_REPLY_PATH = "experimental.enable_rich_reply"
+
+# 「启用引用回复」（宿主旧版开关）配置路径：宿主明确关掉时由本插件接管回复方式。
+# 新版宿主已移除该字段、改由群聊/私聊「引用频率」控制：读取不到 = 按关闭放行
+# （见 evaluate_module 里的 REPLY_QUOTE 分支与模块文档的口径说明）。
+REPLY_QUOTE_PATH = "chat.reply_style.enable_reply_quote"
 
 # 后处理接管的两个宿主开关（1.1.1 起「二选一」）：
 # 总开关关闭 → 完整接管（错别字 + 分段，宿主复刻路径）；
@@ -43,7 +54,7 @@ POST_PROCESS_TYPO_PATH = "chinese_typo.enable"
 # `post_process` 的门控是「二选一」的 OR 条件，不走这张表（见 _evaluate_post_process）。
 MODULE_REQUIREMENTS: Dict[str, Tuple[Tuple[str, str, Any], ...]] = {
     "quote_reply": (
-        ("chat.reply_style.enable_reply_quote", "启用引用回复", False),
+        (REPLY_QUOTE_PATH, "启用引用回复", False),
         (RICH_REPLY_PATH, "丰富回复", False),
     ),
 }
@@ -111,6 +122,23 @@ class ModuleStatus:
 def _show(value: Any) -> str:
     """宿主配置值的展示形态（读取失败显示「未读取到」）。"""
     return "未读取到" if value is None else repr(value)
+
+
+def normalize_reply_quote(value: Any) -> Tuple[Optional[bool], bool]:
+    """把「启用引用回复」的读取结果归一成 (缓存值, 生效开关)。
+
+    新版宿主已移除 chat.reply_style.enable_reply_quote（改用群聊/私聊「引用频率」），
+    读取结果是 None。此时按「宿主不再把引用与否交给这个开关」处理：
+
+    * 明确读到 bool → 缓存值 = 该 bool，生效开关同值；
+    * 读不到（None）或错误 dict 等其他形态 → 缓存值 None（requirements 据此区分
+      「未读取到」的放行原因），生效开关 **False**（接管照常生效，不被静默）。
+
+    读不到却按 True 兜底会让引用回复接管在新宿主上永远静默（1.4.1 修复前正是如此）。
+    """
+    if isinstance(value, bool):
+        return value, value
+    return None, False
 
 
 def rich_reply_enabled(host_values: Mapping[str, Any]) -> bool:
@@ -188,8 +216,9 @@ def evaluate_module(
 
     ``host_values`` 为宿主全局配置的快照（按**完整配置路径**取值）。
     普通宿主开关读取失败/缺失（值为 ``None``）时按**未满足**处理，让模块保持静默而不是
-    冒险介入；唯一例外是「丰富回复」——它在新版宿主里已被移除，读取不到 = **未开启**
-    （否则两个接管会在新版宿主上永远静默）。
+    冒险介入；两个例外都是"新版宿主已移除的旧开关"：「丰富回复」读取不到 = **未开启**，
+    「启用引用回复」读取不到 = **关闭**（宿主不再自己做引用回复）——否则两个接管会在新版
+    宿主上永远静默。
 
     ``rich_reply_gate=False``（对应插件配置 ``[plugin] rich_reply_gate`` 关闭）时，
     不再把「丰富回复」当硬门槛：宿主开着丰富回复也允许接管，状态行里会注明
@@ -218,6 +247,16 @@ def evaluate_module(
                 unmet.append(f"需在宿主配置关闭「{name}」（{path}，当前 True）")
             else:
                 met.append(f"{name}开关未读取到（视为未开启）")
+            continue
+        if path == REPLY_QUOTE_PATH:
+            # 「启用引用回复」：新版宿主已移除该字段（改用群聊/私聊「引用频率」），
+            # 读取不到时按"宿主不再自己做引用回复"放行；只有明确读到 True 才要求去关掉。
+            if actual is False:
+                met.append(f"{name}已关闭")
+            elif isinstance(actual, bool):
+                unmet.append(f"需在宿主配置关闭「{name}」（{path}，当前 True）")
+            else:
+                met.append(f"{name}开关未读取到（新版宿主已移除，视为宿主不再做引用回复）")
             continue
         if actual is expected:  # 严格比较：必须是 False 本身，错误 dict/None 都不算满足
             met.append(f"{name}已关闭")

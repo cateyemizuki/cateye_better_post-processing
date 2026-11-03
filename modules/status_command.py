@@ -30,6 +30,7 @@ fallback 更会让 bot 真实发消息，不对普通群成员开放。``/bpp`` 
 
 from __future__ import annotations
 
+import asyncio
 import html
 import random
 from datetime import datetime
@@ -38,12 +39,34 @@ from typing import Any, Dict, List, Optional, Tuple
 from maibot_sdk import Command
 
 from ..post_processing import build_default_fallback_replies
+from .requirements import REPLY_QUOTE_PATH
 
 # 一图流的渲染参数：固定宽度、**按页面元素截取**（高度贴合内容，见 _render_status_image）、
 # 2x 缩放保证清晰度。1080 与「属于麦麦的生活」状态图同一版心（纸底/墨字/单红强调）。
 # allow_network 保持默认 False（宿主默认禁外网），HTML 里只用内联 CSS、不引用外部资源。
 _RENDER_VIEWPORT_WIDTH = 1080
 _RENDER_DEVICE_SCALE_FACTOR = 2.0
+
+# 一图流渲染的**重试**（1.4.1）：宿主 Playwright 首次冷启动时 node 驱动可能被安全软件扫描
+# 拖死、或上一轮留下的半死驱动被复用，表现为 "Connection closed while reading from the
+# driver" 这类**偶发**失败——宿主渲染服务下次调用会重新拉起驱动，隔一次重试通常就成功。
+# 只对疑似偶发的失败重试；能力未声明/被拒这类确定性失败直接退回文字，不做无用功。
+_RENDER_MAX_ATTEMPTS = 2
+_RENDER_RETRY_DELAY_SECONDS = 1.2
+# 命中这些片段的失败不再重试（能力层拒绝，重试也不会成功）。
+_RENDER_FATAL_HINTS = (
+    "capability",
+    "not allowed",
+    "permission",
+    "denied",
+    "未声明",
+    "不支持",
+    "not supported",
+    "no such",
+)
+
+# 退化原因在聊天窗口里的最长展示长度（宿主错误串可能很长，压成一行短文本）。
+_RENDER_ERROR_MAX_CHARS = 80
 
 # 合并转发节点的展示昵称（转发气泡里显示的名字）。
 _FORWARD_NICKNAME = "更好的消息后处理"
@@ -84,6 +107,26 @@ def _sanitize_placeholder_name(name: str) -> str:
     """占位符用的第三方可控文本清理：剔除非可打印字符后截断到上限长度。"""
     cleaned = "".join(ch for ch in str(name or "") if ch.isprintable())
     return cleaned.strip()[:_PLACEHOLDER_NAME_MAX_CHARS]
+
+
+def _flatten_render_error(error: str) -> str:
+    """把渲染失败原因压成一行短文本（供文字版最后一行展示，避免撑爆聊天窗口）。"""
+    text = " ".join(str(error or "").split())
+    if not text:
+        return "原因未知"
+    return text[:_RENDER_ERROR_MAX_CHARS]
+
+
+def _render_failure_is_transient(error: str) -> bool:
+    """失败是否属于**偶发**（值得重试一次）。
+
+    宿主 Playwright 的驱动冷启动、驱动残留、浏览器刚被重启等情况会抛
+    "Connection closed while reading from the driver" / "Target closed" 这类错误，
+    重试通常即成功；而能力未声明/被拒（"capability"、"not allowed"、中文提示等）重试也
+    不会成功，直接退回文字。
+    """
+    lowered = str(error or "").lower()
+    return not any(hint.lower() in lowered for hint in _RENDER_FATAL_HINTS)
 
 
 class StatusCommandMixin:
@@ -400,7 +443,7 @@ class StatusCommandMixin:
         return None, ""
 
     def _collect_header_facts(self) -> List[Tuple[str, str]]:
-        """卡片左栏的全局事实（键值对）：版本 / 总开关 / 门控 / 宿主丰富回复 / 兜底提示词。"""
+        """卡片左栏的全局事实（键值对）：版本 / 总开关 / 门控 / 宿主开关 / 兜底提示词。"""
         rich_reply = self._cfg.get("experimental.enable_rich_reply")
         if rich_reply is True:
             rich_reply_text = "开（需关闭）"
@@ -409,6 +452,15 @@ class StatusCommandMixin:
         else:
             # 新版宿主已移除该字段：读不到 = 丰富回复能力未开启，接管照常生效。
             rich_reply_text = "未读取到（视为未开启）"
+        reply_quote = self._cfg.get(REPLY_QUOTE_PATH)
+        if reply_quote is True:
+            reply_quote_text = "开（插件静默）"
+        elif reply_quote is False:
+            reply_quote_text = "关（插件接管）"
+        else:
+            # 新版宿主已移除该字段（改用群聊/私聊「引用频率」）：读不到 = 宿主不再把引用与否
+            # 交给这个开关，按关闭处理，引用回复接管照常生效（1.4.1）。
+            reply_quote_text = "未读取到（视为关闭）"
         gate_on = self._rich_reply_gate()
         cleanup_on = bool(getattr(self.config.plugin, "strip_emoji_text", True))
         at_cfg = getattr(self.config, "at_cooldown", None)
@@ -422,6 +474,7 @@ class StatusCommandMixin:
             ("总开关", "开" if self._plugin_enabled() else "关"),
             ("丰富回复门控", "开" if gate_on else "关（不设门槛）"),
             ("宿主丰富回复", rich_reply_text),
+            ("宿主引用回复", reply_quote_text),
             ("出站表情清洗", "开" if cleanup_on else "关"),
             ("@ 冷却", f"{at_seconds:g} 秒" if at_on and at_seconds > 0 else "关"),
             ("异常兜底提示词", self._fallback_prompts_summary()),
@@ -603,13 +656,22 @@ class StatusCommandMixin:
         降级链（与官方文档的兼容建议一致）：
 
         1. ``render.html2png`` 成功 → 合并转发单节点 **image 段**（一图流）；
-        2. 渲染失败（能力被拒 / 宿主没有渲染后端 / 超时）→ 合并转发单节点 **text 段**；
-        3. ``send.forward`` 失败（适配器不支持转发等）→ 有图直发 ``send.image``，
+        2. 偶发失败先重试一次（1.4.1：宿主 Playwright 驱动冷启动）；
+        3. 仍失败（能力被拒 / 宿主没有渲染后端 / 超时）→ 合并转发单节点 **text 段**
+           （文字版末行写明失败原因）；
+        4. ``send.forward`` 失败（适配器不支持转发等）→ 有图直发 ``send.image``，
            再失败 / 没有图 → ``send.text`` 逐行文本。
         """
         text_lines = self._build_status_text()
         status_text = "\n".join(text_lines)
-        image_base64 = await self._render_status_image()
+        image_base64, render_error = await self._render_status_image()
+        if not image_base64:
+            # 退化原因写进文字版最后一行：/bpp 仅 operator 可触发，operator 一眼能看到
+            # "这次为什么没有图"，不必去翻宿主日志（原因已压成一行短文本）。
+            status_text = "\n".join(
+                text_lines
+                + [f"提示：一图流渲染失败（{_flatten_render_error(render_error)}），本次退回文字。"]
+            )
 
         segments: List[Dict[str, str]]
         if image_base64:
@@ -652,13 +714,44 @@ class StatusCommandMixin:
         await self.ctx.send.text(status_text, stream_id, sync_to_maisaka_history=False)
         self.ctx.logger.info("已用文字直发模块状态（会话 %s）", stream_id)
 
-    async def _render_status_image(self) -> str:
-        """把状态 HTML 渲染成 PNG，返回 base64；任何失败返回空串（调用方退回文字）。"""
+    async def _render_status_image(self) -> Tuple[str, str]:
+        """把状态 HTML 渲染成 PNG。
+
+        返回 ``(base64, 失败原因)``：成功时原因为空串，失败时 base64 为空串（调用方
+        退回文字）。**偶发失败重试一次**——宿主 Playwright 驱动冷启动 / 残留会让
+        ``render.html2png`` 抛 "Connection closed while reading from the driver"，
+        宿主渲染服务下次调用会重新拉起驱动，重试通常即成功（1.4.1）。
+        """
         try:
             html_text = self._render_status_html()
         except Exception as exc:
             self.ctx.logger.warning("状态 HTML 构建失败，一图流退回文字: %s", exc)
-            return ""
+            return "", f"HTML 构建失败（{type(exc).__name__}）"
+
+        last_error = ""
+        for attempt in range(1, _RENDER_MAX_ATTEMPTS + 1):
+            image_base64, last_error = await self._render_once(html_text)
+            if image_base64:
+                if attempt > 1:
+                    self.ctx.logger.info("一图流渲染重试第 %d 次成功", attempt)
+                return image_base64, ""
+            if attempt >= _RENDER_MAX_ATTEMPTS or not _render_failure_is_transient(last_error):
+                break
+            self.ctx.logger.warning(
+                "一图流渲染失败（%s），%.1f 秒后重试一次（宿主渲染驱动冷启动属偶发）",
+                last_error or "未知原因",
+                _RENDER_RETRY_DELAY_SECONDS,
+            )
+            await asyncio.sleep(_RENDER_RETRY_DELAY_SECONDS)
+        self.ctx.logger.warning("一图流渲染失败（%s），退回文字", last_error or "未知原因")
+        return "", last_error
+
+    async def _render_once(self, html_text: str) -> Tuple[str, str]:
+        """``render.html2png`` 的单次调用：返回 ``(base64, 失败原因)``。
+
+        失败原因只用一句短文本描述（异常类型 + 消息 / 宿主返回的 error）：既写进日志，
+        也在退回文字时展示给触发命令的 operator。
+        """
         try:
             result = await self.ctx.render.html2png(
                 html_text,
@@ -670,18 +763,15 @@ class StatusCommandMixin:
                 device_scale_factor=_RENDER_DEVICE_SCALE_FACTOR,
             )
         except Exception as exc:
-            self.ctx.logger.warning("一图流渲染失败（render.html2png 异常），退回文字: %s", exc)
-            return ""
+            return "", f"{type(exc).__name__}: {exc}"
         if not isinstance(result, dict):
-            self.ctx.logger.warning("一图流渲染返回形态异常 %r，退回文字", type(result).__name__)
-            return ""
+            return "", f"渲染返回形态异常（{type(result).__name__}）"
         if result.get("success") is False:
-            self.ctx.logger.warning("一图流渲染被拒/失败（%s），退回文字", result.get("error"))
-            return ""
+            return "", str(result.get("error") or "宿主返回 success=False")
         image_base64 = str(result.get("image_base64") or "").strip()
         if not image_base64:
-            self.ctx.logger.warning("一图流渲染结果为空，退回文字")
-        return image_base64
+            return "", "渲染结果为空（未返回 image_base64）"
+        return image_base64, ""
 
     # ------------------------------------------------------------------
     # /bpp fallback：对引用的消息触发一次兜底测试
