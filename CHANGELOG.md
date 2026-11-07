@@ -4,6 +4,12 @@
 > 功能条目；**0.x 时代**的全部更新按次级版本号合并回溯（0.9.0 及更早没有逐条留档，按代码
 > 注释与 README 版本标注整理）。各功能的当前行为以 [`README.md`](README.md) 为准。
 
+## 维护状态（2026-11-07）
+
+- `main` 分支冻结在 **1.4.2**，仅支持 **MaiBot <=1.3.99**；不再加功能。
+- MaiBot 1.4.0+ 请使用 [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0)
+  分支（插件 1.4.3 起，移除已从宿主删除的 `emoji.maisaka.before_select` Hook）。
+
 ## 1.4.2（2026-11-04）
 
 - **新增「独占 @」**（`[plugin] strip_external_at`，默认**开启**）：对属于 bot 本轮回复的

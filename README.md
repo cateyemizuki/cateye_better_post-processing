@@ -1,5 +1,9 @@
 # 更好的消息后处理
 
+> **维护状态（2026-11-07）**：`main` 分支冻结在 **1.4.2**，仅支持 **MaiBot <=1.3.99**，不再加功能。
+> MaiBot 1.4.0+ 请使用 [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0)
+> 分支（插件 1.4.3 起，移除已从宿主删除的 `emoji.maisaka.before_select` Hook）。
+
 <a id="使用前必读先关掉宿主这几个开关否则接管能力不生效"></a>
 
 ## 使用前必读：宿主开关怎么配（新版宿主自带引用，可关可不关）
