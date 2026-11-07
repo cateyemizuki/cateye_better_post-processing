@@ -266,7 +266,7 @@ from .modules.requirements import (
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.4.3"
+SUPPORTED_CONFIG_VERSION = "1.4.5"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -1512,17 +1512,18 @@ class ResponseSplitterSectionConfig(PluginConfigBase):
         },
     )
     final_newline_action: Literal["保持原样", "取消回车", "额外拆分一段"] = Field(
-        default="保持原样",
+        default="额外拆分一段",
         description=(
-            "分段完成后的最终回车处理：保持原样 / 取消回车 / 额外拆分一段。"
+            "分段完成后的最终回车处理：保持原样 / 取消回车 / 额外拆分一段（默认）。"
             "仅分段成功且未触发条数上限时生效；额外拆分无视条数上限，"
-            "只在第一个包含回车、且两侧都有内容的段落处拆成两段"
+            "只在第一个包含回车、且两侧都有内容的段落处拆成两段；"
+            "其余未被拆分的回车会压成空格，避免同一条消息里出现换行"
         ),
         json_schema_extra={
             "label": "分段后回车处理",
             "x-toml-comment": (
-                "分段完成后遇到回车：保持原样 / 取消回车 / 额外拆分一段（无视条数上限）。"
-                "超限不分段时不处理。"
+                "分段完成后遇到回车：保持原样 / 取消回车 / 额外拆分一段（默认，无视条数上限）。"
+                "额外拆分只拆第一处，其余回车压成空格；超限不分段时不处理。"
             ),
             **_ui_i18n(
                 "After-split newline",
