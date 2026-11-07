@@ -138,8 +138,6 @@
    **出站静默 + 主 planner 无在途请求**（``maisaka.planner.before_request`` 里
    ``tool_definitions`` 非空即视为"主 planner 有一轮在跑"，其 ``after_response`` 清掉；
    子代理的 ``tool_definitions`` 为空，不参与），上界是本轮有效期。
-   另有一道**不依赖工具名配置**的保险：宿主 ``send_emoji`` 工具开始选图时触发
-   ``emoji.maisaka.before_select``，插件收到即把本轮标记成"已有表情包在路上"。
 
    回复轮只有在 ``first_send_timeout_seconds`` 秒内看到本轮出站消息才算成立：
    超时说明这轮回复并没有真的发出去（发送失败 / 被其它插件在
@@ -268,7 +266,7 @@ from .modules.requirements import (
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.4.2"
+SUPPORTED_CONFIG_VERSION = "1.4.3"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -1730,8 +1728,6 @@ class EmojiAfterReplySectionConfig(PluginConfigBase):
         description=(
             "planner 计划调用这些工具（``maisaka.planner.after_response`` 的 output_items 工具名）时，"
             "视为本轮已由 planner 自行处理表情，本插件不再补发；留空则关闭该判定。"
-            "0.14.2 起还有一道**不依赖这个名单**的保险：宿主 ``send_emoji`` 工具开始选图时会触发"
-            "``emoji.maisaka.before_select``，插件收到就把本轮标记成「已有表情包」"
         ),
         json_schema_extra={
             "label": "planner 表情工具名",
@@ -1740,8 +1736,7 @@ class EmojiAfterReplySectionConfig(PluginConfigBase):
             **_ui_i18n(
                 "Planner emoji tool names",
                 "When the planner plans to call any of these tools, the round counts as already carrying "
-                "an emoji and no extra one is sent. Empty disables the check. Since 0.14.2 the host's "
-                "emoji.maisaka.before_select hook is also observed, so this list is not the only guard.",
+                "an emoji and no extra one is sent. Empty disables the check.",
             ),
         },
     )
@@ -4063,50 +4058,6 @@ class BetterPostProcessingPlugin(
             tool_name,
             session_id,
             ttl,
-        )
-
-    @HookHandler(
-        "emoji.maisaka.before_select",
-        name="host_emoji_intent_observer",
-        description=(
-            "observe：宿主 send_emoji 工具开始选图时，把该会话标记成"
-            "「本轮已有表情包在路上」，避免插件再补第二张"
-        ),
-        mode=HookMode.OBSERVE,
-        order=HookOrder.EARLY,
-        error_policy=ErrorPolicy.SKIP,
-    )
-    async def handle_host_emoji_intent(self, **kwargs: Any) -> None:
-        """宿主自己即将发表情包 —— 最直接的"别补了"信号（0.14.2）。
-
-        为什么要有这条：``planner_emoji_tools`` 是**按工具名**猜"planner 打算发表情"，
-        依赖用户把工具名配全（默认只有 ``send_emoji``）。而宿主 ``send_emoji`` 内置工具在
-        真正选图前会发 ``emoji.maisaka.before_select``（``emoji_system/maisaka_tool.py``，
-        ``stream_id=tool_ctx.runtime.session_id``，与我们的 session_id 同口径）——
-        这是"表情包已经在路上"的**事实**，与工具名配置无关。
-
-        命中时做两件事：
-
-        * 把本轮回复标记成"已有表情包"（``had_emoji``）→ 补发判定直接跳过；
-        * 刷新"bot 最近发过表情"的时刻（供"本轮开始前几秒刚发过表情"的窗口判定）。
-
-        注意：本插件自己发图走 ``ctx.send.emoji`` 能力、**不经过**这个内置工具，
-        所以不存在自己把自己标记掉的循环。
-        """
-        if not self._plugin_enabled():
-            return
-        session_id = str(kwargs.get("stream_id") or "").strip()
-        if not session_id:
-            return
-        now = time.monotonic()
-        self._chat_emoji_last[session_id] = now
-        reply_round = self._reply_rounds.get(session_id)
-        if reply_round is not None:
-            reply_round["had_emoji"] = True
-        self.ctx.logger.debug(
-            "宿主 send_emoji 已开始选图（会话 %s，情绪=%r），本轮不再补发表情包",
-            session_id,
-            str(kwargs.get("requested_emotion") or ""),
         )
 
     @staticmethod

@@ -610,21 +610,23 @@ planner 通过 `maisaka.reply.before_post_process` 激活一轮回复后，插�
 等待上界是本轮有效期减一个轮询间隔，到点就按"不再等"放行，保证补发仍然来得及判定
 （等满 `round_window_seconds` 反而会被当成"太晚"直接丢弃）。
 
-**planner 自己打算发表情时不会补发（0.7.0 + 0.14.2 双保险）**：
+**planner 自己打算发表情时不会补发（0.7.0）**：
 
-- **第一道（0.7.0，按工具名）**：`maisaka.planner.after_response` 里读本轮 `output_items`
+- **按工具名判定**：`maisaka.planner.after_response` 里读本轮 `output_items`
   的工具调用名，命中 `planner_emoji_tools` 即打标记（有效期 `planned_emoji_ttl_seconds`），
   本轮跳过补发；planner 的表情真的发出后标记立即清除。**默认只含 `send_emoji`**；
   想连"贴表情"一起算就把 `emoji_like` / `emoji_like_list` 自己加进去（贴表情同样表达情绪）；
   留空则关闭该判定。
-- **第二道（0.14.2，按事实）**：宿主 `send_emoji` 内置工具在真正选图前会触发
-  `emoji.maisaka.before_select`（`stream_id` 就是会话 ID），插件收到就把本轮标记成
-  "已有表情包在路上"。这条**不依赖上面那个工具名名单**，因此名单配漏/配错时也不会多发。
 
-> 两道都依赖宿主输出项快照里 `FunctionCallItem.tool_call.func_name` 的形态（形态在
-> MaiBot 1.2.5 源码里核对，插件本体在 1.2.3 上实跑）：形态不匹配时第一道静默退化为
-> "只看已发出的出站消息"，第二道不受影响。本插件自己发图走 `ctx.send.emoji` 能力、
+> 这条判定依赖宿主输出项快照里 `FunctionCallItem.tool_call.func_name` 的形态（形态在
+> MaiBot 1.2.5 源码里核对，插件本体在 1.2.3 上实跑）：形态不匹配时静默退化为
+> "只看已发出的出站消息"。本插件自己发图走 `ctx.send.emoji` 能力、
 > 不经过宿主那个内置工具，所以不会自己把自己标记掉。
+>
+> **1.4.3 起移除了 `emoji.maisaka.before_select` 的第二道观察**：部分宿主版本/构建没有注册
+> 这个 Hook，而新版宿主的 Hook 规格校验会把"声明未注册 Hook"视为组件注册失败，导致插件
+> 整体加载失败（`E_BAD_PAYLOAD`）。现在只保留上面的工具名判定 + planner 收尾等待 +
+> 出站表情观察；默认 `send_emoji` 仍在名单里，常见场景不受影响。
 
 **回复轮只有在真的发出消息后才算成立（0.7.0）**：`first_send_timeout_seconds` 秒内
 没等到本轮出站消息（发送失败、被其它插件在 `send_service.before_send` 中止）即丢弃

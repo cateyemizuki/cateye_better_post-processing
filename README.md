@@ -163,15 +163,18 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 > `send_service.after_send`、`maisaka.reply.before_post_process`、`maisaka.replyer.after_response`、
 > `maisaka.planner.before_request`、`maisaka.planner.after_response`、
 > `maisaka.replyer.before_model_request`、`chat.receive.before_process`、`chat.receive.after_process`、
-> `emoji.register.after_build_description`、`emoji.maisaka.before_select`、`message.get_by_id`、`message.get_by_time_in_chat`、
+> `emoji.register.after_build_description`、`message.get_by_id`、`message.get_by_time_in_chat`、
 > `emoji.*`、`config.get`、`database.query`、`llm.generate`、`send.emoji`、`send.text`、
 > `send.forward`、`send.image`、`render.html2png`、`api.call`、`message.get_recent`、
-> `chat.get_all_streams`、`chat.get_stream_by_user_id`）在 MaiBot 1.2.3 / 1.3.0
-> 与 maibot_sdk 2.8.0 / 2.8.2 上验证。manifest 声明的最低宿主版本为 1.2.3。
+> `chat.get_all_streams`、`chat.get_stream_by_user_id`）在 MaiBot 1.4.0
+> 与 maibot_sdk 2.20.0 上验证。manifest 声明的最低宿主版本为 1.4.0。
 >
 > 多段发送（`[response_splitter]` 的 `takeover`）需要 `send.text` 能力，
 > 「撤回重发」纠错分支需要 `api.call` 能力，`/bpp` 状态命令需要 `send.forward`（合并转发）、
 > `render.html2png`（一图流）与 `send.image`（转发降级直发），**改动过 manifest 需完整重启 MaiBot**。
+
+> **分支说明（2026-11-07）**：本分支 `host-1.4.0` 面向 **MaiBot 1.4.0+**；MaiBot <=1.3.99
+> 请使用 `main` 分支（冻结在 1.4.2，不再加功能）。
 
 **版本变更**见 [`CHANGELOG.md`](CHANGELOG.md)（1.0.0 起记录功能变更，更早版本按次级版本号合并回溯）。
 

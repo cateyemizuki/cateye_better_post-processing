@@ -4,6 +4,18 @@
 > 功能条目；**0.x 时代**的全部更新按次级版本号合并回溯（0.9.0 及更早没有逐条留档，按代码
 > 注释与 README 版本标注整理）。各功能的当前行为以 [`README.md`](README.md) 为准。
 
+## 1.4.3（2026-11-07）
+
+- **移除宿主表情包 Hook 观察**（`emoji.maisaka.before_select` / `host_emoji_intent_observer`）：
+  部分宿主版本/构建没有注册这个 Hook，而新版宿主的 Hook 规格校验会把"声明未注册 Hook"
+  视为组件注册失败，导致插件整个加载失败（`E_BAD_PAYLOAD`）。现在不再订阅该 Hook，
+  「回复后表情包」只保留 `planner_emoji_tools` 工具名判定 + planner 收尾等待 + 出站表情观察，
+  不再依赖宿主 emoji Hook 是否注册。功能上只少了"宿主已开始选图"的第二道防重发保险；
+  默认 `send_emoji` 仍在工具名名单里，常见场景不受影响。
+- 版本与 `config_version` → **1.4.3**。
+- **分支说明**：本分支 `host-1.4.0` 面向 MaiBot 1.4.0+；MaiBot <=1.3.99 请使用 `main`
+  分支（冻结在 1.4.2，不再加功能）。
+
 ## 1.4.2（2026-11-04）
 
 - **新增「独占 @」**（`[plugin] strip_external_at`，默认**开启**）：对属于 bot 本轮回复的
