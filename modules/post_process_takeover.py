@@ -1729,7 +1729,8 @@ class PostProcessTakeoverMixin:
         original_segment_count = len(segments)
         over_segment_cap = max_segments > 0 and original_segment_count > max_segments
         newline_action = str(
-            getattr(self.config.response_splitter, "final_newline_action", "保持原样") or "保持原样"
+            getattr(self.config.response_splitter, "final_newline_action", "额外拆分一段")
+            or "额外拆分一段"
         ).strip()
         extra_split_count = 0
         newline_changed = False
@@ -1886,8 +1887,8 @@ class PostProcessTakeoverMixin:
         其他动作不改变段数。
         """
         action = str(
-            getattr(self.config.response_splitter, "final_newline_action", "保持原样")
-            or "保持原样"
+            getattr(self.config.response_splitter, "final_newline_action", "额外拆分一段")
+            or "额外拆分一段"
         ).strip()
         if action == "取消回车":
             updated: List[ProcessedResponseSegment] = []
@@ -1946,7 +1947,32 @@ class PostProcessTakeoverMixin:
                     else decision
                     for decision in deferred
                 )
-                return updated_segments, updated_corrections, updated_deferred, 1, True
+                # “额外拆分”只拆第一处回车；同一轮压缩里可能还有其它回车
+                # （例如 5 个分句压成 3 条时有两处回车）。这些剩余回车不能再
+                # 留在消息内部，统一压成空格；带纠正的段保持原样，避免撤回/
+                # 引用重发时文本与纠正记录不一致。
+                corrected_after_split = set(updated_corrections) | {
+                    decision.segment_index for decision in updated_deferred
+                }
+                cleaned_segments: List[ProcessedResponseSegment] = []
+                for segment_index, segment in enumerate(updated_segments):
+                    if segment_index in corrected_after_split:
+                        cleaned_segments.append(segment)
+                        continue
+                    cleaned = re.sub(
+                        r"[^\S\r\n]*[\r\n]+[^\S\r\n]*", " ", segment.text
+                    ).strip()
+                    if cleaned and cleaned != segment.text:
+                        cleaned_segments.append(replace(segment, text=cleaned))
+                    else:
+                        cleaned_segments.append(segment)
+                return (
+                    cleaned_segments,
+                    updated_corrections,
+                    updated_deferred,
+                    1,
+                    True,
+                )
         return segments, corrections, deferred, 0, False
 
     # Hook 2c：多段发送——登记待补发分段（blocking）
