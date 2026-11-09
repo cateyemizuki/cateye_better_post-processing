@@ -250,6 +250,7 @@ from .emoji_meanings import (
     sha256_of_base64,
 )
 from .text_rules import ParsedRules, apply_replaces, evaluate_rules, parse_rules
+from .planner_notice import build_rule_block_notice, insert_planner_tail_notice
 from .modules.post_process_takeover import (
     _HOST_MIRROR_EXTRA_FIELDS,
     _HOST_MIRROR_FIELDS,
@@ -277,7 +278,7 @@ from .modules.requirements import (
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.4.6"
+SUPPORTED_CONFIG_VERSION = "1.4.7"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -397,6 +398,12 @@ _REPLY_FLOW_ARM_FALLBACK_SECONDS = 20.0
 # ``_apply_text_rules_to_message`` 的特殊返回值：命中 ``c:内容``（无替换文本）时
 # 整条消息必须阻止发送。布尔返回值无法表达"丢弃"，用独立哨兵避免与 True/False 混淆。
 _TEXT_RULES_DROPPED = object()
+
+# 文本规则整条过滤后，给 planner 注入一次「拦截通知」的有效期与会话上限。
+# 宿主 1.3.x 的 reply 工具拿不到 abort_message，只看到 success=false；不通知
+# planner 就会反复重试 reply。通知只消费一次，新的拦截会重新登记。
+_TEXT_RULE_BLOCK_NOTICE_TTL_SECONDS = 120.0
+_TEXT_RULE_BLOCK_MAX_SESSIONS = 64
 
 # @ 独占（1.4.2）：EARLY 登记的"本插件保留的 at 目标"标记的 TTL 与容量上限。
 # 标记供 LATE 兜底区分自有 @ 与其它插件后补的 @；正常同一钩子链内即被消费，
@@ -2922,6 +2929,9 @@ class BetterPostProcessingPlugin(
         self._cfg: Dict[str, Any] = {}
         # 插件自身配置解析出的派生状态；在 on_load 与配置热更新时重建。
         self._parsed_rules = ParsedRules()
+        # 文本规则整条过滤的登记：session_id -> {timestamp, rule, reply_message_id}。
+        # 下一次 planner 请求时注入一条拦截通知并消费；避免宿主把 reply 失败当可重试错误。
+        self._text_rule_blocks: Dict[str, Dict[str, Any]] = {}
         self._init_quote_takeover()
         # 回复轮跟踪：session_id -> 轮状态（含自增轮 id、目标消息 id、是否已抽取回复方式）。
         self._reply_rounds: Dict[str, Dict[str, Any]] = {}
@@ -3224,6 +3234,7 @@ class BetterPostProcessingPlugin(
         self._pending_quote_targets.clear()
         self._pending_at_targets.clear()
         self._own_at_marks.clear()
+        self._text_rule_blocks.clear()
         if self._meaning_store is not None:
             self._meaning_store.close()
             self._meaning_store = None
@@ -3840,14 +3851,15 @@ class BetterPostProcessingPlugin(
         rules = self._parsed_rules
         if not rules or not self._plugin_enabled():
             return False
-        if str(getattr(self.config.text_rules, "apply_scope", "reply_flow")) != "all_outbound":
-            if not own_follow_up and not self._message_in_reply_flow(session_id, reply_message_id):
-                self.ctx.logger.debug(
-                    "跳过文本规则：该发送不属于 bot 本轮回复（会话 %s，reply_message_id=%s）",
-                    session_id or "?",
-                    reply_message_id or "-",
-                )
-                return False
+        scope = str(getattr(self.config.text_rules, "apply_scope", "reply_flow"))
+        in_reply_flow = own_follow_up or self._message_in_reply_flow(session_id, reply_message_id)
+        if scope != "all_outbound" and not in_reply_flow:
+            self.ctx.logger.debug(
+                "跳过文本规则：该发送不属于 bot 本轮回复（会话 %s，reply_message_id=%s）",
+                session_id or "?",
+                reply_message_id or "-",
+            )
+            return False
 
         components = message.get("raw_message")
         if not isinstance(components, list):
@@ -3871,6 +3883,16 @@ class BetterPostProcessingPlugin(
         outcome = evaluate_rules(full_text, rules)
         if outcome.dropped:
             # 命中 c:内容（无替换文本）：整条消息不发出。
+            self._remember_text_rule_block(
+                session_id,
+                rule_label=(
+                    f"c:{outcome.cover_hit.keyword}"
+                    if outcome.cover_hit is not None
+                    else "r:*（过滤后无内容）"
+                ),
+                reply_message_id=reply_message_id,
+                in_reply_flow=in_reply_flow,
+            )
             return _TEXT_RULES_DROPPED
 
         if outcome.cover_hit is not None:
@@ -3891,6 +3913,12 @@ class BetterPostProcessingPlugin(
         has_non_text = any(index not in text_set for index in range(len(components)))
         if not outcome.text.strip() and not has_non_text:
             # r:词（无替换文本）把整条消息删空：没有可发送的内容，等同于整条过滤。
+            self._remember_text_rule_block(
+                session_id,
+                rule_label="r:*（过滤后无内容）",
+                reply_message_id=reply_message_id,
+                in_reply_flow=in_reply_flow,
+            )
             return _TEXT_RULES_DROPPED
 
         new_components: List[Any] = []
@@ -3935,6 +3963,84 @@ class BetterPostProcessingPlugin(
             return True
         # r:词 把整条文本删空，同样没有可发送的内容。
         return bool(text.strip()) and not outcome.text.strip()
+
+    def _remember_text_rule_block(
+        self,
+        session_id: str,
+        *,
+        rule_label: str,
+        reply_message_id: str = "",
+        in_reply_flow: bool = False,
+    ) -> None:
+        """登记一次「本轮 reply 被文本规则整条过滤」，供下一次 planner 请求注入通知。
+
+        只登记属于 bot 本轮回复的发送：``apply_scope=all_outbound`` 时其它插件直接
+        发出的文本被过滤，不应让 planner 误以为自己的 reply 失败。
+        """
+        normalized_session = str(session_id or "").strip()
+        if not normalized_session or not in_reply_flow:
+            return
+        now = time.monotonic()
+        self._text_rule_blocks[normalized_session] = {
+            "timestamp": now,
+            "rule": str(rule_label or "").strip()[:120] or "文本规则",
+            "reply_message_id": str(reply_message_id or "").strip(),
+        }
+        # 惰性清理：过期项 + 超量时淘汰最旧会话。
+        for key, event in list(self._text_rule_blocks.items()):
+            if now - float(event.get("timestamp", 0.0)) > _TEXT_RULE_BLOCK_NOTICE_TTL_SECONDS:
+                self._text_rule_blocks.pop(key, None)
+        while len(self._text_rule_blocks) > _TEXT_RULE_BLOCK_MAX_SESSIONS:
+            oldest = min(
+                self._text_rule_blocks,
+                key=lambda key: float(self._text_rule_blocks[key].get("timestamp", 0.0)),
+            )
+            self._text_rule_blocks.pop(oldest, None)
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="planner_text_rule_block_notice",
+        description=(
+            "blocking：上一轮 reply 被文本规则整条过滤时，在最新消息之后、尾部系统提示词"
+            "之前注入拦截通知，避免宿主把 reply 失败当成可重试错误而反复调用"
+        ),
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_planner_text_rule_block_notice(self, **kwargs: Any) -> Dict[str, Any]:
+        """把「被规则拦截」写入 planner 上下文（只消费一次，注入成功后才清除）。"""
+        if not self._plugin_enabled():
+            return {"action": "continue"}
+        session_id = str(kwargs.get("session_id") or "").strip()
+        if not session_id:
+            return {"action": "continue"}
+        event = self._text_rule_blocks.get(session_id)
+        if event is None:
+            return {"action": "continue"}
+        if time.monotonic() - float(event.get("timestamp", 0.0)) > _TEXT_RULE_BLOCK_NOTICE_TTL_SECONDS:
+            self._text_rule_blocks.pop(session_id, None)
+            return {"action": "continue"}
+        # 子代理复用同一 Hook，但 tool_definitions 为空；只给主 planner 注入。
+        tool_definitions = kwargs.get("tool_definitions")
+        if isinstance(tool_definitions, list) and not tool_definitions:
+            return {"action": "continue"}
+        items = kwargs.get("items")
+        if not isinstance(items, list) or not items:
+            return {"action": "continue"}
+        notice = build_rule_block_notice(str(event.get("rule") or ""))
+        new_items = insert_planner_tail_notice(items, notice)
+        if new_items is None:
+            return {"action": "continue"}
+        self._text_rule_blocks.pop(session_id, None)
+        self.ctx.logger.info(
+            "planner 上下文注入文本规则拦截通知（会话 %s，规则 %s）",
+            session_id[:12],
+            event.get("rule") or "-",
+        )
+        modified = dict(kwargs)
+        modified["items"] = new_items
+        return {"action": "continue", "modified_kwargs": modified}
 
     def _is_group_message(self, message: Dict[str, Any]) -> bool:
         """该消息是否来自群聊。

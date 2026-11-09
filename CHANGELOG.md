@@ -4,11 +4,22 @@
 > 功能条目；**0.x 时代**的全部更新按次级版本号合并回溯（0.9.0 及更早没有逐条留档，按代码
 > 注释与 README 版本标注整理）。各功能的当前行为以 [`README.md`](README.md) 为准。
 
-## 维护状态（2026-11-09）
+## 维护状态（2026-11-10）
 
-- `main` 分支继续维护 **MaiBot <=1.3.99** 兼容线（当前 1.4.6）。
+- `main` 分支继续维护 **MaiBot <=1.3.99** 兼容线（当前 1.4.7）。
 - MaiBot 1.4.0+ 请使用 [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0)
-  分支（当前 1.4.6；1.4.3 起移除已从宿主删除的 `emoji.maisaka.before_select` Hook）。
+  分支（当前 1.4.7；1.4.3 起移除已从宿主删除的 `emoji.maisaka.before_select` Hook）。
+
+## 1.4.7（2026-11-10）
+
+- **修复文本规则整条过滤后 planner 反复重试 reply**：宿主 1.3.x 的 reply 工具在
+  `send_service.before_send` 被 abort 后拿不到 `abort_message`，工具结果里只有
+  `success=false` 与生成分段，planner 会把它当成普通发送失败而反复调用 reply。
+  现在命中 `c:` 整条过滤（或 `r:` 把消息删空）时，插件在**下一次 planner 请求**里
+  注入一条 `<system-reminder>` 拦截通知，位置在**最新消息之后、工具/人物画像/时间/
+  分析指令等尾部系统提示词之前**，明确说明这是插件预期拦截、不是发送故障，不要
+  重复调用 reply 重试或换措辞重发；通知只消费一次，新的拦截会重新登记。
+- 版本与 `config_version` → **1.4.7**。
 
 ## 1.4.6（2026-11-09）
 
