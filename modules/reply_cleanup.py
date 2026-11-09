@@ -8,7 +8,7 @@
 * 完整中括号还没被分段切开——``[表情包图片内容描述：…]`` 若等到出站才处理，
   可能已经被拆到两条消息里，无法再按对删除。
 
-清洗口径（``[plugin] strip_emoji_text``，默认开启）：
+清洗口径（``[replyer_post_process] strip_emoji_text``，默认开启；1.4.5 前住在 ``[plugin]``）：
 
 1. 成对中括号（``[]`` / ``［］`` / ``【】``）内**包含「表情」二字**时，整对括号连内容一起删；
    覆盖宿主 ``[表情包: 描述]``、插件 ``[表情包标签：…]``、``[表情包图片内容描述：…]``
@@ -104,13 +104,13 @@ class ReplyCleanupMixin:
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_reply_emoji_text_cleanup(self, **kwargs: Any) -> Dict[str, Any]:
-        """清洗回复正文（默认开启，``[plugin] strip_emoji_text`` 可关）。
+        """清洗回复正文（默认开启，``[replyer_post_process] strip_emoji_text`` 可关）。
 
         只改 ``response`` 字段；空回复照常回传空串，由宿主/兜底模块决定后续行为。
         """
         if not self._plugin_enabled():
             return {"action": "continue"}
-        if not bool(getattr(self.config.plugin, "strip_emoji_text", True)):
+        if not bool(getattr(self.config.replyer_post_process, "strip_emoji_text", True)):
             return {"action": "continue"}
         response = kwargs.get("response")
         if not isinstance(response, str) or "表情" not in response:

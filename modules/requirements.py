@@ -220,7 +220,8 @@ def evaluate_module(
     「启用引用回复」读取不到 = **关闭**（宿主不再自己做引用回复）——否则两个接管会在新版
     宿主上永远静默。
 
-    ``rich_reply_gate=False``（对应插件配置 ``[plugin] rich_reply_gate`` 关闭）时，
+    ``rich_reply_gate=False``（对应插件配置 ``[replyer_post_process] rich_reply_gate`` 关闭，
+    1.4.5 前住在 ``[plugin]``）时，
     不再把「丰富回复」当硬门槛：宿主开着丰富回复也允许接管，状态行里会注明
     "丰富回复未做门控"，提醒此时附件会挂在首段、补发分段不带附件。
     """

@@ -398,8 +398,8 @@ class StatusCommandMixin:
             parsed = self._parsed_rules
             total = len(parsed.replaces) + len(parsed.covers)
             detail = (
-                f"replace={len(parsed.replaces)}、cover={len(parsed.covers)}"
-                f"、忽略={len(parsed.invalid)}；范围={cfg.text_rules.apply_scope}"
+                f"r={len(parsed.replaces)}、c={len(parsed.covers)}"
+                f"、过滤={parsed.filter_count}、忽略={len(parsed.invalid)}；范围={cfg.text_rules.apply_scope}"
             )
             # 文本规则没有独立开关：按"有没有生效规则"判定——一条都没有（或全部因
             # 格式错误被忽略）= 已关闭；有生效规则 = 可用（detail 里始终带条数明细）。
@@ -462,7 +462,7 @@ class StatusCommandMixin:
             # 交给这个开关，按关闭处理，引用回复接管照常生效（1.4.1）。
             reply_quote_text = "未读取到（视为关闭）"
         gate_on = self._rich_reply_gate()
-        cleanup_on = bool(getattr(self.config.plugin, "strip_emoji_text", True))
+        cleanup_on = bool(getattr(self.config.replyer_post_process, "strip_emoji_text", True))
         at_cfg = getattr(self.config, "at_cooldown", None)
         at_on = bool(getattr(at_cfg, "enabled", True))
         try:

@@ -269,6 +269,10 @@ _PLANNER_SEGMENT_FIRST_SEND_GRACE_SECONDS = 5.0
 _PENDING_FOLLOW_UP_TTL_SECONDS = 120.0
 # 补发单段的重试次数。
 _FOLLOW_UP_SEND_MAX_ATTEMPTS = 2
+
+# ``_send_follow_up_text`` 的特殊返回值：该分段被文本规则整条过滤，属于**预期跳过**，
+# 不是发送失败（不重试、不计入 failed，也不写进已发送记录）。
+_FOLLOW_UP_SKIPPED = object()
 # planner / 入站消息等待补发的 Hook 超时（内部等待时长由配置决定，这里留出余量）。
 #
 # 为什么要显式设：`maisaka.planner.before_request` 的 Hook 规格默认超时只有 6000ms，
@@ -1244,7 +1248,7 @@ class PostProcessTakeoverMixin:
         at_cardname: str = "",
         previous_message_id: str = "",
         sync_history: bool = True,
-    ) -> Optional[str]:
+    ) -> Any:
         """补发一条文本消息；``quote_target`` / ``at_target`` 非空时在 before_send 注入引用 / @。
 
         ``sync_history=False``：不把这条件写入 Maisaka 对话历史——用于"发出后马上会被撤回"
@@ -1257,6 +1261,13 @@ class PostProcessTakeoverMixin:
         normalized = str(text or "").strip()
         if not normalized:
             return previous_message_id or None
+        # 文本规则会命中的分段提前跳过：让 before_send 去 abort 只会触发重试与
+        # "补发失败"日志，既没发出也没有意义。这里直接当作预期跳过。
+        if self._text_rules_would_drop(normalized):
+            self.ctx.logger.info(
+                "出站文本规则：分段命中整条过滤，跳过补发: %r", normalized[:40]
+            )
+            return _FOLLOW_UP_SKIPPED
         text_key = self._text_key(normalized)
         self._mark_stream_sending(session_id, text_key)
         try:
@@ -1517,6 +1528,11 @@ class PostProcessTakeoverMixin:
                         at_cardname=preserved_at_cardname,
                         previous_message_id=base_id,
                     )
+                if sent_id is _FOLLOW_UP_SKIPPED:
+                    self.ctx.logger.info(
+                        "撤回后重发：修正句被文本规则整条过滤，跳过: %r", item.text[:40]
+                    )
+                    continue
                 if sent_id:
                     # 撤回成功/兜底后重发的修正句才是最终留在历史里的消息；即时纠正
                     # （slot<0）也一样要进补齐记录，不能只记 slot>=0 的回复分段。
@@ -1554,6 +1570,11 @@ class PostProcessTakeoverMixin:
                 previous_message_id=previous_id,
                 sync_history=item.slot not in recalled_slots,
             )
+            if sent_id is _FOLLOW_UP_SKIPPED:
+                self.ctx.logger.info(
+                    "分段被文本规则整条过滤，跳过第 %s 条: %r", position, item.text[:40]
+                )
+                continue
             if sent_id:
                 record_message_id = sent_id if sent_id != previous_id else ""
                 previous_id = sent_id

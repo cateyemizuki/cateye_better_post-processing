@@ -134,9 +134,10 @@ class QuoteTakeoverMixin:
             pass
 
     def _at_trailing_space(self) -> bool:
-        """注入真实 @ 时是否额外补一个空格组件（``[plugin] at_trailing_space``）。
+        """注入真实 @ 时是否额外补一个空格组件（``[replyer_post_process] at_trailing_space``）。
 
-        宿主版本兼容开关（0.14.1 修复）：字段住在**插件总开关所在的 ``[plugin]`` 节**，
+        1.4.5 前字段住在插件总开关所在的 ``[plugin]`` 节，之后搬入
+        ``[replyer_post_process]``（旧键在 ``migrate_legacy_config`` 登记自动搬迁），
         群聊 / 私聊共用同一个值，**不在** ``[quote_reply]`` / ``[quote_reply_private]`` 里。
         0.13.10 ~ 0.14.0 期间这里误读 ``quote_cfg.at_trailing_space``，
         ``getattr`` 取不到该字段便一路返回 ``False`` —— 于是 WebUI 里把开关打开也**不生效**，
@@ -146,8 +147,8 @@ class QuoteTakeoverMixin:
         **默认开启**（宿主自己补的空格组件只对宿主 ``attach_at`` 的 @ 生效，
         本插件注入的 @ 不补空格组件就会与正文粘连）。
         """
-        plugin_cfg = getattr(self.config, "plugin", None)
-        return bool(getattr(plugin_cfg, "at_trailing_space", True))
+        section_cfg = getattr(self.config, "replyer_post_process", None)
+        return bool(getattr(section_cfg, "at_trailing_space", True))
 
     def _quote_weights_config(self, message: Dict[str, Any]) -> Any:
         """按会话类型取引用回复**权重**配置节（``[quote_reply_weights]`` / ``[quote_reply_private_weights]``）。
@@ -347,8 +348,8 @@ class QuoteTakeoverMixin:
         # 之后对该消息的任何回复都不再引用，即使已经超出 stale_age_seconds 的时间限制。
         # 抽到"直接回复"不消耗这次机会：下一轮 planner 再回复同一条消息时仍可能抽到引用。
         quote_cfg = self._quote_section_config(message)
-        # 是否在 @ 后额外补一个空格组件（``[plugin] at_trailing_space``，默认 True）。
-        # 注意：开关在 ``[plugin]`` 节，**不是** ``quote_cfg``（0.14.1 修复误读）。
+        # 是否在 @ 后额外补一个空格组件（``[replyer_post_process] at_trailing_space``，默认 True）。
+        # 注意：开关在 ``[replyer_post_process]`` 节（1.4.5 前在 ``[plugin]``），**不是** ``quote_cfg``（0.14.1 修复误读）。
         at_with_space = self._at_trailing_space()
         if bool(quote_cfg.quote_once_per_target) and self._quoted_before(session_id, reply_message_id):
             self.ctx.logger.debug(
@@ -975,7 +976,7 @@ class QuoteTakeoverMixin:
 
         为什么需要（0.13.17）：正文开头是"字面 @别人"时本插件会**跳过 @ 注入、原样发出**，
         于是那条消息的空格数**完全由模型写的文本决定**（实测 0 / 1 / 2 都可能）——
-        而插件自己注入真实 at 时空格数是**恒定**的（由 ``[plugin] at_trailing_space`` 决定 0 或 1）。
+        而插件自己注入真实 at 时空格数是**恒定**的（由 ``[replyer_post_process] at_trailing_space`` 决定 0 或 1）。
         两条路口径不一致，群里就会看到"有时候 @ 后没空格、有时候一个、有时候两个"。
         这里把字面 @ 也对齐到"恰好一个"。
 
@@ -1060,7 +1061,7 @@ class QuoteTakeoverMixin:
     ) -> List[Any]:
         """把 at 组件插入组件列表首位（返回新列表，不修改入参）。
 
-        空格口径（0.13.12 起，由 ``[plugin] at_trailing_space`` 决定）：
+        空格口径（0.13.12 起，由 ``[replyer_post_process] at_trailing_space`` 决定）：
 
         - 注入前**一律**先 ``_strip_body_leading_whitespace`` 抹掉正文自带的前导空白 ——
           这一步无论补不补空格都要做，否则正文自带的空白会和渲染层的空格叠加；
