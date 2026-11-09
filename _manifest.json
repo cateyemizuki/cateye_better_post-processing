@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.cateye.better-post-processing",
-  "version": "2.4.6",
+  "version": "2.4.7",
   "name": "更好的消息后处理",
   "description": "QQ 消息回复增强：支持分段与打字节奏、错字生成和纠正、引用与 @ 权重、文本过滤、表情包互动及含义库、自回复与重复回复拦截、跨聊私聊回忆。适用于 MaiBot 1.4.x。",
   "author": {
