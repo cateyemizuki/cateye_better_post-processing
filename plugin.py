@@ -153,7 +153,8 @@
    合成记录（``ignore_self_messages``），连击保鲜时长可配
    （``streak_window_seconds``）。
 5. 出站文本规则（``[text_rules]``）：在 ``send_service.before_send`` 里对 bot
-   发出的纯文本组件应用 ``"词"replace"替换词"`` / ``"词"cover"覆盖文本"`` 规则，
+   发出的纯文本组件应用 ``r:词/替换词``（词替换，``r:词`` = 过滤该词）/
+   ``c:内容/替换文本``（整条替换，``c:内容`` = 含该内容的消息整条不发送）规则，
    格式错误的规则在加载时记录日志并忽略（见 ``text_rules.py``）。
    ``apply_scope="reply_flow"``（默认）时只作用于 **planner 拉起的本轮回复自己发出的
    消息**（宿主回复工具的分段，含错别字更正段）：宿主的出站 Hook 载荷里没有来源
@@ -240,7 +241,7 @@ from .emoji_meanings import (
     normalize_image_for_vlm,
     sha256_of_base64,
 )
-from .text_rules import ParsedRules, apply_rules, apply_replaces, find_cover, parse_rules
+from .text_rules import ParsedRules, apply_replaces, evaluate_rules, parse_rules
 from .modules.post_process_takeover import (
     _HOST_MIRROR_EXTRA_FIELDS,
     _HOST_MIRROR_FIELDS,
@@ -266,7 +267,7 @@ from .modules.requirements import (
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.4.5"
+SUPPORTED_CONFIG_VERSION = "2.4.6"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -382,6 +383,10 @@ _ROUND_SENT_ID_MAX_ENTRIES = 20
 
 # 文本规则归属判定里"首条分段等待窗"的兜底秒数（宿主配置为 0 时使用）。
 _REPLY_FLOW_ARM_FALLBACK_SECONDS = 20.0
+
+# ``_apply_text_rules_to_message`` 的特殊返回值：命中 ``c:内容``（无替换文本）时
+# 整条消息必须阻止发送。布尔返回值无法表达"丢弃"，用独立哨兵避免与 True/False 混淆。
+_TEXT_RULES_DROPPED = object()
 
 # @ 独占（1.4.2）：EARLY 登记的"本插件保留的 at 目标"标记的 TTL 与容量上限。
 # 标记供 LATE 兜底区分自有 @ 与其它插件后补的 @；正常同一钩子链内即被消费，
@@ -2493,7 +2498,7 @@ class CrossChatRecallSectionConfig(PluginConfigBase):
 
 
 class TextRulesSectionConfig(PluginConfigBase):
-    """对 bot 出站纯文本做替换或整条覆盖。"""
+    """对 bot 出站纯文本做词替换/过滤，或整条替换/过滤。"""
 
     __ui_label__ = "文本替换规则"
     __ui_icon__ = "find_replace"
@@ -2508,16 +2513,24 @@ class TextRulesSectionConfig(PluginConfigBase):
     rules: List[str] = Field(
         default_factory=list,
         description=(
-            '规则列表，每条形如 "shit"replace"filter"（把消息中的 shit 替换为 filter）'
-            '或 "草"cover"你好"（包含"草"的消息整条覆盖为"你好"）；格式错误的条目会被忽略'
+            "每行一条：r:词/替换词 = 把命中的词替换掉（r:词 或 r:词/ = 过滤该词）；"
+            "c:内容/替换文本 = 消息含该内容时把整条文本替换掉（c:内容 或 c:内容/ = "
+            "含该内容的消息整条不发送）。# 开头为注释；关键词里的 / 写成 \\/。格式错误的条目会被忽略"
         ),
         json_schema_extra={
-            "label": "替换/覆盖规则",
-            "x-toml-comment": "出站文本规则：replace=a=>b 词替换，cover=前缀=>整条覆盖，# 开头为注释。",
+            "label": "替换/过滤规则",
+            "x-toml-comment": (
+                "出站文本规则（每行一条，# 开头为注释）："
+                "r:词/替换词=词替换，r:词 或 r:词/=过滤该词；"
+                "c:内容/替换文本=整条替换，c:内容 或 c:内容/=含该内容的消息整条不发送。"
+            ),
             "rows": 6,
             **_ui_i18n(
                 "Rules",
-                'One item per rule: "word"replace"new" replaces occurrences, "word"cover"text" overwrites the whole text when it contains the word. Malformed items are ignored.',
+                "One rule per line: r:word/replacement replaces occurrences (r:word or r:word/ filters the word); "
+                "c:match/replacement overwrites the whole text when the message contains match "
+                "(c:match or c:match/ drops the whole message). Lines starting with # are comments; "
+                "write \\/ for a literal slash in the keyword. Malformed items are ignored.",
             ),
         },
     )
@@ -3060,7 +3073,7 @@ class BetterPostProcessingPlugin(
             "插件已加载。引用回复开关=%s，插件接管=%s（群聊权重 %s / 私聊权重 %s；"
             "群聊接管=%s 只引用一次=%s，私聊接管=%s 只引用一次=%s）；"
             "回复后表情包=%s（p=%.2f，planner 表情工具=%s）；"
-            "表情包跟风=%s（mode=%s, threshold=%s, 忽略自身=%s）；文本规则：replace=%d, cover=%d, 忽略=%d；"
+            "表情包跟风=%s（mode=%s, threshold=%s, 忽略自身=%s）；文本规则：r=%d, c=%d, 过滤=%d, 忽略=%d；"
             "表情包含义库=%s（已收录 %d 条）；聊天流表情冷却=%.0f 秒",
             self._cfg.get("enable_reply_quote"),
             self._quote_takeover_active(),
@@ -3079,6 +3092,7 @@ class BetterPostProcessingPlugin(
             self.config.emoji_follow.ignore_self_messages,
             len(self._parsed_rules.replaces),
             len(self._parsed_rules.covers),
+            self._parsed_rules.filter_count,
             len(self._parsed_rules.invalid),
             "启用" if self._meaning_store is not None else "不可用",
             self._meaning_store.count() if self._meaning_store is not None else 0,
@@ -3143,9 +3157,10 @@ class BetterPostProcessingPlugin(
             self._self_reply_guard_on_config_update()
             await self._cross_chat_recall_on_config_update(version)
             self.ctx.logger.info(
-                "插件配置已更新：文本规则 replace=%d, cover=%d, 忽略=%d；回复方式权重 群聊=%s 私聊=%s",
+                "插件配置已更新：文本规则 r=%d, c=%d, 过滤=%d, 忽略=%d；回复方式权重 群聊=%s 私聊=%s",
                 len(self._parsed_rules.replaces),
                 len(self._parsed_rules.covers),
+                self._parsed_rules.filter_count,
                 len(self._parsed_rules.invalid),
                 self._reply_style_weights,
                 self._reply_style_weights_private,
@@ -3384,12 +3399,19 @@ class BetterPostProcessingPlugin(
             self.ctx.logger.warning("过滤假 @ 失败，保持原样: %s", exc)
 
         try:
-            changed = self._apply_text_rules_to_message(
+            rule_result = self._apply_text_rules_to_message(
                 message,
                 session_id=session_id,
                 reply_message_id=reply_message_id,
                 own_follow_up=own_follow_up,
-            ) or changed
+            )
+            if rule_result is _TEXT_RULES_DROPPED:
+                self.ctx.logger.info(
+                    "出站文本规则：命中整条过滤，已阻止发送（会话 %s）",
+                    session_id[:12] or "?",
+                )
+                return {"action": "abort", "abort_message": "出站文本规则命中整条过滤"}
+            changed = bool(rule_result) or changed
         except Exception as exc:
             self.ctx.logger.warning("出站文本规则应用失败，跳过: %s", exc)
 
@@ -3720,8 +3742,12 @@ class BetterPostProcessingPlugin(
         session_id: str = "",
         reply_message_id: str = "",
         own_follow_up: bool = False,
-    ) -> bool:
-        """对出站消息的纯文本组件应用替换/覆盖规则（原地修改传入副本）；有改动返回 True。
+    ) -> Any:
+        """对出站消息的纯文本组件应用替换/过滤规则（原地修改传入副本）。
+
+        Returns:
+            ``False`` = 无改动；``True`` = 文本已改写；``_TEXT_RULES_DROPPED`` =
+            命中 ``c:内容``（无替换文本）或词过滤把整条消息删空，调用方必须 abort。
 
         ``apply_scope="reply_flow"``（默认）时只处理**本轮回复自己发出的消息**
         （宿主回复工具拉起的正常回复流程，含多段发送由插件补发的分段），其它插件用
@@ -3759,21 +3785,30 @@ class BetterPostProcessingPlugin(
         if not full_text:
             return False
 
-        covered = find_cover(apply_replaces(full_text, rules.replaces), rules.covers)
-        if covered:
-            # 命中覆盖规则：整条文本替换为覆盖内容（保留首个文本组件的位置）。
+        outcome = evaluate_rules(full_text, rules)
+        if outcome.dropped:
+            # 命中 c:内容（无替换文本）：整条消息不发出。
+            return _TEXT_RULES_DROPPED
+
+        if outcome.cover_hit is not None:
+            # 命中 c:内容/替换文本：整条文本替换为覆盖内容（保留首个文本组件的位置）。
             rebuilt: List[Any] = []
             written = False
             for index, component in enumerate(components):
                 if index in text_set:
                     if not written:
-                        rebuilt.append({"type": "text", "data": covered})
+                        rebuilt.append({"type": "text", "data": outcome.text})
                         written = True
                     continue
                 rebuilt.append(component)
             message["raw_message"] = rebuilt
-            message["processed_plain_text"] = covered
+            message["processed_plain_text"] = outcome.text
             return True
+
+        has_non_text = any(index not in text_set for index in range(len(components)))
+        if not outcome.text.strip() and not has_non_text:
+            # r:词（无替换文本）把整条消息删空：没有可发送的内容，等同于整条过滤。
+            return _TEXT_RULES_DROPPED
 
         new_components: List[Any] = []
         changed = False
@@ -3782,7 +3817,7 @@ class BetterPostProcessingPlugin(
                 new_components.append(component)
                 continue
             original_text = str(component.get("data") or "")
-            new_text = apply_rules(original_text, rules)
+            new_text = apply_replaces(original_text, rules.replaces)
             if new_text != original_text:
                 new_component = dict(component)
                 new_component["data"] = new_text
@@ -3792,11 +3827,31 @@ class BetterPostProcessingPlugin(
                 new_components.append(component)
 
         if changed:
-            message["raw_message"] = new_components
+            filtered: List[Any] = []
+            for component in new_components:
+                if (
+                    isinstance(component, dict)
+                    and str(component.get("type") or "") == "text"
+                    and not str(component.get("data") or "")
+                ):
+                    continue
+                filtered.append(component)
+            message["raw_message"] = filtered
             processed = message.get("processed_plain_text")
             if isinstance(processed, str) and processed:
-                message["processed_plain_text"] = apply_rules(processed, rules)
+                message["processed_plain_text"] = apply_replaces(processed, rules.replaces)
         return changed
+
+    def _text_rules_would_drop(self, text: str) -> bool:
+        """文本规则是否会把这条文本整条过滤（供补发分段提前跳过，避免 abort 重试）。"""
+        rules = self._parsed_rules
+        if not rules or not self._plugin_enabled():
+            return False
+        outcome = evaluate_rules(text, rules)
+        if outcome.dropped:
+            return True
+        # r:词 把整条文本删空，同样没有可发送的内容。
+        return bool(text.strip()) and not outcome.text.strip()
 
     def _is_group_message(self, message: Dict[str, Any]) -> bool:
         """该消息是否来自群聊。
