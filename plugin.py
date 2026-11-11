@@ -263,6 +263,8 @@ from .modules.quote_takeover import QuoteTakeoverMixin
 from .modules.status_command import StatusCommandMixin
 from .modules.reply_cleanup import ReplyCleanupMixin
 from .modules.at_cooldown import AtCooldownMixin
+# B4 联动批：life 跨插件认领桥（@API bpp_life_bridge）
+from .modules.life_bridge import LifeBridgeMixin
 # 1.4.5：替换宿主 replyer「简短表达」尾部提示词（默认关闭）
 from .modules.replyer_tail_prompt import ReplyerTailPromptMixin
 # 阶段 3 合并（1.2.0，迁自两个旧插件；旧插件目录原样保留）
@@ -2820,6 +2822,86 @@ class AtCooldownSectionConfig(PluginConfigBase):
     )
 
 
+class LifeBridgeSectionConfig(PluginConfigBase):
+    """与「属于麦麦的生活」（life）插件的跨插件联动桥（B4，默认不影响任何行为）。
+
+    没有 life 的显式认领时本段完全不改变后处理路径（fail-open）；认领只影响
+    life 是否让出打字时延，不改变本插件的分段/错字/发送链路。
+    """
+
+    __ui_label__ = "life 联动"
+    __ui_icon__ = "link"
+    __ui_order__ = 20
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {
+            "title": "life bridge",
+            "description": "Cross-plugin claim bridge for the life plugin. No claims = no behavior change.",
+        },
+    }
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "是否接受 life 插件的本轮后处理认领。关闭后 bpp 完全走原逻辑，life 会照常"
+            "自己模拟打字（与没有本插件时一致）。默认开启；没有认领时行为不变"
+        ),
+        json_schema_extra={
+            "label": "启用 life 联动桥",
+            "x-toml-comment": "接受 life 的认领（只影响 life 是否让出打字，不改变后处理路径）。",
+            **_ui_i18n(
+                "Enable life bridge",
+                "Accept per-round claims from the life plugin. Claims only decide who simulates "
+                "typing; post-processing is unchanged.",
+            ),
+        },
+    )
+    accept_policy_claims: bool = Field(
+        default=True,
+        description=(
+            "是否接受 mode=policy 的认领（life 只交出「本轮后处理归 bpp、打字归 bpp」的"
+            "策略信号，不提供分段文本）。full_text 模式本批未实现，恒拒绝"
+        ),
+        json_schema_extra={
+            "label": "接受 policy 认领",
+            "x-toml-comment": "接受 life 的 policy 认领；拒绝时 bpp 仍照常分段并打字。",
+            **_ui_i18n(
+                "Accept policy claims",
+                "Accept claim mode=policy. full_text is reserved and always rejected.",
+            ),
+        },
+    )
+    claim_ttl_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=120.0,
+        description="认领有效期（秒）：life 在发送前登记，bpp 在同一轮 before_post_process 消费；过期即失效，绝不跨轮",
+        json_schema_extra={
+            "label": "认领有效期（秒）",
+            "x-toml-comment": "认领只在有效期内、且同一消息文本上生效；默认 10 秒。",
+            **_ui_i18n(
+                "Claim TTL (seconds)",
+                "Claims expire after this many seconds and are single-round only.",
+            ),
+        },
+    )
+    require_yield_to_other_plugins: bool = Field(
+        default=True,
+        description=(
+            "尊重既有的 [response_splitter].yield_to_other_plugins：当本插件被配置为"
+            "「不让位其它插件」时，拒绝 life 的认领（但 typing_owner 仍为 bpp——本插件"
+            "仍会分段并模拟打字，life 照样让位）"
+        ),
+        json_schema_extra={
+            "label": "尊重让位开关",
+            "x-toml-comment": "不让位其它插件时拒绝认领，避免与既有让位协议冲突。",
+            **_ui_i18n(
+                "Respect yield switch",
+                "Reject claims when response_splitter.yield_to_other_plugins is disabled.",
+            ),
+        },
+    )
+
+
 class BetterPostProcessingConfig(PluginConfigBase):
     """插件完整配置。
 
@@ -2890,6 +2972,8 @@ class BetterPostProcessingConfig(PluginConfigBase):
     intercept_log: InterceptLogSectionConfig = Field(default_factory=InterceptLogSectionConfig)
     # ---- 1.4.0：每聊天流独立的 @ 冷却（默认开启）----
     at_cooldown: AtCooldownSectionConfig = Field(default_factory=AtCooldownSectionConfig)
+    # ---- B4 联动批：life 跨插件认领桥（无认领时零行为变化）----
+    life_bridge: LifeBridgeSectionConfig = Field(default_factory=LifeBridgeSectionConfig)
 
 
 class BetterPostProcessingPlugin(
@@ -2902,6 +2986,7 @@ class BetterPostProcessingPlugin(
     ReplyCleanupMixin,
     AtCooldownMixin,
     ReplyerTailPromptMixin,
+    LifeBridgeMixin,
     MaiBotPlugin,
 ):
     """回复后处理接管、回复方式抽取、表情包互动与出站文本规则增强插件。
@@ -2999,6 +3084,8 @@ class BetterPostProcessingPlugin(
         # 阶段 3 合并模块（默认关闭）：自回复/重复回复拦截与跨聊私聊回忆的状态初始化。
         self._init_self_reply_guard()
         self._init_cross_chat_recall()
+        # B4 联动批：life 认领表（进程内、TTL；无认领时零行为变化）
+        self._init_life_bridge()
 
     # ------------------------------------------------------------------
     # 配置生成（宿主现值作为默认值 + 给 config.toml 补行尾注释）
@@ -3235,6 +3322,8 @@ class BetterPostProcessingPlugin(
         self._pending_at_targets.clear()
         self._own_at_marks.clear()
         self._text_rule_blocks.clear()
+        # B4：卸载即清空认领（不残留到下一进程/下一轮）
+        self._life_claims.clear()
         if self._meaning_store is not None:
             self._meaning_store.close()
             self._meaning_store = None
@@ -3246,6 +3335,9 @@ class BetterPostProcessingPlugin(
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             self._rebuild_derived_state()
+            # B4：关闭联动桥时清空未消费认领，life 下一轮会得到 active/accepted=False。
+            if not self._life_bridge_enabled():
+                self._life_claims.clear()
             # 阶段 3 合并模块：拦截独立日志按新配置重建；跨聊私聊回忆在模块被打开时补齐运行时。
             self._self_reply_guard_on_config_update()
             await self._cross_chat_recall_on_config_update(version)

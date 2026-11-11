@@ -1636,8 +1636,34 @@ class PostProcessTakeoverMixin:
         if not self._post_process_takeover_active():
             return {"action": "continue", "modified_kwargs": modified}
 
+        # B4 联动批（v2 §6.2）：先窥探本轮 life 认领，用于「已让位给第三方」的告警；
+        # 认领本身不改变任何后处理路径（fail-open）。
+        life_claim = self._life_bridge_claim_for_round(modified, consume=False)
         if self._yield_to_other_plugins(modified):
+            if life_claim is not None:
+                # §6.2 前置约束：life 已让出打字，而 bpp 又让位给第三方 → 本轮可能无人打字。
+                self._life_bridge_stats["orphaned"] += 1
+                self.ctx.logger.warning(
+                    "life 联动：本轮存在 life 认领（claim_id=%s），但 bpp 已让位给其它插件"
+                    "（skip_post_process=True）——life 可能已让出打字，请检查是否并存第三方分段插件",
+                    life_claim.get("claim_id"),
+                )
+                self._life_bridge_note(
+                    "life_bridge_orphaned",
+                    claim_id=str(life_claim.get("claim_id") or ""),
+                    stream_id=str(life_claim.get("stream_id") or ""),
+                )
             return {"action": "continue", "modified_kwargs": modified}
+
+        # 认领消费只发生在本轮 bpp 真正接管时：单轮有效，取走即删（TTL 兜底）。
+        life_claim = self._life_bridge_claim_for_round(modified, consume=True)
+        if life_claim is not None:
+            self._life_bridge_note(
+                "life_bridge_round_claimed",
+                claim_id=str(life_claim.get("claim_id") or ""),
+                stream_id=str(life_claim.get("stream_id") or ""),
+                mode=str(life_claim.get("mode") or ""),
+            )
 
         response = str(modified.get("response") or "").strip()
         if not response:
