@@ -4,11 +4,28 @@
 > 功能条目；**0.x 时代**的全部更新按次级版本号合并回溯（0.9.0 及更早没有逐条留档，按代码
 > 注释与 README 版本标注整理）。各功能的当前行为以 [`README.md`](README.md) 为准。
 
-## 维护状态（2026-11-10）
+## 维护状态（2026-11-11）
 
-- `main` 分支继续维护 **MaiBot <=1.3.99** 兼容线（当前 1.4.7）。
+- `main` 分支继续维护 **MaiBot <=1.3.99** 兼容线（当前 1.4.8）。
 - MaiBot 1.4.0+ 请使用 [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0)
-  分支（当前 1.4.7；1.4.3 起移除已从宿主删除的 `emoji.maisaka.before_select` Hook）。
+  分支（当前 1.4.8；1.4.3 起移除已从宿主删除的 `emoji.maisaka.before_select` Hook）。
+
+## 1.4.8（2026-11-11）
+
+- **与「属于麦麦的生活」（life）联动：认领让位**：新增进程内 TTL 认领表
+  （`modules/life_bridge.py`，默认 10 秒、单轮、同流覆盖）与 `@API bpp_life_bridge`
+  （`claim` / `release` / `status`，返回 `active` / `accepted` / `typing_owner` /
+  `reason`；`full_text` 预留恒拒绝）。life 在每轮回复后处理前登记认领；只有本插件
+  **后处理接管实际生效**时才消费认领并模拟打字，`typing_owner` 恒为 `bpp`，
+  life 据此让位、避免双重等待。
+- **无认领零行为变化（fail-open）**：没有有效认领时 `handle_before_post_process`
+  原逻辑逐字不变；life 未安装 / 未开启 / 超时 / 被拒绝时照常走自己原有的打字链。
+  检测到 `skip_post_process=True` 且存在 life 认领时记 warning 与独立日志，提示
+  可能并存第三方分段插件（认领仍不跨轮生效）。
+- **配置**：新增 `[life_bridge]` 4 键（`enabled` / `accept_policy_claims` /
+  `claim_ttl_seconds` / `require_yield_to_other_plugins`），默认无认领零行为变化；
+  插件卸载/关闭时清空认领。
+- 版本与 `config_version` → **1.4.8**。
 
 ## 1.4.7（2026-11-10）
 

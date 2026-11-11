@@ -280,7 +280,7 @@ from .modules.requirements import (
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.4.7"
+SUPPORTED_CONFIG_VERSION = "1.4.8"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
