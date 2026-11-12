@@ -37,6 +37,7 @@
 | 18 | `[duplicate_reply_guard]` | 重复回复拦截（1.2.0 合并；**默认关闭**） |
 | 19 | `[intercept_log]` | 拦截独立日志（1.2.0 合并；默认开启） |
 | 20 | `[at_cooldown]` | 每聊天流独立的 @ 冷却（1.4.0；默认开启、15 秒） |
+| 21 | `[life_bridge]` | 与「属于麦麦的生活」（life）的跨插件认领桥（1.4.8；默认开启，无认领时零行为变化） |
 
 ### 三条通用规则
 
@@ -1195,6 +1196,28 @@ planner 按需补录**不再重试它**——否则每轮 planner 都会把它�
 | `enabled` | `True` | 是否启用 @ 冷却。 |
 | `seconds` | `15` | 冷却时长（秒）：同一聊天流两次 @ 的最小间隔；`0` = 不冷却（等于关闭）。 **取值范围** `0~`。 |
 
+### `[life_bridge]` 与 life 联动（1.4.8，默认开启，无认领时零行为变化）
+
+> 目的：让「属于麦麦的生活」（life）在每轮回复的后处理前向本插件登记一条**单轮认领**，
+> 认领生效时由本插件模拟打字、life 让位，避免 life 与本插件**双重等待**。
+> 没有有效认领（life 未安装 / 未开启 / 超时 / 被拒绝）时，`handle_before_post_process`
+> 原逻辑**逐字不变**，life 照常走自己的打字链（fail-open）。
+
+- 认领表在进程内，按 `session_id` 覆盖，**单轮有效、绝不跨轮**；插件卸载/关闭时清空。
+- 对外接口：`@API bpp_life_bridge`（`claim` / `release` / `status`，返回
+  `active` / `accepted` / `typing_owner` / `reason`）；`mode=full_text` 为预留能力，
+  **恒拒绝**。
+- 只有本插件**后处理接管实际生效**时才消费认领并模拟打字；`typing_owner` 恒为 `bpp`。
+- 检测到 `skip_post_process=True` 且存在 life 认领时记 warning 与独立日志，提示可能
+  并存第三方分段插件（认领仍不跨轮生效）。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `True` | 是否接受 life 插件的本轮后处理认领。关闭后 bpp 完全走原逻辑，life 照常自己模拟打字（与没有本插件时一致）；没有认领时行为不变。 |
+| `accept_policy_claims` | `True` | 是否接受 `mode=policy` 的认领（life 只交出「本轮后处理归 bpp、打字归 bpp」的策略信号，不提供分段文本）；`mode=full_text` 预留未实现，**恒拒绝**；拒绝时 bpp 仍照常分段并打字。 |
+| `claim_ttl_seconds` | `10.0` | 认领有效期（秒）。life 在发送前登记，bpp 在同一轮 `before_post_process` 消费；过期即失效、绝不跨轮。**取值范围** `1.0~120.0`。 |
+| `require_yield_to_other_plugins` | `True` | 尊重既有的 `[response_splitter].yield_to_other_plugins`：当本插件被配置为「不让位其它插件」时拒绝 life 的认领（但 `typing_owner` 仍为 `bpp`——本插件仍分段并模拟打字，life 照样让位），避免与既有让位协议冲突。 |
+
 ### WebUI 显示与翻译（0.6.1；提示文本 0.11.1）
 
 - 所有配置字段都有中文短标签（`label`），不再显示英文变量名；详细说明悬停在
@@ -1209,6 +1232,6 @@ planner 按需补录**不再重试它**——否则每轮 planner 都会把它�
   `i18n.en.hint`，未命中时回退到这句中文。
 - **板块标题下的那行说明（0.12.2 起只写一句话）**：它取的是配置类的 `__doc__`，而
   `maibot_sdk` 只做 `strip()`、**不做 dedent**——多行 docstring 会带着源码缩进显示成一坨。
-  所以本插件的 17 个板块 docstring 一律一句话（12~23 字），设计说明与历史沿革写成类上方的
+  所以本插件的 21 个板块 docstring 一律一句话（12~23 字），设计说明与历史沿革写成类上方的
   `#` 注释保留在源码里。
 
