@@ -242,13 +242,12 @@ from .emoji_meanings import (
     build_emoji_content_suffix,
     build_generation_messages,
     build_tagged_emoji_label,
-    detect_image_format,
     EMOJI_CONTENT_SUFFIX_PREFIX,
     EMOJI_LABEL_PATTERN,
     extract_emoji_refs_from_message,
-    normalize_image_for_vlm,
     sha256_of_base64,
 )
+from .modules.emoji_recognition import EmojiRecognitionMixin
 from .text_rules import ParsedRules, apply_replaces, evaluate_rules, parse_rules
 from .planner_notice import build_rule_block_notice, insert_planner_tail_notice
 from .modules.post_process_takeover import (
@@ -280,7 +279,7 @@ from .modules.requirements import (
 # 内置总结提示词（跨聊私聊回忆）：配置默认值直接暴露**全文**，清空则回退到它（见 summarizer）。
 from .summarizer import DEFAULT_SUMMARY_PROMPT
 
-SUPPORTED_CONFIG_VERSION = "1.4.8"
+SUPPORTED_CONFIG_VERSION = "1.5.0"
 
 # 项目根目录（插件位于 <root>/plugins/<plugin_dir>/，用于定位宿主 depends-data 里的字频表）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -2977,6 +2976,7 @@ class BetterPostProcessingConfig(PluginConfigBase):
 
 
 class BetterPostProcessingPlugin(
+    EmojiRecognitionMixin,
     StatusCommandMixin,
     QuoteTakeoverMixin,
     PostProcessTakeoverMixin,
@@ -3049,6 +3049,7 @@ class BetterPostProcessingPlugin(
         # "强制直发阈值"被「对话已推进阈值」压制时首次用 info 记录，后续降为 debug。
         self._direct_threshold_clamped_logged = False
         # 表情包含义库与补录队列（**键统一是宿主 image_hash / sha256**）。
+        self._init_emoji_recognition()
         self._meaning_store: Optional[EmojiMeaningStore] = None
         # 待补录队列：(image_hash, 描述)；描述只用于展示与回退键。
         self._meaning_queue: Deque[Tuple[str, str]] = deque()
@@ -3112,10 +3113,11 @@ class BetterPostProcessingPlugin(
         """先做旧配置迁移（见 ``migrate_legacy_config``），再走 SDK 的校验与补齐。
 
         排版变更会让老键"消失"，不迁移的话用户改过的权重/开关会在升级时被静默重置。
-        注意：宿主 Runner 在调用本方法之前会先 ``rebuild_plugin_config_data``（以默认值补齐、
+        注意：早期宿主 Runner 在调用本方法之前会先 ``rebuild_plugin_config_data``（以默认值补齐、
         丢弃新结构里没有的旧键），所以**主要靠 ``get_default_config`` 里把旧值带进默认值**
         （见 ``_legacy_config_values``）；这里是第二道保险，负责 WebUI 直接提交旧格式数据的场景。
         """
+        self._capture_previous_config_version(config_data)
         return super().normalize_plugin_config(migrate_legacy_config(dict(config_data or {})))
 
     def _legacy_config_values(self) -> Dict[str, Any]:
@@ -3136,6 +3138,7 @@ class BetterPostProcessingPlugin(
         except Exception as exc:  # 读不动就当没有（不影响插件运行）
             self._log_quiet("debug", "读旧配置用于迁移失败（忽略）: %s", exc)
             return {}
+        self._capture_previous_config_version(raw)
         migrated = migrate_legacy_config(raw)
         plugin_section = migrated.get("plugin")
         if isinstance(plugin_section, dict):
@@ -5091,6 +5094,7 @@ class BetterPostProcessingPlugin(
             store = EmojiMeaningStore(Path(str(data_dir)) / "emoji_meanings.db")
             store.initialize()
             self._meaning_store = store
+            self._prepare_gif_upgrade(SUPPORTED_CONFIG_VERSION)
         except Exception as exc:
             self._meaning_store = None
             self.ctx.logger.warning("表情包含义库初始化失败，含义补录与注入不可用: %s", exc)
@@ -5143,7 +5147,7 @@ class BetterPostProcessingPlugin(
     async def handle_planner_emoji_meaning_scan(self, **kwargs: Any) -> None:
         """planner 按需补录：只补"这一轮真的出现在上下文里"的表情包。
 
-        这是**唯一**的批量补录通道：token 消耗随实际使用量走、不随表情库规模走。
+        这是**日常**的批量补录通道：token 消耗随实际使用量走；版本升级另有旧 GIF 重识别队列。
         （0.13.11 起移除了「库扫描补录」——全库扫描既慢又贵，而没出现在上下文里的表情包
         本来也不影响聊天。）
 
@@ -5589,7 +5593,7 @@ class BetterPostProcessingPlugin(
                 await asyncio.sleep(max(5.0, float(self.config.emoji_meaning.worker_interval_seconds)))
                 # 循环无条件启动，顺带承担全局状态清理的节拍（不依赖回复轮标记触发）。
                 self._prune_stale_state(time.monotonic())
-                if self.config.emoji_meaning.enabled and self._meaning_store is not None:
+                if self._plugin_enabled() and self.config.emoji_meaning.enabled and self._meaning_store is not None:
                     self._flush_meaning_usage()
                     await self._purge_expired_meanings()
                     await self._process_meaning_batch()
@@ -5644,80 +5648,6 @@ class BetterPostProcessingPlugin(
                 ttl_days,
                 self._meaning_store.count(),
             )
-
-    async def _process_meaning_batch(self) -> None:
-        """处理一批待补录表情包：**按 hash 取图** → 调 VLM 生成 → 按 hash 入库。
-
-        取图顺序：① 入站载荷自带的 base64 缓存（最省，见 ``_remember_inline_emoji_bytes``）；
-        ② 按 hash 读宿主图片文件（``data/images/<hash>.<ext>`` 或 ``Images.full_path``）；
-        ③ 仍拿不到才退回 ``emoji.get_random`` 抽样——抽样载荷不含 hash，改在本地对抽到的
-        base64 算 sha256 与目标比对（宿主 ``emoji.get_all`` 会把整库 base64 塞进单个 RPC 帧，
-        大库超过 16MB 帧上限、线上实测 47MB 被拒，所以抽样是唯一可用的能力通道）。
-
-        **三条路都只产出 base64 字符串**，格式一律由 ``normalize_image_for_vlm`` 按真实魔数给出
-        （需要时转 PNG），所以不存在"格式串与字节对不上"的可能；不是图片的字节直接跳过，
-        不会拿空图去问视觉模型。
-        """
-        cfg = self.config.emoji_meaning
-        batch: List[Tuple[str, str]] = []
-        while self._meaning_queue and len(batch) < cfg.batch_size:
-            image_hash, description = self._meaning_queue.popleft()
-            self._meaning_queued.discard(image_hash)
-            batch.append((image_hash, description))
-        if not batch:
-            return
-
-        sample: Optional[Dict[str, str]] = None
-        for image_hash, description in batch:
-            image_base64 = self._take_inline_emoji_bytes(image_hash)
-            if image_base64 is None:
-                image_base64 = await self._load_emoji_bytes_by_hash(image_hash)
-            if image_base64 is None:
-                if sample is None:
-                    sample = await self._sample_emoji_images()
-                if sample is None:
-                    # 抽样失败（帧超限等）：该条顺延，抽样张数已自适应下调。
-                    self._enqueue_emoji_meaning(image_hash, description, force=True)
-                    continue
-                image_base64 = sample.get(image_hash)
-            if not image_base64:
-                # 三条路都拿不到这张图：不计入生成失败次数，等待后续轮次。
-                self._record_meaning_sample_miss(image_hash, description)
-                continue
-            # 上传前统一规范化：格式必属宿主白名单、base64 必能被 validate=True 解码。
-            # 动图会在这里被**取首帧转 PNG**，所以"送给模型的格式"与"宿主那份字节的格式"
-            # 可能不同：库里记**宿主侧原始格式**（注入文本要如实说这是张什么格式的表情包），
-            # 送给模型的用规范化后的格式。
-            host_format = detect_image_format(image_base64)
-            normalized = normalize_image_for_vlm(image_base64)
-            if normalized is None:
-                detected = host_format or "无法识别"
-                self.ctx.logger.warning(
-                    "表情包图片格式不可用，跳过（hash=%s，识别为 %s）", image_hash[:12], detected
-                )
-                self._record_meaning_failure(image_hash, description, f"图片格式不可用（{detected}）")
-                continue
-            image_payload, image_format = normalized
-            stored_format = host_format or image_format
-            try:
-                meaning = await self._generate_emoji_meaning(description, image_payload, image_format)
-            except Exception as exc:
-                self.ctx.logger.warning("表情包含义生成失败（hash=%s）: %s", image_hash[:12], exc)
-                self._record_meaning_failure(image_hash, description, str(exc))
-                continue
-            self._meaning_attempts.pop(image_hash, None)
-            self._meaning_misses.pop(image_hash, None)
-            if self._meaning_store.upsert(
-                image_hash, description, meaning, image_format=stored_format, source="scan"
-            ):
-                self.ctx.logger.info(
-                    "已收录表情包含义（hash=%s desc=%r 格式=%s%s，长度 %d）",
-                    image_hash[:12],
-                    description,
-                    stored_format,
-                    "" if image_format == stored_format else f"，送模型={image_format}",
-                    len(meaning),
-                )
 
     async def _sample_emoji_images(self) -> Optional[Dict[str, str]]:
         """随机抽样一批表情包图片，返回 ``sha256 -> base64``；失败返回 None。
@@ -5873,7 +5803,7 @@ class BetterPostProcessingPlugin(
         for root in self._resolve_host_roots():
             images_dir = root / "data" / "images"
             for ext in _IMAGE_FILE_EXTS:
-                loaded = self._read_image_file(images_dir / f"{normalized_hash}.{ext}")
+                loaded = await asyncio.to_thread(self._read_image_file, images_dir / f"{normalized_hash}.{ext}")
                 if loaded is not None:
                     return loaded
         try:
@@ -5901,9 +5831,9 @@ class BetterPostProcessingPlugin(
             return None
         path = Path(full_path)
         if path.is_absolute():
-            return self._read_image_file(path)
+            return await asyncio.to_thread(self._read_image_file, path)
         for root in self._resolve_host_roots():
-            loaded = self._read_image_file(root / path)
+            loaded = await asyncio.to_thread(self._read_image_file, root / path)
             if loaded is not None:
                 return loaded
         return None
@@ -5920,11 +5850,13 @@ class BetterPostProcessingPlugin(
         self._meaning_misses[image_hash] = misses
         self._enqueue_emoji_meaning(image_hash, description, force=True)
 
-    async def _generate_emoji_meaning(self, description: str, image_base64: str, image_format: str) -> str:
+    async def _generate_emoji_meaning(
+        self, description: str, image_base64: str, image_format: str, *, animated: bool = False
+    ) -> str:
         """调用视觉模型生成一条表情包的准确含义。"""
         cfg = self.config.emoji_meaning
         prompt_text = cfg.generation_prompt.strip() or DEFAULT_GENERATION_PROMPT
-        messages = build_generation_messages(prompt_text, image_base64, image_format)
+        messages = build_generation_messages(prompt_text, image_base64, image_format, animated=animated)
         result = await self.ctx.llm.generate(messages, model=cfg.model_task, max_tokens=cfg.max_tokens)
         if not isinstance(result, dict):
             raise RuntimeError(f"llm.generate 返回形态异常: {type(result).__name__}")

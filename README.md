@@ -1,8 +1,8 @@
 # 更好的消息后处理
 
-> **维护状态（2026-11-08）**：`main` 分支继续维护 **MaiBot <=1.3.99** 兼容线（当前 1.4.4，仅缺陷修复）。
-> MaiBot 1.4.0+ 请使用 [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0)
-> 分支（当前 1.4.5；1.4.3 起移除已从宿主删除的 `emoji.maisaka.before_select` Hook）。
+> **维护状态（2026-11-16）**：`main` 分支为 **1.5.0**，适用于 MaiBot **1.2.3–1.3.x**；
+> [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0) 分支为 **2.0.0**，适用于 MaiBot **1.4.x**。
+> 两条分支均支持 GIF 时序拼图识别，首次升级会分批重新识别含义库中的历史 GIF。
 
 <a id="使用前必读先关掉宿主这几个开关否则接管能力不生效"></a>
 

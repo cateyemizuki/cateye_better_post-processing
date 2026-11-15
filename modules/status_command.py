@@ -393,7 +393,8 @@ class StatusCommandMixin:
             enabled = bool(cfg.emoji_meaning.enabled)
             count = self._meaning_store.count() if self._meaning_store is not None else 0
             scope = "、".join(str(item) for item in (cfg.emoji_meaning.rewrite_scope or [])) or "不改写"
-            return enabled, f"已收录 {count} 条；标签替换范围={scope}"
+            pending = len(self._meaning_store.pending_reprocessing()) if self._meaning_store is not None else 0
+            return enabled, f"已收录 {count} 条；标签替换范围={scope}；GIF 待重识别 {pending} 条"
         if key == "text_rules":
             parsed = self._parsed_rules
             total = len(parsed.replaces) + len(parsed.covers)
