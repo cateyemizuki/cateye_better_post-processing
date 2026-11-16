@@ -1,17 +1,15 @@
-"""MaiBot 回复后处理的忠实复刻（插件内自包含实现）。
+"""MaiBot 回复后处理的插件内自包含实现。
 
-本模块对 MaiBot 内置的 ``src/chat/utils/utils.py`` 的
-``process_llm_response_segments`` 以及 ``src/chat/utils/typo_generator.py`` 的
-``ChineseTypoGenerator`` 做逐行复刻，使插件能在框架“回复后处理总开关”关闭时，
-以与 MaiBot 完全一致的后处理逻辑接管该功能。**1.1.0 起**，分段复刻已同步
-MaiBot **1.3.0** 的回复分割修复：分句保留每句的尾随分隔符，多段被压缩合并为
-一条消息时补回句间分隔符（``ProcessedResponseSegment.separator``）。
+错字生成与处理结构源自宿主；分段与纠正消息边界对照 MaiBot 1.4.5
+（上游提交 478f671e64467121fd3e39205c8d3507b5ce0bd6）。分句实现在
+sentence_splitter.py，共用宿主的长度概率合并策略，并修正省略号、配对引号、
+连续标点与强制换行的边界。
 
 来源与许可（重要）
 ------------------
 本文件**派生自 MaiBot**（https://github.com/Mai-with-u/MaiBot ，GPL-3.0）的
 ``src/chat/utils/utils.py`` 与 ``src/chat/utils/typo_generator.py``：分段、颜文字
-保护、长度/句数守卫、错字候选与概率等逻辑与上游逐行一致，其中相当一部分是**逐字
+保护、长度/句数守卫、错字候选与概率等逻辑源自上游，其中相当一部分是**逐字
 复制**（含正则字面量与中文行内注释）。因此本文件按上游同一协议 **GPL-3.0** 提供，
 本插件整体以 **GPL-3.0-or-later** 发布（见仓库 ``LICENSE`` 与 ``README.md`` 的
 「许可证」「致谢」两节）。**请勿**把本文件当作可单独按 MIT 使用的代码。
@@ -25,13 +23,12 @@ MaiBot **1.3.0** 的回复分割修复：分句保留每句的尾随分隔符，
 * 汉字频率表优先读取宿主 ``depends-data/char_frequency.json``（与 MaiBot 同一份，
   保证错字候选与原逻辑完全一致）；缺失时按原逻辑从 ``jieba`` 自带词典重建。
 
-所有确定性逻辑（分段、颜文字保护、长度/句数守卫、错字候选与概率）均与 MaiBot
-源码一致。**0.10.0 起**，"每条分段作为独立平台消息发送"由
+分段使用插件修正的边界规则，其余后处理结构保留宿主实现。**0.10.0 起**，"每条分段作为独立平台消息发送"由
 ``modules/post_process_takeover.py`` 用 Hook 组合 + ``ctx.send.text`` 复刻
 （首段走宿主原生发送链，其余分段由插件补发并按宿主打字速度模拟打字），
-本文件只负责产出与宿主一致的分段/纠正计划。
+本文件负责产出共享的分段/纠正计划。
 
-与宿主**有意不同**的三处（都在下面显式标注，方便比对上游改动）：
+与宿主**有意不同**的处理（都在下面显式标注，方便比对上游改动）：
 
 1. 整词同音替换的组合数硬上限（``_MAX_HOMOPHONE_COMBINATIONS``）：宿主无条件穷举，
    长词会指数爆炸把线程占死；
@@ -57,6 +54,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from .sentence_splitter import split_sentence_segments
 
 # 整词同音替换的候选组合数硬上限（**与宿主不同的一处**，见 ``_get_word_homophones``）。
 # 宿主原逻辑用 ``itertools.product(*candidates)`` 穷举"每个字的所有同音字"的全部组合，
@@ -185,6 +184,8 @@ class ProcessedResponseSegment:
     # 原始文本中紧跟本段的分隔符；多条消息被压缩合并为一条时，用它恢复句间的停顿
     # （同步 MaiBot 1.3.0 的回复分割修复）。
     separator: str = ""
+    # 与 MaiBot 1.4.5 对齐：纠正内容独占消息，不依赖引用开关。
+    is_correction: bool = False
 
 
 def build_default_fallback_replies(bot_nickname: str) -> List[str]:
@@ -615,135 +616,8 @@ def get_western_ratio(paragraph: str) -> float:
 
 
 def _split_into_sentence_segments(text: str) -> List[Tuple[str, str]]:
-    """将文本分割成 (句子, 尾随分隔符) 元组，并根据概率合并（复刻原逻辑）。
-
-    尾随分隔符是原始文本中紧跟该句的分隔符（最后一句为空字符串），供后续把多句
-    压缩回一条消息时恢复句间停顿（同步 MaiBot 1.3.0 的回复分割修复）。
-    """
-    import re
-
-    # 预处理：处理多余的换行符
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    text = re.sub(r"\n\s*([，,。;\s])", r"\n\1", text)
-    text = re.sub(r"([，,。;\s])\s*\n", r"\1\n", text)
-
-    len_text = len(text)
-    if len_text < 3:
-        if random.random() < 0.01:
-            return [(char, "") for char in text]
-        return [(text, "")]
-
-    quote_chars = {'"', "'", "“", "”", "‘", "’", "「", "」", "『", "』"}
-    inside_quote = [False] * len_text
-    in_quote = False
-    current_quote_char = ""
-    for idx, ch in enumerate(text):
-        if ch in quote_chars:
-            if not in_quote:
-                in_quote = True
-                current_quote_char = ch
-                inside_quote[idx] = False
-            else:
-                if ch == current_quote_char or ch in {'"', "'"} and current_quote_char in {'"', "'"}:
-                    in_quote = False
-                    current_quote_char = ""
-                inside_quote[idx] = False
-        else:
-            inside_quote[idx] = in_quote
-
-    separators = {"，", ",", " ", "。", ";", "\n"}
-    segments: List[Tuple[str, str]] = []
-    current_segment = ""
-
-    i = 0
-    while i < len(text):
-        char = text[i]
-        if char in separators:
-            if inside_quote[i]:
-                can_split = False
-            else:
-                if char == "\n":
-                    can_split = True
-                else:
-                    can_split = True
-                    if i > 0:
-                        prev_char = text[i - 1]
-                        if prev_char in {":", "："}:
-                            can_split = False
-                    if i < len(text) - 1:
-                        next_char = text[i + 1]
-                        if next_char in {":", "："}:
-                            can_split = False
-                    if can_split and char == " " and i > 0 and i < len(text) - 1:
-                        prev_char = text[i - 1]
-                        next_char = text[i + 1]
-                        dash_chars = {"-", "—"}
-                        if prev_char in dash_chars or next_char in dash_chars:
-                            can_split = False
-                        else:
-                            prev_is_alnum = prev_char.isdigit() or is_english_letter(prev_char)
-                            next_is_alnum = next_char.isdigit() or is_english_letter(next_char)
-                            if prev_is_alnum and next_is_alnum:
-                                can_split = False
-            if can_split:
-                if current_segment:
-                    segments.append((current_segment, char))
-                elif char in {" ", "\n"}:
-                    segments.append(("", char))
-                current_segment = ""
-            else:
-                current_segment += char
-        else:
-            current_segment += char
-        i += 1
-
-    if current_segment:
-        segments.append((current_segment, ""))
-
-    segments = [(content, sep) for content, sep in segments if content or sep]
-    if not segments:
-        return [(text, "")] if text else []
-
-    if len_text < 12:
-        split_strength = 0.2
-    elif len_text < 32:
-        split_strength = 0.6
-    else:
-        split_strength = 0.7
-    merge_probability = 1.0 - split_strength
-
-    merged_segments: List[Tuple[str, str]] = []
-    idx = 0
-    while idx < len(segments):
-        current_content, current_sep = segments[idx]
-        if (
-            idx + 1 < len(segments)
-            and current_content
-            and current_sep != "\n"
-            and random.random() < merge_probability
-        ):
-            next_content, next_sep = segments[idx + 1]
-            if next_content:
-                merged_segments.append((current_content + current_sep + next_content, next_sep))
-            else:
-                merged_segments.append((current_content, next_sep))
-            idx += 2
-        else:
-            merged_segments.append((current_content, current_sep))
-            idx += 1
-
-    # 提取最终的句子内容（保留尾随分隔符，供压缩拼接时恢复停顿）
-    sentence_segments = [(content, sep) for content, sep in merged_segments if content]
-    # 清理可能引入的空字符串和仅包含空白的字符串
-    sentence_segments = [
-        (sentence, sep) for sentence, sep in sentence_segments if sentence.strip()
-    ]
-    sentence_segments = [
-        (normalized_sentence, sep)
-        for sentence, sep in sentence_segments
-        if (normalized_sentence := re.sub(r"[^\S\r\n]*[\r\n]+[^\S\r\n]*", " ", sentence).strip())
-    ]
-    return sentence_segments
+    """沿用宿主 1.4.5 的规则与概率合并，修正收尾标点和配对引号边界。"""
+    return split_sentence_segments(text)
 
 
 def split_into_sentences_w_remove_punctuation(text: str) -> List[str]:
@@ -770,8 +644,12 @@ def _merge_groups(
         return [], []
 
     segment_count = len(segments)
-    required_starts = [index for index, segment in enumerate(segments) if index > 0 and segment.quote_previous]
-    group_starts = {0, *required_starts[: max_count - 1]}
+    group_starts = {0}
+    for index, segment in enumerate(segments):
+        if segment.is_correction or segment.quote_previous:
+            group_starts.add(index)
+            if index + 1 < segment_count:
+                group_starts.add(index + 1)
 
     evenly_spaced_starts: List[int] = []
     start_index = 0
@@ -804,6 +682,7 @@ def _merge_groups(
                 text="".join(merged_text_parts),
                 quote_previous=group[0].quote_previous,
                 separator=group[-1].separator,
+                is_correction=group[0].is_correction,
             )
         )
     return merged_segments, sorted_starts
@@ -829,7 +708,7 @@ class CorrectionDecision:
 
 @dataclass(frozen=True)
 class ResponsePlan:
-    """自定义纠正分支的分段计划：分段方式与宿主一致，纠正方式由插件决定。"""
+    """自定义纠正分支的分段计划：分段采用共享规则，纠正方式由插件决定。"""
 
     segments: List[ProcessedResponseSegment]
     corrections: Dict[int, CorrectionDecision]  # 紧跟该段之后执行（direct/quote/recall）
@@ -945,11 +824,9 @@ class PostProcessor:
     ) -> List[ProcessedResponseSegment]:
         """复刻 ``process_llm_response_segments``（跳过宿主总开关门控，主开关由插件判定）。
 
-        返回复刻后的分段列表；每条 ``ProcessedResponseSegment.text`` 与 MaiBot 完全一致，
-        ``quote_previous`` 标记也保留。
+        返回分段列表，保留 ``quote_previous`` 与 ``is_correction`` 标记。
 
-        **勿改这里的语句顺序与随机数调用顺序**：它是逐行复刻，RNG 序也必须一致
-        （差分测试 `test_better_post_processing_*` 会比对同种子下的输出）。
+        分句与接管路径共用同一套边界规则；普通分隔符保留宿主的概率合并策略。
         兜底回复恒用**宿主自带**的兜底提示词（``allow_custom=False``）——用户自定义的
         兜底提示词只作用于接管路径（``plan``），保证本方法的差分基线不漂移。
         """
@@ -986,7 +863,7 @@ class PostProcessor:
                         segments.append(
                             ProcessedResponseSegment(typoed_text, separator=sentence_separator)
                         )
-                        segments.append(ProcessedResponseSegment(typo_corrections, quote_previous=quote_previous))
+                        segments.append(ProcessedResponseSegment(typo_corrections, quote_previous=quote_previous, is_correction=True))
                     else:
                         segments.append(
                             ProcessedResponseSegment(sentence, separator=sentence_separator)
@@ -1268,6 +1145,7 @@ class PostProcessor:
                     text=recovered_text,
                     quote_previous=segment.quote_previous,
                     separator=segment.separator,
+                    is_correction=segment.is_correction,
                 )
                 for segment, recovered_text in zip(merged, recovered_sentences, strict=True)
             ]
