@@ -1,9 +1,9 @@
 # 更好的消息后处理
 
-> **发行线约定**：`main` 的插件大版本为 `1`，面向 MaiBot 1.4.0 以下；`host-1.4.0` 的插件大版本为 `2`，面向 MaiBot 1.4.x。本提交版本为 `2.5.0`（原编号 `2.0.0`）。
+> **发行线约定**：`main` 的插件大版本为 `1`，面向 MaiBot 1.4.0 以下；`host-1.4.0` 的插件大版本为 `2`，面向 MaiBot 1.4.x。本提交版本为 `2.5.1`（原编号 `2.0.1`）。
 
-> **维护状态（2026-11-16）**：`main` 分支为 **1.5.0**，适用于 MaiBot **1.2.3–1.3.x**；
-> [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0) 分支为 **2.5.0**，适用于 MaiBot **1.4.x**。
+> **维护状态（2026-11-16）**：`main` 分支为 **1.5.1**，适用于 MaiBot **1.2.3–1.3.x**；
+> [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0) 分支为 **2.5.1**，适用于 MaiBot **1.4.x**。
 > 两条分支均支持 GIF 时序拼图识别，首次升级会分批重新识别含义库中的历史 GIF。
 
 <a id="使用前必读先关掉宿主这几个开关否则接管能力不生效"></a>
@@ -179,7 +179,7 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 > 「撤回重发」纠错分支需要 `api.call` 能力，`/bpp` 状态命令需要 `send.forward`（合并转发）、
 > `render.html2png`（一图流）与 `send.image`（转发降级直发），**改动过 manifest 需完整重启 MaiBot**。
 
-> **分支说明**：`main` 1.5.0 对应 MaiBot 1.2.3–1.3.x；`host-1.4.0` 2.5.0 对应 MaiBot 1.4.x。
+> **分支说明**：`main` 1.5.1 对应 MaiBot 1.2.3–1.3.x；`host-1.4.0` 2.5.1 对应 MaiBot 1.4.x。
 
 **版本变更**见 [`CHANGELOG.md`](CHANGELOG.md)（1.0.0 起记录功能变更，更早版本按次级版本号合并回溯）。
 
@@ -326,7 +326,7 @@ manifest 声明 **17** 项能力，与代码里的实际调用一一对应（审
   | `intercept_log.py` | 拦截独立 JSONL 日志（1.2.0；迁自 cateye_duplicate_reply_guard） |
   | `helpers.py` / `injector.py` / `name_resolver.py` / `scanner.py` / `store.py` / `summarizer.py` / `logging_setup.py` | 跨聊私聊回忆的支撑模块（1.2.0；迁自 cateye_mai_cross-chat_recall，`logging_setup` 只随迁不初始化） |
   | `post_processing.py` | 宿主后处理算法逐行复刻（纯逻辑，可离线单测）+ 兜底提示词抽取 |
-  | `emoji_meanings.py` / `text_rules.py` | 表情包含义库存储与提示词 / 文本规则解析 |
+  | `emoji_meanings.py` / `sentence_splitter.py` / `text_rules.py` | 表情包含义库存储与提示词 / 文本规则解析 |
 
   各接管 / 兜底模块与命令模块以 **mixin** 形式被插件类继承——SDK 用 `dir(instance)` 收集组件，继承来的
   `@HookHandler` / `@Command` 一样会被注册；共享状态（`self._reply_rounds` 等）通过 `self` 访问。
