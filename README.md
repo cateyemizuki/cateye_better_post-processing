@@ -1,7 +1,11 @@
 # 更好的消息后处理
 
-> **维护状态（2026-11-16）**：`main` 分支为 **1.5.1**，适用于 MaiBot **1.2.3–1.3.x**；
-> [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0) 分支为 **2.0.1**，适用于 MaiBot **1.4.x**。
+> `main` 维护插件 2.x，适用于 MaiBot **1.4.x**。[legacy-1.3](https://github.com/cateyemizuki/cateye_better_post-processing/tree/legacy-1.3) 维护插件 1.x，适用于 MaiBot **1.2.3–1.3.x**。
+>
+> 插件市场按宿主版本选择已收录的发行版。手动安装可用 [MaiBot 1.4.x 的 v2.4.7](https://github.com/cateyemizuki/cateye_better_post-processing/releases/tag/v2.4.7) 或 [MaiBot 1.2.3–1.3.x 的 v1.5.0](https://github.com/cateyemizuki/cateye_better_post-processing/releases/tag/v1.5.0)。用 Git 维护旧宿主的安装时，请跟踪 `legacy-1.3`。
+>
+> 原 `host-1.4.0` 保留为迁移前的快照，2.x 的维护在 `main`。
+>
 > 两条分支均支持 GIF 时序拼图识别，首次升级会分批重新识别含义库中的历史 GIF。
 
 <a id="使用前必读先关掉宿主这几个开关否则接管能力不生效"></a>
