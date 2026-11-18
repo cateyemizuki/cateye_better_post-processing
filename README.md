@@ -1,9 +1,11 @@
 # 更好的消息后处理
 
-> **发行线约定**：`main` 的插件大版本为 `1`，面向 MaiBot 1.4.0 以下；`host-1.4.0` 的插件大版本为 `2`，面向 MaiBot 1.4.x。本提交版本为 `2.5.1`（原编号 `2.0.1`）。
-
-> **维护状态（2026-11-16）**：`main` 分支为 **1.5.1**，适用于 MaiBot **1.2.3–1.3.x**；
-> [`host-1.4.0`](https://github.com/cateyemizuki/cateye_better_post-processing/tree/host-1.4.0) 分支为 **2.5.1**，适用于 MaiBot **1.4.x**。
+> `main` 维护插件 2.x，适用于 MaiBot **1.4.x**。[legacy-1.3](https://github.com/cateyemizuki/cateye_better_post-processing/tree/legacy-1.3) 维护插件 1.x，适用于 MaiBot **1.2.3–1.3.x**。
+>
+> 插件市场按宿主版本选择已收录的发行版。手动安装可用 [MaiBot 1.4.x 的 v2.4.7](https://github.com/cateyemizuki/cateye_better_post-processing/releases/tag/v2.4.7) 或 [MaiBot 1.2.3–1.3.x 的 v1.5.0](https://github.com/cateyemizuki/cateye_better_post-processing/releases/tag/v1.5.0)。用 Git 维护旧宿主的安装时，请跟踪 `legacy-1.3`。
+>
+> 原 `host-1.4.0` 保留为迁移前的快照，2.x 的维护在 `main`。
+>
 > 两条分支均支持 GIF 时序拼图识别，首次升级会分批重新识别含义库中的历史 GIF。
 
 <a id="使用前必读先关掉宿主这几个开关否则接管能力不生效"></a>
@@ -179,7 +181,6 @@ Maibot出站消息增强插件，提供下列可分别开关的独立功能：
 > 「撤回重发」纠错分支需要 `api.call` 能力，`/bpp` 状态命令需要 `send.forward`（合并转发）、
 > `render.html2png`（一图流）与 `send.image`（转发降级直发），**改动过 manifest 需完整重启 MaiBot**。
 
-> **分支说明**：`main` 1.5.1 对应 MaiBot 1.2.3–1.3.x；`host-1.4.0` 2.5.1 对应 MaiBot 1.4.x。
 
 **版本变更**见 [`CHANGELOG.md`](CHANGELOG.md)（1.0.0 起记录功能变更，更早版本按次级版本号合并回溯）。
 
