@@ -211,6 +211,35 @@ def apply_replaces(text: str, replaces: Sequence[ReplaceRule]) -> str:
     return result
 
 
+def replace_text_parts(parts: Sequence[str], replaces: Sequence[ReplaceRule]) -> List[str]:
+    """按拼接后的文本匹配，替换内容放在匹配起始组件，保留其余组件的位置。"""
+    result = list(parts)
+    if len(result) == 1:
+        return [apply_replaces(result[0], replaces)]
+    for rule in replaces:
+        text = "".join(result)
+        if not rule.keyword or rule.keyword not in text:
+            continue
+        matches = re.finditer(re.escape(rule.keyword), text)
+        match = next(matches, None)
+        updated: List[str] = []
+        offset = 0
+        consumed_until = 0
+        for part in result:
+            limit = offset + len(part)
+            start = max(offset, consumed_until)
+            fragments: List[str] = []
+            while match is not None and match.start() < limit:
+                fragments.extend((text[start:match.start()], rule.replacement))
+                consumed_until = start = match.end()
+                match = next(matches, None)
+            fragments.append(text[start:limit])
+            updated.append("".join(fragments))
+            offset = limit
+        result = updated
+    return result
+
+
 def match_cover(text: str, covers: Sequence[CoverRule]) -> Optional[CoverRule]:
     """返回第一条命中的整条覆盖/过滤规则；没有命中时返回 ``None``。"""
     for rule in covers:

@@ -301,6 +301,20 @@ def test_disabled_rewriting_survives_both_host_config_upgrade_orders(tmp_path, m
     assert normalized["emoji_meaning"]["inject_into_chat_stream"] is False
 
 
+@pytest.mark.parametrize(
+    ("emoji", "expected"),
+    [
+        ({"rewrite_scope": [["planner"], 1]}, False),
+        ({"rewrite_scope": [["planner"], " replyer "]}, True),
+        ({"rewrite_scope": [["planner"], "planner"], "inject_into_chat_stream": False}, False),
+    ],
+)
+def test_legacy_scope_migration_ignores_nested_entries(emoji, expected):
+    config = {"plugin": {"config_version": "1.4.7"}, "emoji_meaning": emoji}
+    normalized, _ = implementation.BetterPostProcessingPlugin().normalize_plugin_config(config)
+    assert normalized["emoji_meaning"]["inject_into_chat_stream"] is expected
+
+
 def message(segments):
     return {"message_id": "m1", "session_id": "s1", "raw_message": segments,
             "processed_plain_text": " ".join(str(item["data"]) for item in segments), "platform": "qq"}
@@ -339,6 +353,43 @@ async def test_stream_first_unseen_gif_is_recognized_before_message_is_released(
     assert modified["raw_message"][0]["hash"] == key
     assert modified["raw_message"][0]["binary_data_base64"] == payload
     assert len(plugin.ctx.llm.calls) == 1 and not plugin._meaning_queue
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stream_messages_share_gif_recognition_without_requeue(plugin, monkeypatch):
+    payload = encoded_image()
+    key = core.sha256_of_base64(payload)
+    source = message([{"type": "emoji", "data": "[表情包]", "hash": key, "binary_data_base64": payload}])
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_generate = plugin.ctx.llm.generate
+
+    async def delayed_generate(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original_generate(*args, **kwargs)
+
+    original_ensure = plugin._ensure_meaning_generation
+    joined = asyncio.Event()
+
+    async def observe_join(image_hash, *args, **kwargs):
+        if image_hash in plugin._meaning_inflight:
+            joined.set()
+        return await original_ensure(image_hash, *args, **kwargs)
+
+    monkeypatch.setattr(plugin.ctx.llm, "generate", delayed_generate)
+    monkeypatch.setattr(plugin, "_ensure_meaning_generation", observe_join)
+    first = asyncio.create_task(plugin.handle_inbound_emoji_stream_meaning(message=source))
+    await asyncio.wait_for(entered.wait(), 2)
+    second = asyncio.create_task(plugin.handle_inbound_emoji_stream_meaning(message=source))
+    await asyncio.wait_for(joined.wait(), 2)
+    release.set()
+    results = await asyncio.gather(first, second)
+    await plugin._process_meaning_batch()
+
+    assert all("犹豫" in result["modified_kwargs"]["message"]["raw_message"][0]["data"] for result in results)
+    assert len(plugin.ctx.llm.calls) == 1
+    assert not plugin._meaning_queue and key not in plugin._meaning_queued
 
 
 @pytest.mark.skipif(not MODERN, reason="1.4.x 宿主专用")

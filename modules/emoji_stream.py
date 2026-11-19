@@ -91,7 +91,10 @@ class EmojiStreamMixin:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining > 0 and image_hash not in self._meaning_abandoned:
                     try:
-                        await asyncio.wait_for(self._ensure_meaning_generation(image_hash, description), remaining)
+                        await asyncio.wait_for(
+                            self._ensure_meaning_generation(image_hash, description, reuse_existing=True),
+                            remaining,
+                        )
                     except asyncio.TimeoutError:
                         self.ctx.logger.warning("聊天流表情识别等待超时，保留原消息，后台继续（hash=%s）", image_hash[:12])
                     used_hash, meaning, image_format = self._meaning_store.content_for_hash(image_hash)

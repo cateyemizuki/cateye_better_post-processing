@@ -37,9 +37,13 @@ class EmojiRecognitionMixin:
             self.ctx.logger.info("表情包含义库版本 %s -> %s：没有待重识别的 GIF，跳过", previous or "新库/旧库", version)
 
     async def _ensure_meaning_generation(
-        self, image_hash: str, description: str, sample_cache: Optional[Dict[str, Any]] = None
+        self, image_hash: str, description: str, sample_cache: Optional[Dict[str, Any]] = None, *,
+        reuse_existing: bool = False,
     ) -> bool:
         """同一哈希共享一次生成；调用方超时不会取消后台识别或丢失升级任务。"""
+        if reuse_existing and self._meaning_store.content_for_hash(image_hash)[1]:
+            # 调用方在排队等待期间，另一条消息可能已经完成了首次识别。
+            return True
         task = self._meaning_inflight.get(image_hash)
         if task is None:
             # 入站处理抢先识别时，移除尚未被后台工作循环消费的同一项。

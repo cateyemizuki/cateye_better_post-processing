@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.cateye.better-post-processing",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "name": "更好的消息后处理",
   "description": "增强 QQ 消息回复：支持分段与打字节奏、错字注入和纠正、引用与 @ 权重、文本替换和过滤、表情包互动，以及自回复与重复回复拦截、跨聊私聊回忆。表情包含义库使用视觉模型识别内容与梗，GIF 通过抽帧和时序拼图理解动作变化。适用于 MaiBot 1.4.x，含义直接附加到聊天流消息。",
   "author": {
@@ -49,7 +49,7 @@
     "llm.generate",
     "send.emoji",
     "send.text",
-    "send.image",
+    "send.hybrid",
     "send.forward",
     "render.html2png",
     "chat.get_all_streams",
