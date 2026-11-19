@@ -2,10 +2,8 @@
 
 提供两个子命令（同一个 ``@Command`` 组件，正则捕获子命令）：
 
-* ``/bpp``——把插件当前各模块的状态**用合并转发发送**（``send.forward`` 单节点）：
-  状态先渲染成**一图流**（``render.html2png``，HTML 面板 → PNG，节点里放 image 段），
-  **渲染失败时退回文字**（节点里放 text 段）；合并转发本身失败时再逐级退回
-  ``send.image`` / ``send.text`` 直发（官方文档建议的兼容口径：适配器可能不支持转发）。
+* ``/bpp`` 在 QQ 用合并转发发出状态图，渲染失败则在转发节点里放文字。
+  其它平台直接发送文字。每次命令只提交一种消息。
 * ``/bpp fallback``——对**命令引用的那条消息**触发一次异常兜底测试：按
   ``[empty_reply_fallback] fallback_prompts`` 的当前配置抽一条兜底提示词
   （留空 = 宿主自带的那组），替换 ``{bot_name}`` / ``{user_name}`` 占位后
@@ -167,8 +165,10 @@ class StatusCommandMixin:
         sub_l = sub.lower()
         try:
             if not sub_l:
-                await self._bpp_send_status(stream_id)
-                return True, "bpp status", True
+                message = kwargs.get("message")
+                platform = str(message.get("platform") or "").strip().lower() if isinstance(message, dict) else ""
+                sent = await self._bpp_send_status(stream_id, platform=platform)
+                return sent, "bpp status" if sent else "状态消息送达未确认，详情见日志", True
             if sub_l == "fallback":
                 await self._bpp_fallback_test(kwargs, stream_id)
                 return True, "bpp fallback test", True
@@ -183,17 +183,7 @@ class StatusCommandMixin:
             )
             return False, f"unknown subcommand: {shown}", True
         except Exception as exc:
-            # 命令处理器抛异常时 Runner 会返回 (False, str(exc), True)，但用户侧什么都看不到
-            # ——这里自己兜底发一条错误提示，免得"发了命令没反应"。文案**固定**、不带异常
-            # 细节：异常文本可能含宿主路径 / 配置键，会出现在聊天窗口的内容一律不放；
-            # 详情只进日志（上面 warning 已带 exc_info）。
             self.ctx.logger.warning("/bpp 执行失败: %s", exc, exc_info=True)
-            try:
-                await self.ctx.send.text(
-                    "/bpp 执行失败，详情请查看宿主日志。", stream_id, sync_to_maisaka_history=False
-                )
-            except Exception:
-                pass
             return False, "bpp 执行失败（详情见日志）", True
 
     # ------------------------------------------------------------------
@@ -648,72 +638,40 @@ class StatusCommandMixin:
         return "".join(parts)
 
     # ------------------------------------------------------------------
-    # /bpp：合并转发发送（一图流优先，文字兜底）
+    # /bpp：先选平台消息形态，再提交一次
     # ------------------------------------------------------------------
 
-    async def _bpp_send_status(self, stream_id: str) -> None:
-        """收集状态 → 渲染一图流 → 合并转发发送；每一环失败都有下一级兜底。
-
-        降级链（与官方文档的兼容建议一致）：
-
-        1. ``render.html2png`` 成功 → 合并转发单节点 **image 段**（一图流）；
-        2. 偶发失败先重试一次（1.4.1：宿主 Playwright 驱动冷启动）；
-        3. 仍失败（能力被拒 / 宿主没有渲染后端 / 超时）→ 合并转发单节点 **text 段**
-           （文字版末行写明失败原因）；
-        4. ``send.forward`` 失败（适配器不支持转发等）→ 有图直发 ``send.image``，
-           再失败 / 没有图 → ``send.text`` 逐行文本。
-        """
-        text_lines = self._build_status_text()
-        status_text = "\n".join(text_lines)
-        image_base64, render_error = await self._render_status_image()
-        if not image_base64:
-            # 退化原因写进文字版最后一行：/bpp 仅 operator 可触发，operator 一眼能看到
-            # "这次为什么没有图"，不必去翻宿主日志（原因已压成一行短文本）。
-            status_text = "\n".join(
-                text_lines
-                + [f"提示：一图流渲染失败（{_flatten_render_error(render_error)}），本次退回文字。"]
+    async def _bpp_send_status(self, stream_id: str, *, platform: str) -> bool:
+        """QQ 使用合并转发，其它平台用文字。渲染结果在发送前决定。"""
+        status_text = "\n".join(self._build_status_text())
+        if platform == "qq":
+            image_base64, render_error = await self._render_status_image()
+            if image_base64:
+                segments = [{"type": "image", "content": image_base64}]
+            else:
+                reason = _flatten_render_error(render_error)
+                status_text += f"\n提示：一图流渲染失败（{reason}），本次使用文字。"
+                segments = [{"type": "text", "content": status_text}]
+            node = {"user_id": "0", "nickname": _FORWARD_NICKNAME, "segments": segments}
+            send = self.ctx.send.forward(
+                [node], stream_id, sync_to_maisaka_history=False, processed_plain_text=status_text,
             )
-
-        segments: List[Dict[str, str]]
-        if image_base64:
-            segments = [{"type": "image", "content": image_base64}]
+            format_name = "合并转发"
         else:
-            segments = [{"type": "text", "content": status_text}]
-        node = {
-            "user_id": "0",
-            "nickname": _FORWARD_NICKNAME,
-            "segments": segments,
-        }
-        forwarded = False
-        try:
-            forwarded = bool(
-                await self.ctx.send.forward(
-                    [node],
-                    stream_id,
-                    sync_to_maisaka_history=False,
-                    processed_plain_text=status_text,
-                )
-            )
-        except Exception as exc:
-            self.ctx.logger.warning("合并转发发送模块状态失败，改为直发: %s", exc)
-        if forwarded:
-            self.ctx.logger.info(
-                "已用合并转发发送模块状态（会话 %s，形态=%s）",
-                stream_id,
-                "一图流" if image_base64 else "文字",
-            )
-            return
+            send = self.ctx.send.text(status_text, stream_id, sync_to_maisaka_history=False)
+            format_name = "文字"
 
-        # 转发不可用：直发兜底。
-        if image_base64:
-            try:
-                if await self.ctx.send.image(image_base64, stream_id, sync_to_maisaka_history=False):
-                    self.ctx.logger.info("合并转发不可用，已直发状态一图流（会话 %s）", stream_id)
-                    return
-            except Exception as exc:
-                self.ctx.logger.warning("直发状态图片失败，改为文字: %s", exc)
-        await self.ctx.send.text(status_text, stream_id, sync_to_maisaka_history=False)
-        self.ctx.logger.info("已用文字直发模块状态（会话 %s）", stream_id)
+        try:
+            sent = await send
+        except Exception as exc:
+            self.ctx.logger.warning("/bpp 状态消息送达未确认（会话 %s，%s）: %s", stream_id, format_name, exc)
+            return False
+        # 宿主布尔结果也会合并适配器超时等情形，无法安全地据此换一种格式重发。
+        if sent is not True:
+            self.ctx.logger.warning("/bpp 状态消息未收到成功回执（会话 %s，%s）", stream_id, format_name)
+            return False
+        self.ctx.logger.info("/bpp 状态消息已确认送达（会话 %s，%s）", stream_id, format_name)
+        return True
 
     async def _render_status_image(self) -> Tuple[str, str]:
         """把状态 HTML 渲染成 PNG。
@@ -832,25 +790,17 @@ class StatusCommandMixin:
         if not text.strip():
             text = "（抽到的兜底提示词替换占位后为空，请检查配置）"
 
-        # previous_message_id=target_id 只用作返回值兜底：发送成功但适配器没回传
-        # message_id 时 _send_follow_up_text 会返回它，避免把"已发出"误报成失败
-        # （否则用户会额外收到一条"兜底测试发送失败"）。
-        sent_id = await self._send_follow_up_text(
+        from .post_process_takeover import FollowUpSendStatus
+
+        result = await self._send_follow_up_text(
             stream_id,
             text,
             typing=False,
             quote_target=target_id,
-            previous_message_id=target_id,
             sync_history=False,
         )
-        if sent_id is None:
-            # 通知里只回显提示词前 40 字符：整段文本可能含被引用消息第三方发送者的
-            # 名称（他人可控内容）且可能很长，全文在下面的日志里可查。
-            await self.ctx.send.text(
-                f"兜底测试发送失败（抽中的提示词：{text[:40]!r}，来源：{source}），详见日志。",
-                stream_id,
-                sync_to_maisaka_history=False,
-            )
+        if result.status is not FollowUpSendStatus.SENT:
+            self.ctx.logger.info("兜底测试发送状态：%s（会话 %s）", result.status.value, stream_id)
             return
         self.ctx.logger.info(
             "兜底测试已发送（会话 %s，引用 %s，来源=%s，模板=%r，bot_name=%r，user_name=%r）",

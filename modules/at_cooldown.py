@@ -215,7 +215,9 @@ class AtCooldownMixin:
         age = max(0.0, now_wall - latest)
         if age >= self._at_cooldown_seconds():
             return
-        self._at_cooldown_last[sid] = time.monotonic() - age
+        self._at_cooldown_last[sid] = max(
+            self._at_cooldown_last.get(sid, 0.0), time.monotonic() - age,
+        )
         self.ctx.logger.info(
             "@ 冷却初始化：上下文里 bot 最近一次 @ 在 %.1f 秒前，本次冷却剩余 %.1f 秒（会话 %s）",
             age,

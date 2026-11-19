@@ -23,7 +23,10 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..helpers import annotate_outbound, delivered_reply_style, outbound_metadata
 from ..post_processing import match_leading_at_mention
+
+_AT_REPLY_INTENT = "cateye_bpp_at_reply"
 
 # @ 目标发送者查询缓存时长与容量上限（失败项用更短的负缓存，避免失败路径反复 RPC）。
 _TARGET_CACHE_TTL_SECONDS = 600.0
@@ -51,7 +54,7 @@ class QuoteTakeoverMixin:
         self._reply_style_weights_private: Dict[str, int] = {}
         # 已引用过的目标消息（「同一消息只引用一次」）：session_id -> OrderedDict[target_id, 记录时刻]。
         self._quoted_targets: Dict[str, "OrderedDict[str, float]"] = {}
-        # 已抽过回复方式的目标消息（「回复方式只取首条」）：session_id -> OrderedDict[target_id, 首次抽取时刻]。
+        # 已确认回复的目标消息（「回复方式只取首条」）：session_id -> OrderedDict[target_id, 回执时刻]。
         # 用于保证 @ 只可能出现在"对这条目标消息的第一条回复"上。
         self._styled_targets: Dict[str, "OrderedDict[str, float]"] = {}
         # @ 目标发送者查询缓存：reply_message_id -> (缓存时刻, user_id, 昵称, 群名片, 消息时间戳)。
@@ -123,16 +126,6 @@ class QuoteTakeoverMixin:
         except Exception:
             return 0.0
 
-    def _mark_at_cooldown_safe(self, session_id: str) -> None:
-        """注入 @ 后立刻刷新冷却（不等 after_send，避免同轮后续消息抢跑）。"""
-        marker = getattr(self, "_mark_at_cooldown", None)
-        if not callable(marker):
-            return
-        try:
-            marker(session_id)
-        except Exception:
-            pass
-
     def _at_trailing_space(self) -> bool:
         """注入真实 @ 时是否额外补一个空格组件（``[replyer_post_process] at_trailing_space``）。
 
@@ -183,58 +176,21 @@ class QuoteTakeoverMixin:
             for component in raw_message
         )
 
-    def _record_reply_head_style(
-        self,
-        *,
-        session_id: str,
-        message: Dict[str, Any],
-        modified: Dict[str, Any],
-        reply_message_id: str,
+    def _note_delivered_reply_style(
+        self, session_id: str, message: Dict[str, Any], kwargs: Dict[str, Any],
     ) -> None:
-        """记录本轮首条文本分段实际带没带引用/@，供“撤回重发头部”时恢复。"""
-        reply_round = self._reply_rounds.get(session_id) if session_id else None
-        if not reply_round or reply_round.get("head_style_recorded"):
-            return
-        target_id = str(reply_round.get("target_id") or "").strip()
-        if not target_id or str(reply_message_id or "").strip() != target_id:
-            return
-        if not self._has_text_component(message):
-            return
-        raw_message = message.get("raw_message")
-        has_quote = bool(modified.get("set_reply")) or self._has_component_type(
-            raw_message, "reply"
-        )
-        has_at = self._has_component_type(raw_message, "at")
-        quote_target = str(modified.get("reply_message_id") or "").strip()
-        at_user_id = at_nickname = at_cardname = ""
-        for component in raw_message if isinstance(raw_message, list) else []:
-            if not isinstance(component, dict):
-                continue
-            component_type = str(component.get("type") or "")
-            data = component.get("data")
-            if component_type == "reply" and isinstance(data, dict):
-                quote_target = str(data.get("target_message_id") or "").strip() or quote_target
-            elif component_type == "at" and isinstance(data, dict) and not at_user_id:
-                at_user_id = str(data.get("target_user_id") or "").strip()
-                at_nickname = str(data.get("target_user_nickname") or "").strip()
-                at_cardname = str(data.get("target_user_cardname") or "").strip()
-        reply_round["head_style"] = {
-            "has_quote": has_quote,
-            "has_at": has_at,
-            "target_id": target_id,
-            "quote_target": quote_target or target_id,
-            "at_user_id": at_user_id,
-            "at_nickname": at_nickname,
-            "at_cardname": at_cardname,
-        }
-        reply_round["head_style_recorded"] = True
-        self.ctx.logger.debug(
-            "记录本轮首段回复方式：quote=%s at=%s（会话 %s，target=%s）",
-            reply_round["head_style"]["has_quote"],
-            reply_round["head_style"]["has_at"],
-            session_id,
-            target_id,
-        )
+        """仅由成功回执调用，最终组件决定引用与 @ 是否占用本次资格。"""
+        style = delivered_reply_style(message, kwargs)
+        self._remember_quoted_target(session_id, style["quote_target"])
+        anchor = str(message.get("reply_to") or "").strip()
+        if anchor and self._has_text_component(message):
+            self._remember_styled_target(session_id, anchor)
+
+        # 仅插件实际注入且最终随消息送达的 @ 可占用对原目标的引用资格。
+        intent = outbound_metadata(message).get(_AT_REPLY_INTENT)
+        at_user_id = style.get("at_user_id")
+        if at_user_id and isinstance(intent, dict) and at_user_id == intent.get("user_id"):
+            self._remember_quoted_target(session_id, str(intent.get("target_id") or ""))
 
     async def _apply_preserved_at(
         self,
@@ -280,7 +236,6 @@ class QuoteTakeoverMixin:
             cardname=cardname,
             with_space=self._at_trailing_space(),
         )
-        self._mark_at_cooldown_safe(str(message.get("session_id") or ""))
         self.ctx.logger.info("撤回重发头部：已重新注入原回复目标的 @（target=%s）", target_id)
         return True
 
@@ -338,10 +293,8 @@ class QuoteTakeoverMixin:
             return False
         reply_round["style_done"] = True
 
-        # 「回复方式只取首条」：先判断这一轮是不是"对该目标消息的第一条回复"，**再**记账——
-        # 记账之后，后续对该目标消息的回复不会再抽到 @（覆盖"第一条没 @、第二条才 @"）。
+        # 「回复方式只取首条」：从已送达记录读取此前有没有回复这条目标消息。
         style_taken_before = self._style_taken_before(session_id, reply_message_id)
-        self._remember_styled_target(session_id, reply_message_id)
 
         # 「同一消息只引用一次」：优先级最高，先于"目标超时/强制直发/对话已推进"三条过旧规则——
         # 一旦这条目标消息被引用过（本插件抽到引用，或被观测到以引用方式发出），
@@ -495,7 +448,8 @@ class QuoteTakeoverMixin:
                             with_space=at_with_space,
                         )
                         message["raw_message"] = injected
-                        self._mark_at_cooldown_safe(session_id)
+                        if getattr(quote_cfg, "style_once_per_target", True):
+                            annotate_outbound(message, _AT_REPLY_INTENT, {"target_id": reply_message_id, "user_id": user_id})
                         self.ctx.logger.info(
                             "回复方式=%s（字面 @ 升级为真实 @）：前缀组件 %s（会话 %s，引用=%s）",
                             style,
@@ -503,11 +457,8 @@ class QuoteTakeoverMixin:
                             session_id,
                             style == "quote_at",
                         )
-                        if bool(getattr(quote_cfg, "style_once_per_target", True)):
-                            self._remember_quoted_target(session_id, reply_message_id)
                         if style == "quote_at":
                             modified["set_reply"] = True
-                            self._remember_quoted_target(session_id, reply_message_id)
                         return True
                     # 开头 @ 的是别人：正文已经有 @ 了，**不再补第二个**（"一条消息只 @ 一次"）。
                     # 但**空格口径仍要对齐**（0.13.17）：这条路原本"原样发出"，空格数由模型写，
@@ -527,7 +478,6 @@ class QuoteTakeoverMixin:
                     )
                     if style == "quote_at":
                         modified["set_reply"] = True
-                        self._remember_quoted_target(session_id, reply_message_id)
                         return True
                     return normalized_mention is not None
                 if self._has_leading_at(message.get("raw_message")):
@@ -558,7 +508,6 @@ class QuoteTakeoverMixin:
                     # 仅"引用＋@"还需要补引用。
                     if style == "quote_at":
                         modified["set_reply"] = True
-                        self._remember_quoted_target(session_id, reply_message_id)
                         return True
                     # style == "at" 时不需要 set_reply；但**规范化改动了消息体就必须回传**
                     # （调用方只在返回 True 时才回传 modified_kwargs，否则改动会被丢掉）。
@@ -571,7 +520,8 @@ class QuoteTakeoverMixin:
                     with_space=at_with_space,
                 )
                 message["raw_message"] = injected
-                self._mark_at_cooldown_safe(session_id)
+                if getattr(quote_cfg, "style_once_per_target", True):
+                    annotate_outbound(message, _AT_REPLY_INTENT, {"target_id": reply_message_id, "user_id": user_id})
                 self.ctx.logger.info(
                     "回复方式=%s（注入 @）：前缀组件 %s（会话 %s，引用=%s）",
                     style,
@@ -579,13 +529,8 @@ class QuoteTakeoverMixin:
                     session_id,
                     style == "quote_at",
                 )
-                if bool(getattr(quote_cfg, "style_once_per_target", True)):
-                    # @ 也算"对这条目标消息用过一次指代"：同一消息只引用一次时，后续回复
-                    # 不会再引用它（避免"先 @、再引用同一条"的重复指代）。
-                    self._remember_quoted_target(session_id, reply_message_id)
                 if style == "quote_at":
                     modified["set_reply"] = True
-                    self._remember_quoted_target(session_id, reply_message_id)
                 return True
             # @ 目标查不到（消息被清理等）时回退为引用回复。
             self.ctx.logger.debug("@ 目标查询失败（reply_message_id=%s），回退为引用回复", reply_message_id)
@@ -594,7 +539,6 @@ class QuoteTakeoverMixin:
             self.ctx.logger.debug("私聊会话不支持 @ 回复（reply_message_id=%s），回退为引用回复", reply_message_id)
 
         modified["set_reply"] = True
-        self._remember_quoted_target(session_id, reply_message_id)
         return True
 
 
@@ -646,7 +590,7 @@ class QuoteTakeoverMixin:
     # ------------------------------------------------------------------
 
     def _style_taken_before(self, session_id: str, target_id: str) -> bool:
-        """这条目标消息是否已经抽过一次回复方式（即本轮不是"第一条回复"）。"""
+        """该目标是否已有确认送达的文本回复。"""
         if not session_id or not target_id:
             return False
         bucket = self._styled_targets.get(session_id)
@@ -654,7 +598,7 @@ class QuoteTakeoverMixin:
 
 
     def _remember_styled_target(self, session_id: str, target_id: str) -> None:
-        """登记"对这条目标消息已经抽过一次回复方式"（容量超限时淘汰最旧的）。"""
+        """登记已送达的文本回复（容量超限时淘汰最旧的）。"""
         normalized_target = str(target_id or "").strip()
         if not session_id or not normalized_target:
             return

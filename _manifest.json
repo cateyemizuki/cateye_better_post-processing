@@ -49,7 +49,7 @@
     "llm.generate",
     "send.emoji",
     "send.text",
-    "send.image",
+    "send.hybrid",
     "send.forward",
     "render.html2png",
     "chat.get_all_streams",

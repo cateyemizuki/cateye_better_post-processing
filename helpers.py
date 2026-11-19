@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time as _time
 from datetime import datetime
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping
 
 _TZ_WARNED = {"flag": False}
 
@@ -12,6 +12,45 @@ _TZ_WARNED = {"flag": False}
 def _sub(message: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = message.get(key)
     return value if isinstance(value, Mapping) else {}
+
+
+def outbound_metadata(message: Mapping[str, Any]) -> Mapping[str, Any]:
+    """宿主在构建消息与发送回执之间保留的附加字段。"""
+    return _sub(_sub(message, "message_info"), "additional_config")
+
+
+def annotate_outbound(message: Dict[str, Any], key: str, value: Any) -> None:
+    info = dict(_sub(message, "message_info"))
+    additional = dict(outbound_metadata(message))
+    if value is None:
+        additional.pop(key, None)
+    else:
+        additional[key] = value
+    info["additional_config"] = additional
+    message["message_info"] = info
+
+
+def delivered_reply_style(message: Mapping[str, Any], kwargs: Mapping[str, Any]) -> Dict[str, str]:
+    """从最终出站组件读取引用目标及首个实际 @ 的信息。"""
+    quote_target = str(kwargs.get("reply_message_id") or "").strip() if kwargs.get("set_reply") else ""
+    style = {"quote_target": quote_target}
+    components = message.get("raw_message")
+    if not isinstance(components, list):
+        return style
+    found_quote = False
+    for component in components:
+        if not isinstance(component, Mapping):
+            continue
+        data = _sub(component, "data")
+        if component.get("type") == "reply" and not found_quote:
+            target = str(data.get("target_message_id") or "").strip()
+            if target:
+                style["quote_target"] = target
+                found_quote = True
+        elif component.get("type") == "at" and not style.get("at_user_id"):
+            for name in ("user_id", "user_nickname", "user_cardname"):
+                style["at_" + name] = str(data.get("target_" + name) or "").strip()
+    return style
 
 
 def extract_message_fields(message: Any) -> Dict[str, Any]:

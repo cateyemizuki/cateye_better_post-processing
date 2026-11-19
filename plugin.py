@@ -39,7 +39,7 @@
 宿主的分段发送循环锁死在回复工具内部、受
 ``response_post_process.enable_response_post_process`` 全局开关门控，单靠
 ``before_post_process`` 一个 Hook 无法把一条待发消息拆成多条；因此改用 **Hook 组合 +
-``ctx.send.text``** 复现同一效果（见 ``modules/post_process_takeover.py`` 的模块说明）。
+``ctx.send.hybrid``** 复现同一效果（见 ``modules/post_process_takeover.py`` 的模块说明）。
 
 当前提供十一个互相独立的功能（其中 7~9 为 1.2.0 合并进来的三个模块，**默认关闭**；
 10~11 为 1.4.0 新增的出站清洗与 @ 冷却，**默认开启**）：
@@ -83,9 +83,7 @@
    强制直发阈值必须小于"对话已推进阈值"：配置值 ≥ 旧阈值时自动让步，压到旧阈值 − 1。
 
    **同一消息只引用一次**（``quote_once_per_target``，群聊/私聊各自独立开关与记录）：
-   一条目标消息一旦被引用过（本插件抽到引用/引用＋@，或在
-   ``send_service.after_send`` 观测到它以 ``set_reply=True`` 发出——宿主自带的、
-   其它插件注入的都算），之后**任何**对该消息的回复都不再引用，只可能直接回复（该判定
+   在 ``send_service.after_send`` 确认带引用的回复已送达后，后续对此目标的回复使用直接回复（该判定
    发生在回复方式抽取之前，@ 也不会再抽取）；抽到"直接回复"不消耗这次机会，下一轮 planner 再次回复同一条消息时
    仍有机会抽到引用。该规则优先于全部过旧规则（含 ``stale_age_seconds`` 的
    "目标超时后强制直接回复"），因此对"bot 回复自己刚发过的消息"这类超出时间窗的目标
@@ -248,7 +246,8 @@ from .emoji_meanings import (
     sha256_of_base64,
 )
 from .modules.emoji_recognition import EmojiRecognitionMixin
-from .text_rules import ParsedRules, apply_replaces, evaluate_rules, parse_rules
+from .helpers import annotate_outbound, outbound_metadata
+from .text_rules import ParsedRules, evaluate_rules, match_cover, parse_rules, replace_text_parts
 from .planner_notice import build_rule_block_notice, insert_planner_tail_notice
 from .modules.post_process_takeover import (
     _HOST_MIRROR_EXTRA_FIELDS,
@@ -331,20 +330,8 @@ _IMAGE_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _MESSAGE_EMOJI_REFS_MAX_ENTRIES = 512
 _MESSAGE_EMOJI_REFS_TTL_SECONDS = 3600.0
 
-# 「这个会话是群聊」的记忆（session_id 集合，LRU 限长）。
-#
-# 为什么需要：**出站**消息的群/私聊只能靠 ``message_info.group_info`` 判定，而宿主
-# ``send_service._build_outbound_session_message()`` 只在 ``target_stream.group_name``
-# （或流上下文消息的群名）**非空**时才填它：
-#     group_info = None
-#     if target_stream.group_id:
-#         group_name = ... ; if group_name: group_info = GroupInfo(...)
-# 群名缺失时出站消息的 ``group_info`` 就是 None → 插件会把群聊当成私聊：
-# 权重池按 ``allow_at=False`` 清零、@ 永不出现、而且读的是 ``[quote_reply_private]`` 配置节，
-# 现象是"这个群怎么都不 @ 人"且日志里看不出来。
-# 入站消息的 ``group_info`` 一定是准的（群聊 = dict、私聊 = None），所以按 session_id 记一份；
-# 会话类型不会变，因此**不设 TTL**，只按 LRU 限长。
-_GROUP_SESSIONS_MAX_ENTRIES = 512
+# 规划回复时尚未构建消息，复用入站和出站 Hook 记录的会话类型。
+_SESSION_SCOPE_MAX_ENTRIES = 512
 
 # item 文本前缀里的消息 id（`<message msg_id="…" …>`，宿主 planner_messages 生成）。
 _MSG_ID_IN_PREFIX = re.compile(r'msg_id="([^"]*)"')
@@ -406,11 +393,7 @@ _TEXT_RULES_DROPPED = object()
 _TEXT_RULE_BLOCK_NOTICE_TTL_SECONDS = 120.0
 _TEXT_RULE_BLOCK_MAX_SESSIONS = 64
 
-# @ 独占（1.4.2）：EARLY 登记的"本插件保留的 at 目标"标记的 TTL 与容量上限。
-# 标记供 LATE 兜底区分自有 @ 与其它插件后补的 @；正常同一钩子链内即被消费，
-# TTL 只兜底"中途被其它插件 abort"等走不到 LATE 的漏网条目。
-_OWN_AT_MARK_TTL = 120.0
-_OWN_AT_MARK_MAX = 512
+_OWN_AT_TARGETS = "cateye_bpp_allowed_at_targets"
 
 # 「假 @」：LLM 手写在正文里的 "@某人"——`@` + 昵称字符 + **至少一个空白**。
 # 昵称字符集与 post_processing._AT_MENTION_PATTERN 保持一致（汉字/字母数字/下划线/连字符/间隔号）；
@@ -762,6 +745,7 @@ _LEGACY_REMOVED_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("chinese_typo", "enable_correction_quote"),
     ("chinese_typo", "correction_quote_probability"),
     ("chinese_typo", "recall_purge"),
+    ("chinese_typo", "private_no_recall"),
     ("chinese_typo_weights", "weight_correction_last"),
     ("host_override", "typo_correction_quote_probability"),
 )
@@ -969,7 +953,7 @@ class QuoteReplySectionConfig(PluginConfigBase):
         description=(
             "回复方式只取首条：同一条目标消息只有**第一条**回复能抽到 @，之后的回复只在"
             "「直接回复 / 引用回复」里抽——避免出现「前一条什么都没挂、后一条才 @ 人」的错位观感。"
-            "另外抽到 @ 也算用过一次指代（计入「同一消息只引用一次」），后续不再引用该消息。"
+            "另外确认送达的 @ 也算用过一次指代（计入「同一消息只引用一次」），后续不再引用该消息。"
             "关掉后回到旧行为：每一轮各自独立抽 @"
         ),
         json_schema_extra={
@@ -1301,31 +1285,6 @@ class ChineseTypoSectionConfig(PluginConfigBase):
             "label": "撤回失败兜底",
             "x-toml-comment": "撤回失败时怎么办：quote 引用发送 / direct 直接发送 / none 放弃这条纠正。",
             **_ui_i18n("Recall fallback", "quote (default) / direct / none."),
-        },
-    )
-    private_no_recall: bool = Field(
-        default=True,
-        description=(
-            "私聊禁用撤回（**默认开启**）：私聊里**根本不抽「撤回重发」**——recall 在**抽签阶段**"
-            "就从权重池里剔除，剩余方式（direct / quote / none）按原权重比例重新归一化抽取，"
-            "所以私聊里不会产生任何撤回动作（不是「抽到撤回再降级」）。"
-            "原因：私聊中 bot 撤回自己的消息时，适配器会把这条撤回**显示成「是用户撤回了消息」**，"
-            "于是 bot 的上下文里会出现一条「对方撤回了一条消息」——它会误以为是用户撤回了什么，"
-            "从而被错误引导（追问、道歉、「你撤回了什么」之类），而实际上只是 bot 自己纠正错字。"
-            "群聊不受影响（群里撤回就是 bot 自己撤回，语义正确）。关闭本项 = 私聊也照常抽撤回"
-        ),
-        json_schema_extra={
-            "label": "私聊禁用撤回",
-            "x-toml-comment": (
-                "私聊里不把「撤回重发」放进抽签池（私聊撤回会被适配器显示成「用户撤回」，可能误导 bot）。"
-                "默认开启，群聊不受影响。"
-            ),
-            **_ui_i18n(
-                "No recall in private chats",
-                "Recall is removed from the pick pool entirely in private chats (never drawn), because "
-                "adapters may render the bot's own recall as the USER recalling a message, which "
-                "misleads the bot. On (default); group chats unaffected.",
-            ),
         },
     )
     recall_delay_seconds: _OptionalFloat = Field(
@@ -3038,9 +2997,6 @@ class BetterPostProcessingPlugin(
         # 每聊天流 @ 冷却：session_id -> 最近一次 @ 的单调时钟；已做过上下文初始化的会话。
         self._at_cooldown_last: Dict[str, float] = {}
         self._at_cooldown_seeded: set[str] = set()
-        # @ 独占（1.4.2）：(session_id, message_id) -> (登记时刻, 本插件保留的 at 目标集合)。
-        # EARLY 处理器末尾登记、LATE 兜底消费；TTL 限长防漏（中途被 abort 走不到 LATE 时）。
-        self._own_at_marks: "OrderedDict[Tuple[str, str], Tuple[float, frozenset]]" = OrderedDict()
         # 群聊连续表情包计数：session_id -> {"count", "last", "last_desc"}。
         self._emoji_streaks: Dict[str, Dict[str, Any]] = {}
         # "对话已推进"/"回复目标超时"首次触发时用 info 记录，后续降为 debug。
@@ -3076,8 +3032,7 @@ class BetterPostProcessingPlugin(
         # 入站消息里的表情包引用（reply 路径"本地映射优先"用）：
         # message_id -> (单调时钟, session_id, [(hash, 描述)])。
         self._message_emoji_refs: "OrderedDict[str, Tuple[float, str, List[Tuple[str, str]]]]" = OrderedDict()
-        # 「这个会话是群聊」的记忆（出站消息缺 group_info 时的兜底判定）：LRU 限长的 session_id 集合。
-        self._group_sessions: "OrderedDict[str, None]" = OrderedDict()
+        self._session_group_flags: "OrderedDict[str, bool]" = OrderedDict()
         # 后台任务集合（on_unload 时统一取消）。
         self._tasks: set[asyncio.Task] = set()
         self._init_post_process_takeover()
@@ -3317,13 +3272,10 @@ class BetterPostProcessingPlugin(
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
         self._stream_follow_up_tasks.clear()
-        self._stream_sending_texts.clear()
+        self._follow_up_intents.clear()
         self._pending_follow_ups.clear()
         self._prepared_segments.clear()
         self._planner_segment_records.clear()
-        self._pending_quote_targets.clear()
-        self._pending_at_targets.clear()
-        self._own_at_marks.clear()
         self._text_rule_blocks.clear()
         # B4：卸载即清空认领（不残留到下一进程/下一轮）
         self._life_claims.clear()
@@ -3517,29 +3469,26 @@ class BetterPostProcessingPlugin(
 
         # 本条发送是否为本插件正在补发的分段（多段发送）：文本规则据此把它认作
         # 本轮回复的一部分（这类发送 reply_message_id 为空，轮记录判定不成立）。
-        outbound_text = self._extract_outbound_text(message)
-        own_follow_up = self._is_own_follow_up_text(session_id, outbound_text)
-        in_reply_flow = own_follow_up or self._message_in_reply_flow(session_id, reply_message_id)
-        quote_target = ""
-        at_target_info: Dict[str, str] = {}
-        if own_follow_up:
-            quote_bucket = self._pending_quote_targets.get(session_id)
-            if quote_bucket:
-                quote_target = str(quote_bucket.get(self._text_key(outbound_text)) or "").strip()
-            at_bucket = self._pending_at_targets.get(session_id)
-            if at_bucket:
-                raw_at_info = at_bucket.get(self._text_key(outbound_text))
-                if isinstance(raw_at_info, dict):
-                    at_target_info = dict(raw_at_info)
-                elif raw_at_info:
-                    at_target_info = {"target_id": str(raw_at_info).strip()}
+        send_id = self._follow_up_id(message)
+        own_follow_up = bool(send_id)
+        unanchored = self._is_unanchored_reply(message)
+        if unanchored:
+            changed = self._remove_unanchored_addressing(modified, message)
+            reply_message_id = ""
+        in_reply_flow = unanchored or own_follow_up or self._message_in_reply_flow(session_id, reply_message_id)
+        group_kind = self._remember_chat_scope(message)
+        private_reply = group_kind is False and in_reply_flow and self._plugin_enabled()
+        intent = self._follow_up_intents.get(send_id) if own_follow_up and not unanchored else None
+        if intent is not None and intent.session_id != session_id:
+            intent = None
 
         # @ 独占（1.4.2）：本轮回复内，入口无条件剥离外部 at。宿主 attach_at 与其它插件的
         # 注入都发生在本钩子之前，而本插件自己的 @ 只在本处理器后续步骤注入，因此入口
         # 看到的 at 必为外部。剥掉后假 @ 过滤不再被"开头是真 at"短路，正文里的字面 @
         # 能正常被清理/升级，@ 与正文之间的空格也由本插件统一负责。
         strip_external_at = (
-            in_reply_flow
+            not unanchored
+            and in_reply_flow
             and self._plugin_enabled()
             and bool(getattr(self.config.replyer_post_process, "strip_external_at", True))
         )
@@ -3548,7 +3497,9 @@ class BetterPostProcessingPlugin(
         # 宿主/其它插件已经挂在这个出站消息上的 at 组件（@ 独占开启时同样走这次剥离）。
         # 插件自己抽到的 @ 由 ``_apply_reply_style`` 直接不抽，末尾还有一次兜底移除。
         at_cooldown_active = False
-        if session_id:
+        if private_reply:
+            changed = bool(self._strip_at_components(message)) or changed
+        elif session_id and not unanchored:
             try:
                 await self._seed_at_cooldown_from_context(session_id)
             except Exception as exc:
@@ -3591,7 +3542,7 @@ class BetterPostProcessingPlugin(
                 message,
                 session_id=session_id,
                 reply_message_id=reply_message_id,
-                own_follow_up=own_follow_up,
+                own_follow_up=own_follow_up or unanchored,
             )
             if rule_result is _TEXT_RULES_DROPPED:
                 self.ctx.logger.info(
@@ -3603,26 +3554,26 @@ class BetterPostProcessingPlugin(
         except Exception as exc:
             self.ctx.logger.warning("出站文本规则应用失败，跳过: %s", exc)
 
-        try:
-            changed = await self._apply_reply_style(modified, message) or changed
-        except Exception as exc:
-            self.ctx.logger.warning("回复方式抽取失败，保持原样: %s", exc)
+        if not unanchored:
+            try:
+                changed = await self._apply_reply_style(modified, message) or changed
+            except Exception as exc:
+                self.ctx.logger.warning("回复方式抽取失败，保持原样: %s", exc)
 
-        # 错别字更正段引用上一段（复刻宿主 quote_previous）：ctx.send.text 无法携带
-        # reply_message，这里补上 set_reply + reply_message_id，宿主据此构造引用组件。
-        if quote_target and not reply_message_id and not bool(modified.get("set_reply")):
+        # 用补发自己的发送标识取回引用目标，由宿主构造引用组件。
+        if intent is not None and intent.quote_target and not reply_message_id and not modified.get("set_reply"):
             modified["set_reply"] = True
-            modified["reply_message_id"] = quote_target
+            modified["reply_message_id"] = intent.quote_target
             changed = True
 
-        if at_target_info:
+        if intent is not None and intent.at_target and group_kind is True:
             try:
                 changed = await self._apply_preserved_at(
                     message,
-                    str(at_target_info.get("target_id") or "").strip(),
-                    user_id=str(at_target_info.get("user_id") or "").strip(),
-                    nickname=str(at_target_info.get("nickname") or "").strip(),
-                    cardname=str(at_target_info.get("cardname") or "").strip(),
+                    intent.at_target,
+                    user_id=intent.at_user_id,
+                    nickname=intent.at_nickname,
+                    cardname=intent.at_cardname,
                 ) or changed
             except Exception as exc:
                 self.ctx.logger.warning("恢复首段 @ 失败，保持原样: %s", exc)
@@ -3639,57 +3590,30 @@ class BetterPostProcessingPlugin(
                     session_id[:12],
                 )
 
-        # @ 独占 / @ 冷却：登记本条消息最终保留的 at 目标（此刻要么全是本插件注入的，
+        # @ 独占、@ 冷却和私聊回复都登记本条消息保留的 at 目标（此刻要么全是本插件注入的，
         # 要么一个都没有），供 LATE 兜底区分其它插件在本处理器之后新补的 at。
-        if strip_external_at or at_cooldown_active:
-            self._register_own_at_mark(session_id, message)
-
-        # 首条文本分段（宿主原生发送链）实际带没带引用/@：在发送前记录一次，
-        # 后续若因错字撤回重发头部，用它恢复引用/@。
-        try:
-            self._record_reply_head_style(
-                session_id=session_id,
-                message=message,
-                modified=modified,
-                reply_message_id=reply_message_id,
-            )
-        except Exception as exc:
-            self.ctx.logger.debug("记录首段回复方式失败（忽略）: %s", exc)
+        if strip_external_at or at_cooldown_active or private_reply:
+            self._mark_allowed_at_targets(message)
+            changed = True
 
         if not changed:
             return {"action": "continue"}
         return {"action": "continue", "modified_kwargs": modified}
 
-    def _register_own_at_mark(self, session_id: str, message: Dict[str, Any]) -> None:
-        """登记本条出站消息最终保留的 at 目标（供 LATE 兜底区分来源）。
-
-        调用时机在 EARLY 处理器完成所有注入/剥离之后：此刻消息里的 at 要么全是本插件
-        注入的，要么一个都没有（冷却期）。LATE 兜底按这份白名单放行，其余 at 一律视为
-        排在本插件之后的其它插件新注入的，移除。标记读后即删，TTL/容量双限防漏。
-        """
-        message_id = str(message.get("message_id") or "").strip()
-        if not session_id or not message_id:
-            return
-        targets: set = set()
+    @staticmethod
+    def _mark_allowed_at_targets(message: Dict[str, Any]) -> None:
+        """标记本条消息允许的 @，让 LATE 直接读同一消息的组件权限。"""
         components = message.get("raw_message")
-        if isinstance(components, list):
-            for component in components:
-                if not (isinstance(component, dict) and str(component.get("type") or "") == "at"):
-                    continue
-                data = component.get("data")
-                if isinstance(data, dict):
-                    target = str(data.get("target_user_id") or "").strip()
-                    if target:
-                        targets.add(target)
-        now = time.monotonic()
-        key = (session_id, message_id)
-        self._own_at_marks.pop(key, None)
-        self._own_at_marks[key] = (now, frozenset(targets))
-        while len(self._own_at_marks) > _OWN_AT_MARK_MAX:
-            self._own_at_marks.popitem(last=False)
-        expired = [k for k, (ts, _) in self._own_at_marks.items() if now - ts > _OWN_AT_MARK_TTL]
-        for k in expired:
-            self._own_at_marks.pop(k, None)
+        targets = []
+        for component in components if isinstance(components, list) else []:
+            if not isinstance(component, dict) or component.get("type") != "at":
+                continue
+            data = component.get("data")
+            if isinstance(data, dict):
+                target = str(data.get("target_user_id") or "").strip()
+                if target:
+                    targets.append(target)
+        annotate_outbound(message, _OWN_AT_TARGETS, targets)
 
     @HookHandler(
         "send_service.before_send",
@@ -3700,33 +3624,33 @@ class BetterPostProcessingPlugin(
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_before_send_at_guard(self, **kwargs: Any) -> Dict[str, Any]:
-        """EARLY 处理器只能清它运行前就存在的 at；NORMAL/LATE 的其它插件仍可能在其后注入。
-
-        这里以 EARLY 登记的目标集合为白名单移除其余 at。只消费本插件登记过的标记：
-        没经过 EARLY 登记的消息（其它插件的命令响应、纯 at 消息等）一律不动。
-        @ 冷却期内白名单为空，等价于禁止任何来源的 at（与冷却口径一致）。
-        """
+        """按消息上的标记清理后注入的 @，同时应用 EARLY 之后已生效的冷却。"""
         raw_message = kwargs.get("message")
         if not isinstance(raw_message, dict):
             return {"action": "continue"}
         session_id = str(raw_message.get("session_id") or "").strip()
-        message_id = str(raw_message.get("message_id") or "").strip()
-        mark = self._own_at_marks.pop((session_id, message_id), None)
-        if mark is None:
+        targets = outbound_metadata(raw_message).get(_OWN_AT_TARGETS)
+        marked = isinstance(targets, list)
+        unanchored = self._is_unanchored_reply(raw_message)
+        cooldown_active = self._at_cooldown_active(session_id)
+        if not marked and not cooldown_active and not unanchored:
             return {"action": "continue"}
-        _, allowed = mark
+        allowed = set()
+        if not cooldown_active and isinstance(targets, list):
+            allowed = {target for target in targets if isinstance(target, str)}
         message = dict(raw_message)
-        removed = self._strip_at_components(message, keep_targets=set(allowed))
-        if not removed:
+        if marked:
+            annotate_outbound(message, _OWN_AT_TARGETS, None)
+        if unanchored:
+            modified = {**kwargs, "message": message}
+            changed = self._remove_unanchored_addressing(modified, message)
+            return {"action": "continue", "modified_kwargs": modified} if changed or marked else {"action": "continue"}
+        removed = self._strip_at_components(message, keep_targets=allowed)
+        if removed:
+            self.ctx.logger.info("出站清洗：LATE 移除 %d 个 at 组件（会话 %s）", removed, session_id[:12])
+        if not marked and not removed:
             return {"action": "continue"}
-        self.ctx.logger.info(
-            "出站清洗：@ 独占 LATE 兜底，移除 %d 个后注入的 at 组件（会话 %s）",
-            removed,
-            session_id[:12],
-        )
-        modified = dict(kwargs)
-        modified["message"] = message
-        return {"action": "continue", "modified_kwargs": modified}
+        return {"action": "continue", "modified_kwargs": {**kwargs, "message": message}}
 
     # ------------------------------------------------------------------
     # 出站：过滤"假 @"（LLM 手写的纯文本 @）
@@ -3968,88 +3892,59 @@ class BetterPostProcessingPlugin(
         if not text_indexes:
             return False
 
-        text_set = set(text_indexes)
-        full_text = "".join(
-            str(components[index].get("data") or "") for index in text_indexes
-        )
+        text_parts = [str(components[index].get("data") or "") for index in text_indexes]
+        full_text = "".join(text_parts)
         if not full_text:
             return False
 
-        outcome = evaluate_rules(full_text, rules)
-        if outcome.dropped:
-            # 命中 c:内容（无替换文本）：整条消息不发出。
+        replaced_parts = replace_text_parts(text_parts, rules.replaces)
+        replaced_text = "".join(replaced_parts)
+        cover = match_cover(replaced_text, rules.covers)
+        if cover is not None and cover.is_filter:
             self._remember_text_rule_block(
-                session_id,
-                rule_label=(
-                    f"c:{outcome.cover_hit.keyword}"
-                    if outcome.cover_hit is not None
-                    else "r:*（过滤后无内容）"
-                ),
-                reply_message_id=reply_message_id,
-                in_reply_flow=in_reply_flow,
+                session_id, rule_label=f"c:{cover.keyword}",
+                reply_message_id=reply_message_id, in_reply_flow=in_reply_flow,
             )
             return _TEXT_RULES_DROPPED
 
-        if outcome.cover_hit is not None:
-            # 命中 c:内容/替换文本：整条文本替换为覆盖内容（保留首个文本组件的位置）。
-            rebuilt: List[Any] = []
-            written = False
-            for index, component in enumerate(components):
-                if index in text_set:
-                    if not written:
-                        rebuilt.append({"type": "text", "data": outcome.text})
-                        written = True
-                    continue
-                rebuilt.append(component)
-            message["raw_message"] = rebuilt
-            message["processed_plain_text"] = outcome.text
+        text_set = set(text_indexes)
+        if cover is not None:
+            # 整条替换只改文本，附件仍在原有位置。
+            first_text_index = text_indexes[0]
+            message["raw_message"] = [
+                {**component, "data": cover.content} if index == first_text_index else component
+                for index, component in enumerate(components)
+                if index == first_text_index or index not in text_set
+            ]
+            message["processed_plain_text"] = cover.content
             return True
 
-        has_non_text = any(index not in text_set for index in range(len(components)))
-        if not outcome.text.strip() and not has_non_text:
-            # r:词（无替换文本）把整条消息删空：没有可发送的内容，等同于整条过滤。
+        if not replaced_text.strip() and len(components) == len(text_indexes):
             self._remember_text_rule_block(
-                session_id,
-                rule_label="r:*（过滤后无内容）",
-                reply_message_id=reply_message_id,
-                in_reply_flow=in_reply_flow,
+                session_id, rule_label="r:*（过滤后无内容）",
+                reply_message_id=reply_message_id, in_reply_flow=in_reply_flow,
             )
             return _TEXT_RULES_DROPPED
 
+        if replaced_parts == text_parts:
+            return False
+        replacements = dict(zip(text_indexes, replaced_parts, strict=True))
         new_components: List[Any] = []
-        changed = False
         for index, component in enumerate(components):
-            if index not in text_set:
+            if index not in replacements:
                 new_components.append(component)
-                continue
-            original_text = str(component.get("data") or "")
-            new_text = apply_replaces(original_text, rules.replaces)
-            if new_text != original_text:
-                new_component = dict(component)
-                new_component["data"] = new_text
-                new_components.append(new_component)
-                changed = True
-            else:
-                new_components.append(component)
-
-        if changed:
-            filtered: List[Any] = []
-            for component in new_components:
-                if (
-                    isinstance(component, dict)
-                    and str(component.get("type") or "") == "text"
-                    and not str(component.get("data") or "")
-                ):
-                    continue
-                filtered.append(component)
-            message["raw_message"] = filtered
-            processed = message.get("processed_plain_text")
-            if isinstance(processed, str) and processed:
-                message["processed_plain_text"] = apply_replaces(processed, rules.replaces)
-        return changed
+            elif replacements[index]:
+                new_components.append({**component, "data": replacements[index]})
+        message["raw_message"] = new_components
+        processed = message.get("processed_plain_text")
+        if isinstance(processed, str) and processed.count(full_text) == 1:
+            message["processed_plain_text"] = processed.replace(full_text, replaced_text, 1)
+        else:
+            message["processed_plain_text"] = replaced_text
+        return True
 
     def _text_rules_would_drop(self, text: str) -> bool:
-        """文本规则是否会把这条文本整条过滤（供补发分段提前跳过，避免 abort 重试）。"""
+        """文本规则是否会把这条文本整条过滤（供补发分段提前跳过）。"""
         rules = self._parsed_rules
         if not rules or not self._plugin_enabled():
             return False
@@ -4137,31 +4032,37 @@ class BetterPostProcessingPlugin(
         modified["items"] = new_items
         return {"action": "continue", "modified_kwargs": modified}
 
-    def _is_group_message(self, message: Dict[str, Any]) -> bool:
-        """该消息是否来自群聊。
-
-        首选 ``message_info.group_info``（入站消息一定准）。取不到时退回"本会话是群聊"的记忆
-        （``_group_sessions``，由入站 Hook 记录）——**出站**消息的 ``group_info`` 由宿主按
-        ``target_stream.group_name`` 是否非空决定，群名缺失时会是 None（详见
-        ``_GROUP_SESSIONS_MAX_ENTRIES`` 的说明），此时若直接判成私聊，群聊的 @ 就永远不会出现。
-        """
-        message_info = message.get("message_info")
-        if not isinstance(message_info, dict):
-            return False
-        if isinstance(message_info.get("group_info"), dict):
+    def _message_group_kind(self, message: Dict[str, Any]) -> Optional[bool]:
+        """识别群聊、私聊或未提供会话类型的消息。"""
+        scope = message.get("scope")
+        if scope in ("group", "private"):
+            return scope == "group"
+        info = message.get("message_info")
+        group_info = info.get("group_info") if isinstance(info, dict) else None
+        metadata = outbound_metadata(message)
+        # 旧宿主可能省略空群名对应的 group_info，但发送路由仍带群 ID。
+        if isinstance(group_info, dict) or metadata.get("platform_io_target_group_id"):
             return True
+        if metadata.get("platform_io_target_user_id"):
+            return False
         session_id = str(message.get("session_id") or "").strip()
-        return bool(session_id) and session_id in self._group_sessions
+        return self._session_group_flags.get(session_id)
 
-    def _remember_group_session(self, session_id: str) -> None:
-        """记下"这个会话是群聊"（LRU 限长；会话类型不会变，所以不设 TTL）。"""
-        normalized = str(session_id or "").strip()
-        if not normalized:
-            return
-        self._group_sessions[normalized] = None
-        self._group_sessions.move_to_end(normalized)
-        while len(self._group_sessions) > _GROUP_SESSIONS_MAX_ENTRIES:
-            self._group_sessions.popitem(last=False)
+    def _is_group_message(self, message: Dict[str, Any]) -> bool:
+        return self._message_group_kind(message) is True
+
+    def _remember_chat_scope(self, message: Dict[str, Any], *, inbound: bool = False) -> Optional[bool]:
+        group_kind = self._message_group_kind(message)
+        if group_kind is None and inbound and isinstance(message.get("message_info"), dict):
+            # 旧宿主的入站载荷用空 group_info 表示私聊。
+            group_kind = False
+        session_id = str(message.get("session_id") or "").strip()
+        if session_id and group_kind is not None:
+            self._session_group_flags[session_id] = group_kind
+            self._session_group_flags.move_to_end(session_id)
+            if len(self._session_group_flags) > _SESSION_SCOPE_MAX_ENTRIES:
+                self._session_group_flags.popitem(last=False)
+        return group_kind
 
     def _message_in_reply_flow(self, session_id: str, reply_message_id: str) -> bool:
         """该出站消息是否属于"planner 拉起的本轮回复"。
@@ -4278,9 +4179,6 @@ class BetterPostProcessingPlugin(
             "emoji_done": False,
             # 引用回复接管是否已抽取过回复方式（同一轮只在首条文本分段抽取一次）。
             "style_done": False,
-            # 首条文本分段实际带没带引用/@；撤回重发头部时据此恢复。
-            "head_style": None,
-            "head_style_recorded": False,
         }
         self._prune_stale_state(now)
 
@@ -4493,7 +4391,7 @@ class BetterPostProcessingPlugin(
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_outbound_observer(self, **kwargs: Any) -> None:
-        if not bool(kwargs.get("sent", False)):
+        if kwargs.get("sent") is not True:
             return
         message = kwargs.get("message")
         if not isinstance(message, dict):
@@ -4510,11 +4408,7 @@ class BetterPostProcessingPlugin(
             isinstance(component, dict) and str(component.get("type") or "") == "emoji"
             for component in components
         )
-        # 「同一消息只引用一次」的事实来源：只要观测到某条出站消息确实以引用方式发出
-        # （set_reply=True + reply_message_id），就登记该目标已引用过——本插件抽取的、
-        # 宿主自带的、其它插件注入的引用都算，之后对该目标的回复不再引用。
-        if bool(kwargs.get("set_reply", False)):
-            self._remember_quoted_target(session_id, str(kwargs.get("reply_message_id") or ""))
+        self._note_delivered_reply_style(session_id, message, kwargs)
         if has_emoji:
             self._chat_emoji_last[session_id] = now
             # planner 已经真的把表情发出来了，意图标记不再需要。
@@ -4700,12 +4594,7 @@ class BetterPostProcessingPlugin(
         if not session_id:
             return
 
-        # —— 先记"这个会话是群聊"（出站消息缺 group_info 时的兜底判定，0.14.2）——
-        # 入站消息的 group_info 一定准确；出站消息那边宿主只在群名非空时才填它，
-        # 缺群名的群会被判成私聊（@ 永不出现、读私聊配置节）。这里按 session_id 记一份，
-        # 与下面的表情包统计无关，因此放在所有表情包判定之前、且不受各功能开关门控。
-        if self._is_group_message(message):
-            self._remember_group_session(session_id)
+        self._remember_chat_scope(message, inbound=True)
 
         # —— 先记录"消息 → 表情包引用"映射（**含 bot 自己的消息**，0.13.17 起）——
         # 含义库注入（`_rewrite_emoji_labels_in_items`）按 item 文本里的 `msg_id` 反查本地映射，
@@ -5046,7 +4935,7 @@ class BetterPostProcessingPlugin(
         参数对齐宿主自己的 ``send_emoji`` 工具（``src/emoji_system/maisaka_tool.py``）：
         ``storage_message=True`` / ``set_reply=False`` / ``reply_message=None`` /
         ``sync_to_maisaka_history=True`` / ``maisaka_source_kind="guided_reply"``。
-        （本插件的分段补发走 ``ctx.send.text``，那个参数一直传着，只有 emoji 这条漏了。）
+        （本插件的分段补发也传这个参数，只有 emoji 这条漏了。）
         """
         if self._meaning_store is not None and self.config.emoji_meaning.enabled:
             image_hash = sha256_of_base64(emoji_base64)
@@ -5580,6 +5469,11 @@ class BetterPostProcessingPlugin(
             return False
         if not force and normalized_hash in self._meaning_abandoned:
             return False
+        inflight = self._meaning_inflight.get(normalized_hash)
+        if inflight is not None and not inflight.done():
+            # 在途任务自己可安排失败重试。其它来源等待同一任务，避免成功后又识别一次。
+            if not force or asyncio.current_task() is not inflight:
+                return False
         if normalized_hash in self._meaning_queued:
             return False
         self._meaning_queued.add(normalized_hash)
